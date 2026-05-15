@@ -51,6 +51,7 @@ export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
   const platform: Platform = mapEventTypeId(eventTypeId) ?? guessPlatform(payload);
   const username =
     payload.author?.displayName ??
+    payload.author?.nickname ?? // Discord-style
     payload.author?.name ??
     payload.author?.username ??
     payload.username ??
@@ -99,39 +100,57 @@ export function normalizeRestreamEvent(raw: unknown): ChatMessage | undefined {
 
 // Restream documents numeric eventTypeIds per platform.
 // Source: https://developers.restream.io/chat/events
-//   1  = Discord Text
-//   2  = DLive Text
+//   1  = Discord Text                 (author.name / author.nickname)
+//   2  = DLive Text                   (author.username / author.name)
+//   3  = DLive Emoji                  (same shape + link)
 //   4  = Twitch Text                  (author.displayName)
 //   5  = YouTube Text                 (author.displayName)
-//   7  = YouTube Super Chat
-//   8  = YouTube Super Sticker
+//   7  = YouTube Super Chat           (author.displayName + donation)
+//   8  = YouTube Super Sticker        (author.displayName + donation.stickerId)
 //   11 = Facebook Personal Text       (author.name)
+//   12 = Facebook Personal Sticker    (author.name + link)
 //   13 = Facebook Public Page Text    (author.name)
+//   14 = Facebook Public Page Sticker (author.name + link)
 //   21 = LinkedIn Text                (author.name)
 //   22 = Trovo Text                   (author.name)
+//   23 = YouTube Member Milestone     (author.displayName + memberMilestone)
 //   24 = X Text                       (author.displayName)
 //   25 = Kick Text                    (author.username)
-//   26 = Kick Subscription
-//   32 = Rumble Text                  (author.displayName)
+//   26 = Kick Subscription            (author.username, no text — drops as no-text)
+//   28 = YouTube Membership           (author.displayName + membership)
+//   29 = YouTube Membership Gifting   (author.displayName + giftMemberships)
+//   32 = Rumble Text                  (author.displayName / author.name)
 // Note: Restream's Chat API does NOT carry a TikTok text event today; the
 // platform is exposed only via guessPlatform fallback for legacy / unknown ids.
 function mapEventTypeId(id: unknown): Platform | undefined {
   switch (id) {
+    case 1:
+      return 'unknown'; // Discord — no dedicated Platform yet, surface as 'unknown' for now
+    case 2:
+    case 3:
+      return 'unknown'; // DLive — same; not in our Platform union
     case 4:
       return 'twitch';
     case 5:
-      return 'youtube';
     case 7:
     case 8:
-      return 'youtube'; // Super Chat / Super Sticker still carry author + text
+    case 23:
+    case 28:
+    case 29:
+      return 'youtube'; // Text / Super Chat / Super Sticker / Member Milestone / Membership / Gifting
     case 11:
+    case 12:
     case 13:
+    case 14:
       return 'facebook';
+    case 21:
+      return 'unknown'; // LinkedIn — no dedicated Platform yet
     case 22:
       return 'trovo';
     case 24:
       return 'x';
     case 25:
+    case 26:
       return 'kick';
     case 32:
       return 'rumble';

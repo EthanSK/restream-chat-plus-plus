@@ -138,4 +138,44 @@ describe('normalizeRestreamEvent', () => {
       normalizeRestreamEventDetailed({ action: 'heartbeat' }).drop?.reason,
     ).toBe('not-event-action');
   });
+
+  it('maps YouTube Super Chat (7), Super Sticker (8), Member Milestone (23), Membership (28), Gifting (29) all to youtube', () => {
+    for (const eventTypeId of [7, 8, 23, 28, 29]) {
+      const m = normalizeRestreamEvent({
+        action: 'event',
+        payload: {
+          eventTypeId,
+          eventPayload: { author: { displayName: 'YTUser' }, text: 'hi' },
+        },
+      });
+      expect(m?.platform, `eventTypeId=${eventTypeId}`).toBe('youtube');
+    }
+  });
+
+  it('maps Facebook sticker variants (12, 14) to facebook', () => {
+    for (const eventTypeId of [12, 14]) {
+      const m = normalizeRestreamEvent({
+        action: 'event',
+        payload: {
+          eventTypeId,
+          eventPayload: { author: { name: 'FBUser' }, text: 'sticker' },
+        },
+      });
+      expect(m?.platform, `eventTypeId=${eventTypeId}`).toBe('facebook');
+    }
+  });
+
+  it('extracts Discord nickname when author.displayName is absent', () => {
+    const m = normalizeRestreamEvent({
+      action: 'event',
+      payload: {
+        eventTypeId: 1,
+        eventPayload: {
+          author: { nickname: 'GuildMember', name: 'rawname#1234' },
+          text: 'gg',
+        },
+      },
+    });
+    expect(m?.username).toBe('GuildMember');
+  });
 });
