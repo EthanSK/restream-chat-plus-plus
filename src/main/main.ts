@@ -7,6 +7,7 @@ import {
   shell,
 } from 'electron';
 import path from 'node:path';
+import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
@@ -17,6 +18,7 @@ import {
   IPC,
   Settings,
   AuthStatus,
+  ConnectionState,
 } from '../shared/types';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -25,6 +27,31 @@ declare const MAIN_WINDOW_VITE_NAME: string;
 if (started) app.quit();
 
 let mainWindow: BrowserWindow | null = null;
+
+/**
+ * Reveal the user-data log folder in Finder / Explorer. We prefer to reveal
+ * the raw-frames.jsonl file directly (so Ethan can `Quick Look` it without
+ * hunting) but fall back to the parent log directory if the WS client hasn't
+ * created the file yet (e.g. authenticated but the WebSocket hasn't opened
+ * yet, or running in a path where the log dir is missing).
+ */
+function revealLogsInFinder(rawLogPath: string | undefined): boolean {
+  try {
+    if (rawLogPath && fs.existsSync(rawLogPath)) {
+      shell.showItemInFolder(rawLogPath);
+      return true;
+    }
+    const dir = rawLogPath
+      ? path.dirname(rawLogPath)
+      : app.getPath('logs');
+    fs.mkdirSync(dir, { recursive: true });
+    shell.openPath(dir);
+    return true;
+  } catch (err) {
+    console.error('[main] revealLogsInFinder failed', err);
+    return false;
+  }
+}
 
 async function createMainWindow() {
   mainWindow = new BrowserWindow({
@@ -69,9 +96,20 @@ function buildMenu() {
               { role: 'about' as const },
               { type: 'separator' as const },
               {
+                id: 'check-for-updates',
                 label: 'Check for Updates…',
+                enabled: true,
+                // The click handler MUST NOT throw synchronously — Electron
+                // surfaces a sync throw as the macOS system alert "this
+                // command is disabled and cannot be executed". Wrap defensively.
                 click: () => {
-                  void checkForUpdatesInteractive(mainWindow);
+                  try {
+                    void checkForUpdatesInteractive(mainWindow).catch((err) =>
+                      console.error('[menu] check-for-updates failed', err),
+                    );
+                  } catch (err) {
+                    console.error('[menu] check-for-updates threw sync', err);
+                  }
                 },
               },
               { type: 'separator' as const },
@@ -134,9 +172,17 @@ function buildMenu() {
           ? []
           : [
               {
+                id: 'check-for-updates-help',
                 label: 'Check for Updates…',
+                enabled: true,
                 click: () => {
-                  void checkForUpdatesInteractive(mainWindow);
+                  try {
+                    void checkForUpdatesInteractive(mainWindow).catch((err) =>
+                      console.error('[menu] check-for-updates failed', err),
+                    );
+                  } catch (err) {
+                    console.error('[menu] check-for-updates threw sync', err);
+                  }
                 },
               },
             ]),
