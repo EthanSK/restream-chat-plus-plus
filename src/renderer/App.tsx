@@ -20,6 +20,7 @@ export function App(): React.ReactElement {
   const [conn, setConn] = useState<ConnectionState>({ status: 'idle', attempt: 0 });
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const ttsRef = useRef<TTSEngine | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
 
@@ -119,12 +120,53 @@ export function App(): React.ReactElement {
     setMessages([]);
   };
 
+  const onReconnect = async () => {
+    if (reconnecting) return;
+    setReconnecting(true);
+    try {
+      await rcpp.reconnect();
+    } catch (err) {
+      console.error('[App] reconnect failed', err);
+    } finally {
+      // Drop the spinner shortly after — the actual state will be reflected
+      // by the status dot via the CONN_STATE stream. Keep a small floor so
+      // the icon doesn't flash.
+      setTimeout(() => setReconnecting(false), 400);
+    }
+  };
+
   return (
     <div className="app">
       <div className="titlebar">Restream Chat++</div>
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />
         <span className="status-label">{statusLabel(conn, auth)}</span>
+        {auth.authenticated && (
+          <button
+            className={`btn icon ghost reconnect-btn${reconnecting ? ' spinning' : ''}`}
+            title="Reconnect"
+            aria-label="Reconnect"
+            disabled={reconnecting}
+            onClick={() => void onReconnect()}
+          >
+            {/* Inline SVG so we avoid an icon-font dependency. */}
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <polyline points="23 4 23 10 17 10" />
+              <polyline points="1 20 1 14 7 14" />
+              <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+            </svg>
+          </button>
+        )}
         <span className="spacer" />
         <button
           className="btn ghost"

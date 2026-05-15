@@ -116,6 +116,7 @@ export const IPC = {
   AUTH_LOGOUT: 'auth:logout',
   CONN_STATE: 'conn:state',
   CONN_STATE_GET: 'conn:state:get',
+  CONN_RECONNECT: 'conn:reconnect',
   CHAT_MESSAGE: 'chat:message',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',

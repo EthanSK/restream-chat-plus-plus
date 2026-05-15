@@ -27,6 +27,15 @@ const api = {
    */
   connectionState: (): Promise<ConnectionState> =>
     ipcRenderer.invoke(IPC.CONN_STATE_GET),
+  /**
+   * Force-reconnect the chat WebSocket. Triggered by the toolbar refresh
+   * button. Main process refreshes the OAuth token first if expired, then
+   * tears down + reopens the socket. Returns ok=true on success, or
+   * ok=false + reason on failure (reason='not-authenticated' or 'error').
+   */
+  reconnect: (): Promise<
+    { ok: true } | { ok: false; reason: 'not-authenticated' | 'error'; error?: string }
+  > => ipcRenderer.invoke(IPC.CONN_RECONNECT),
   onChatMessage: (cb: (m: ChatMessage) => void): Unsub => {
     const h = (_: unknown, m: ChatMessage) => cb(m);
     ipcRenderer.on(IPC.CHAT_MESSAGE, h);

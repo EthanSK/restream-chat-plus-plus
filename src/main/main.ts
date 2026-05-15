@@ -284,6 +284,45 @@ app.on('ready', async () => {
   // ----- IPC: reveal logs in Finder/Explorer (renderer button) -----
   ipcMain.handle(IPC.REVEAL_LOGS, () => revealLogsInFinder(chat.getRawLogPath()));
 
+  // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
+  // Tears down the live WebSocket, resets attempt counters, and immediately
+  // opens a fresh connection. If the stored access token is within 60s of
+  // expiry (matches OAuthCoordinator.isAuthenticated), we transparently
+  // refresh first so the new socket boots with a fresh bearer. If refresh
+  // fails or no token is present, we surface the error via the connection
+  // state stream — the renderer already displays state.lastError.
+  ipcMain.handle(IPC.CONN_RECONNECT, async () => {
+    try {
+      let token = oauth.getToken();
+      // If the token is missing or about-to-expire, refresh before reconnect.
+      // This is the recovery path for a session that's been backgrounded
+      // long enough for the access token to lapse — without this, the new
+      // WS would open with a stale token and immediately get closed by the
+      // server with 401 / handshake fail.
+      const aboutToExpire = !token || token.expiresAt - Date.now() < 60_000;
+      if (aboutToExpire && token?.refreshToken) {
+        const refreshed = await oauth.refresh();
+        if (refreshed) {
+          token = refreshed;
+          mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+            authenticated: true,
+            scope: refreshed.scope,
+            expiresAt: refreshed.expiresAt,
+          } satisfies AuthStatus);
+        }
+      }
+      if (!token) {
+        return { ok: false, reason: 'not-authenticated' as const };
+      }
+      chat.setToken(token.accessToken);
+      chat.reconnect();
+      return { ok: true as const };
+    } catch (err) {
+      console.error('[main] reconnect failed', err);
+      return { ok: false, reason: 'error' as const, error: String((err as Error)?.message ?? err) };
+    }
+  });
+
   ipcMain.handle(IPC.AUTH_LOGOUT, async () => {
     chat.stop();
     await oauth.logout();

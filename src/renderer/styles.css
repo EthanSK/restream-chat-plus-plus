@@ -105,6 +105,26 @@ body {
 .btn.primary { background: var(--accent-hot); border-color: var(--accent-hot); }
 .btn.primary:hover { background: var(--accent); }
 .btn.ghost { background: transparent; }
+.btn:disabled { opacity: 0.55; cursor: default; }
+.btn:disabled:hover { background: transparent; }
+
+.btn.icon {
+  padding: 4px;
+  width: 24px;
+  height: 24px;
+  justify-content: center;
+  color: var(--text-2);
+  border-color: transparent;
+}
+.btn.icon:hover:not(:disabled) { color: var(--text-0); background: var(--bg-3); }
+
+.reconnect-btn svg { display: block; }
+.reconnect-btn.spinning svg { animation: spin 0.7s linear infinite; }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 /* --------------------------------- Feed ---------------------------------- */
 
