@@ -73,6 +73,37 @@ export class ChatClient extends EventEmitter {
     this.setState({ status: 'disconnected', attempt: 0 });
   }
 
+  /**
+   * Force-tear-down the current WebSocket (if any) and immediately attempt a
+   * fresh connection using the stored access token. Bypasses the exponential
+   * backoff timer — this is the user-driven "Reconnect" flow surfaced via
+   * the toolbar refresh button. Safe to call from any state.
+   *
+   * The token-refresh path is intentionally NOT handled here: the caller
+   * (main.ts IPC handler) is responsible for refreshing OAuth first if the
+   * stored token is expired, then calling reconnect(). This keeps the WS
+   * client free of credential-store / OAuth coupling.
+   */
+  reconnect() {
+    this.clearTimers();
+    if (this.ws) {
+      try {
+        this.ws.removeAllListeners();
+      } catch {
+        // ignore
+      }
+      try {
+        this.ws.close();
+      } catch {
+        // ignore
+      }
+      this.ws = undefined;
+    }
+    this.stopped = false;
+    this.attempt = 0;
+    this.connect();
+  }
+
   getState(): ConnectionState {
     return this.state;
   }
@@ -121,6 +152,30 @@ export class ChatClient extends EventEmitter {
       }
       this.appendRawLog({ kind: 'frame', frame: parsed });
       this.emit('raw', parsed);
+
+      // Server-level connection-info / connection-closed surfaces are useful
+      // signal (e.g. Twitch channel disconnected, YouTube broadcast ended).
+      // Log them as their own kind so Ethan can see *why* a stream went quiet
+      // without grepping for frame.payload.status === 'error'. These do NOT
+      // affect our overall ChatClient status — the WS itself is still healthy.
+      if (parsed && typeof parsed === 'object') {
+        const p = parsed as Record<string, any>;
+        if (p.action === 'connection_info' && p.payload?.status === 'error') {
+          this.appendRawLog({
+            kind: 'connection-info-error',
+            eventSourceId: p.payload?.eventSourceId,
+            reason: p.payload?.reason,
+            connectionIdentifier: p.payload?.connectionIdentifier,
+          });
+        } else if (p.action === 'connection_closed') {
+          this.appendRawLog({
+            kind: 'connection-closed',
+            connectionUuid: p.payload?.connectionUuid,
+            reason: p.payload?.reason,
+          });
+        }
+      }
+
       const result = normalizeRestreamEventDetailed(parsed);
       if (result.message) {
         this.emit('message', result.message);

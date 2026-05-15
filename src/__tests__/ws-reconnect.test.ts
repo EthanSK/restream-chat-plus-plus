@@ -69,4 +69,37 @@ describe('ChatClient reconnect', () => {
 
     client.stop();
   });
+
+  it('reconnect() bypasses backoff timer and opens a fresh socket immediately', () => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    ws0.emit('open');
+    ws0.emit('close', 1006, Buffer.from('boom'));
+    // We're now in backoff for ~1s. Without advancing timers, calling
+    // reconnect() should immediately spawn a fresh socket — no timer wait.
+    expect(WS.instances.length).toBe(1);
+    client.reconnect();
+    expect(WS.instances.length).toBe(2);
+    // The reconnect path should reset the attempt counter back to 0 so
+    // future backoff starts fresh from base.
+    expect(client.getState().status).toBe('connecting');
+    expect(client.getState().attempt).toBe(0);
+    client.stop();
+  });
+
+  it('reconnect() from connected state tears down current socket and opens new one', () => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    ws0.emit('open');
+    expect(client.getState().status).toBe('connected');
+    client.reconnect();
+    // Fresh socket created.
+    expect(WS.instances.length).toBe(2);
+    expect(client.getState().status).toBe('connecting');
+    client.stop();
+  });
 });
