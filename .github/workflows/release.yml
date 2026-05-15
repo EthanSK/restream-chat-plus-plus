@@ -172,30 +172,41 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
+          # macOS runners ship bash 3.2 which has no `globstar`; use `find`
+          # for cross-shell recursive matching.
           mkdir -p release-staging
-          shopt -s nullglob globstar
+
+          stage_files() {
+            local pattern="$1"
+            local rename_to="$2"
+            local count=0
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if [ -n "$rename_to" ]; then
+                cp "$f" "release-staging/$rename_to"
+              else
+                cp "$f" "release-staging/"
+              fi
+              count=$((count + 1))
+            done < <(find "out/make" -type f -name "$pattern" 2>/dev/null || true)
+            echo "[stage] pattern=$pattern count=$count"
+          }
 
           case "$PLATFORM" in
             darwin)
-              for f in out/make/zip/darwin/**/*.zip; do
-                cp "$f" "release-staging/restream-chat-plus-plus-${SLUG}-${APP_VERSION}.zip"
-              done
+              stage_files "*.zip" "restream-chat-plus-plus-${SLUG}-${APP_VERSION}.zip"
               ;;
             win32)
-              for f in out/make/squirrel.windows/**/*.exe; do
-                cp "$f" "release-staging/restream-chat-plus-plus-${SLUG}-${APP_VERSION}-Setup.exe"
-              done
-              for f in out/make/squirrel.windows/**/*.nupkg; do
-                cp "$f" "release-staging/restream-chat-plus-plus-${SLUG}-${APP_VERSION}.nupkg"
-              done
+              stage_files "*Setup.exe" "restream-chat-plus-plus-${SLUG}-${APP_VERSION}-Setup.exe"
+              # Squirrel emits the .nupkg with its own version-bearing name;
+              # ship under its original name so Squirrel update math works.
+              stage_files "*.nupkg" ""
+              # Also stage RELEASES manifest if present (Squirrel update feed)
+              stage_files "RELEASES" ""
               ;;
             linux)
-              for f in out/make/deb/**/*.deb; do
-                cp "$f" "release-staging/restream-chat-plus-plus-${SLUG}-${APP_VERSION}.deb"
-              done
-              for f in out/make/rpm/**/*.rpm; do
-                cp "$f" "release-staging/restream-chat-plus-plus-${SLUG}-${APP_VERSION}.rpm"
-              done
+              stage_files "*.deb" "restream-chat-plus-plus-${SLUG}-${APP_VERSION}.deb"
+              stage_files "*.rpm" "restream-chat-plus-plus-${SLUG}-${APP_VERSION}.rpm"
               ;;
           esac
 
