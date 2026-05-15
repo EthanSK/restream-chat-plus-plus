@@ -309,6 +309,16 @@ app.on('ready', async () => {
             scope: refreshed.scope,
             expiresAt: refreshed.expiresAt,
           } satisfies AuthStatus);
+        } else {
+          // Refresh failed AND the token was already expired/about-to-expire.
+          // Reconnecting with this token would just produce a doomed handshake
+          // and a noisy reconnect loop. Surface the auth failure instead so
+          // the renderer can prompt re-auth via the existing AUTH_STATUS
+          // channel. Codex review (v0.1.7) flagged this as MUST-FIX.
+          mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+            authenticated: false,
+          } satisfies AuthStatus);
+          return { ok: false, reason: 'not-authenticated' as const };
         }
       }
       if (!token) {
