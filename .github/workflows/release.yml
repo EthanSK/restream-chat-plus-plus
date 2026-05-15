@@ -295,10 +295,9 @@ jobs:
             echo ""
             echo "### Downloads"
             echo ""
-            echo "macOS (auto-update enabled — pick the matching arch):"
+            echo "macOS (Apple Silicon, auto-update enabled):"
             echo ""
-            echo "- Apple Silicon: \`restream-chat-plus-plus-mac-arm64-*.zip\`"
-            echo "- Intel: \`restream-chat-plus-plus-mac-x64-*.zip\`"
+            echo "- \`restream-chat-plus-plus-mac-arm64-*.zip\`"
             echo ""
             echo "Windows: \`restream-chat-plus-plus-win-x64-*-Setup.exe\`"
             echo ""
@@ -354,7 +353,6 @@ jobs:
             "releaseUrl": "https://github.com/${REPO}/releases/tag/${RELEASE_TAG}",
             "latestDownloads": {
               "macArm64": "https://github.com/${REPO}/releases/latest/download/restream-chat-plus-plus-mac-arm64-${APP_VERSION}.zip",
-              "macX64": "https://github.com/${REPO}/releases/latest/download/restream-chat-plus-plus-mac-x64-${APP_VERSION}.zip",
               "winX64": "https://github.com/${REPO}/releases/latest/download/restream-chat-plus-plus-win-x64-${APP_VERSION}-Setup.exe",
               "linuxX64Deb": "https://github.com/${REPO}/releases/latest/download/restream-chat-plus-plus-linux-x64-${APP_VERSION}.deb",
               "linuxX64Rpm": "https://github.com/${REPO}/releases/latest/download/restream-chat-plus-plus-linux-x64-${APP_VERSION}.rpm"
