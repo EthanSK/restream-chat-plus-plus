@@ -18,6 +18,15 @@ const api = {
     ipcRenderer.on(IPC.CONN_STATE, h);
     return () => ipcRenderer.removeListener(IPC.CONN_STATE, h);
   },
+  /**
+   * Pull-fetch the current connection state. The push channel
+   * (onConnectionState) only delivers UPDATES; if the WebSocket already
+   * transitioned to 'connecting' / 'connected' BEFORE the renderer mounted
+   * its listener, the renderer would otherwise be stuck on its initial
+   * 'idle' placeholder. Calling this on mount syncs the renderer to truth.
+   */
+  connectionState: (): Promise<ConnectionState> =>
+    ipcRenderer.invoke(IPC.CONN_STATE_GET),
   onChatMessage: (cb: (m: ChatMessage) => void): Unsub => {
     const h = (_: unknown, m: ChatMessage) => cb(m);
     ipcRenderer.on(IPC.CHAT_MESSAGE, h);
@@ -28,6 +37,12 @@ const api = {
     ipcRenderer.on('menu:open-settings', h);
     return () => ipcRenderer.removeListener('menu:open-settings', h);
   },
+  onMenuRevealLogs: (cb: () => void): Unsub => {
+    const h = () => cb();
+    ipcRenderer.on('menu:reveal-logs', h);
+    return () => ipcRenderer.removeListener('menu:reveal-logs', h);
+  },
+  revealLogs: (): Promise<boolean> => ipcRenderer.invoke(IPC.REVEAL_LOGS),
   getSettings: (): Promise<Settings> => ipcRenderer.invoke(IPC.SETTINGS_GET),
   setSettings: (s: Settings): Promise<Settings> =>
     ipcRenderer.invoke(IPC.SETTINGS_SET, s),

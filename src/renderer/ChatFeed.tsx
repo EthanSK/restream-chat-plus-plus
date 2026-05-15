@@ -1,13 +1,32 @@
 import React from 'react';
 import { Virtuoso } from 'react-virtuoso';
-import { ChatMessage, PLATFORM_COLORS, PLATFORM_LABELS } from '../shared/types';
+import {
+  ChatMessage,
+  ConnectionState,
+  PLATFORM_COLORS,
+  PLATFORM_LABELS,
+} from '../shared/types';
 
 interface Props {
   messages: ChatMessage[];
   authenticated: boolean;
+  /**
+   * The current WebSocket connection state, used as the SINGLE SOURCE OF
+   * TRUTH for the empty-feed copy. Previously this component always said
+   * "Listening for chat…" the moment the user was authenticated, even
+   * before the WebSocket had connected — which then disagreed with the
+   * toolbar status dot showing "idle" / "connecting" / "error". Deriving
+   * the empty-feed message from `connection.status` keeps both halves of
+   * the UI in lockstep.
+   */
+  connection: ConnectionState;
 }
 
-export function ChatFeed({ messages, authenticated }: Props): React.ReactElement {
+export function ChatFeed({
+  messages,
+  authenticated,
+  connection,
+}: Props): React.ReactElement {
   if (!authenticated) {
     return (
       <div className="feed">
@@ -28,11 +47,7 @@ export function ChatFeed({ messages, authenticated }: Props): React.ReactElement
     return (
       <div className="feed">
         <div className="empty">
-          <h2>Listening for chat…</h2>
-          <p>
-            Once a viewer messages on any of your linked platforms, it'll show
-            up here.
-          </p>
+          <EmptyFeedBody connection={connection} />
         </div>
       </div>
     );
@@ -47,6 +62,79 @@ export function ChatFeed({ messages, authenticated }: Props): React.ReactElement
       />
     </div>
   );
+}
+
+/**
+ * Empty-feed body. Derives its title + body copy from the WebSocket
+ * connection state so the UI never says "Listening for chat…" while the
+ * toolbar status dot disagrees (e.g. status="idle"/"error"/"reconnecting").
+ */
+function EmptyFeedBody({
+  connection,
+}: {
+  connection: ConnectionState;
+}): React.ReactElement {
+  switch (connection.status) {
+    case 'connected':
+      return (
+        <>
+          <h2>Listening for chat…</h2>
+          <p>
+            Connected to Restream. Once a viewer messages on any of your
+            linked platforms, it&apos;ll show up here. If you&apos;ve sent a
+            test message and nothing&apos;s arrived, open Logs → raw-frames.jsonl
+            to see exactly what the WebSocket is forwarding.
+          </p>
+        </>
+      );
+    case 'connecting':
+      return (
+        <>
+          <h2>Connecting to Restream…</h2>
+          <p>Negotiating the WebSocket connection.</p>
+        </>
+      );
+    case 'reconnecting':
+      return (
+        <>
+          <h2>Reconnecting…</h2>
+          <p>
+            Attempt {connection.attempt}
+            {connection.lastError ? ` — last error: ${connection.lastError}` : ''}
+          </p>
+        </>
+      );
+    case 'error':
+      return (
+        <>
+          <h2>Connection error</h2>
+          <p>{connection.lastError ?? 'Unknown error'}</p>
+          <p>
+            Check Logs → raw-frames.jsonl for details, or sign out + back in to
+            re-run the OAuth flow.
+          </p>
+        </>
+      );
+    case 'disconnected':
+      return (
+        <>
+          <h2>Disconnected</h2>
+          <p>The WebSocket is currently closed. Sign out + back in to reconnect.</p>
+        </>
+      );
+    case 'idle':
+    default:
+      return (
+        <>
+          <h2>Idle</h2>
+          <p>
+            The WebSocket hasn&apos;t started yet. If this persists for more
+            than a few seconds after signing in, check Logs → raw-frames.jsonl
+            for OAuth or connection errors.
+          </p>
+        </>
+      );
+  }
 }
 
 function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElement {

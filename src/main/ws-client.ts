@@ -77,6 +77,16 @@ export class ChatClient extends EventEmitter {
     return this.state;
   }
 
+  /**
+   * Public accessor so the main process can resolve / expose the raw-frame
+   * log path (e.g. for a "Reveal Logs in Finder" menu item) without having
+   * to duplicate the platform-specific path-resolution logic. Returns
+   * undefined if the path couldn't be resolved (no Electron app, no fs).
+   */
+  getRawLogPath(): string | undefined {
+    return this.resolveRawLogPath();
+  }
+
   // ------------------------------------------------------------------
   // internals
   // ------------------------------------------------------------------

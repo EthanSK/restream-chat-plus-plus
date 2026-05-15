@@ -85,7 +85,7 @@ async function createMainWindow() {
   });
 }
 
-function buildMenu() {
+function buildMenu(onRevealLogs: () => void) {
   const isMac = process.platform === 'darwin';
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
@@ -132,7 +132,21 @@ function buildMenu() {
       : []),
     {
       label: 'File',
-      submenu: [isMac ? { role: 'close' } : { role: 'quit' }],
+      submenu: [
+        {
+          label: 'Reveal Logs in Finder',
+          accelerator: 'CmdOrCtrl+Shift+L',
+          click: () => {
+            try {
+              onRevealLogs();
+            } catch (err) {
+              console.error('[menu] reveal-logs failed', err);
+            }
+          },
+        },
+        { type: 'separator' as const },
+        isMac ? { role: 'close' as const } : { role: 'quit' as const },
+      ],
     },
     {
       label: 'Edit',
@@ -205,8 +219,27 @@ app.on('ready', async () => {
   const chat = new ChatClient();
 
   app.setName('Restream Chat++');
-  buildMenu();
+  buildMenu(() => revealLogsInFinder(chat.getRawLogPath()));
   await createMainWindow();
+
+  // When the renderer finishes loading, push the CURRENT connection state +
+  // current auth status so the renderer doesn't sit on its initial 'idle'
+  // placeholder. The push-only IPC channel (CONN_STATE) only delivers
+  // updates; if chat.start() ran before the renderer mounted (auth resume
+  // path), the renderer would otherwise never receive the initial state.
+  mainWindow?.webContents.on('did-finish-load', () => {
+    try {
+      mainWindow?.webContents.send(IPC.CONN_STATE, chat.getState());
+      const t = oauth.getToken();
+      mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+        authenticated: oauth.isAuthenticated(),
+        scope: t?.scope,
+        expiresAt: t?.expiresAt,
+      } satisfies AuthStatus);
+    } catch (err) {
+      console.error('[main] failed to send initial state on did-finish-load', err);
+    }
+  });
 
   // Wire auto-update polling (update.electronjs.org → GitHub Releases).
   // Skipped automatically in dev / when not packaged / when running unsigned.
@@ -241,6 +274,15 @@ app.on('ready', async () => {
     };
     return status;
   });
+
+  // ----- IPC: connection state (pull-fetch on renderer mount) -----
+  // Pull-fetch counterpart to the push-only CONN_STATE channel. Renderer
+  // calls this on mount to sync to the current truth (avoids the "stuck on
+  // 'idle' because state transitioned before listener attached" bug).
+  ipcMain.handle(IPC.CONN_STATE_GET, (): ConnectionState => chat.getState());
+
+  // ----- IPC: reveal logs in Finder/Explorer (renderer button) -----
+  ipcMain.handle(IPC.REVEAL_LOGS, () => revealLogsInFinder(chat.getRawLogPath()));
 
   ipcMain.handle(IPC.AUTH_LOGOUT, async () => {
     chat.stop();

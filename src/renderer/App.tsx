@@ -23,7 +23,7 @@ export function App(): React.ReactElement {
   const ttsRef = useRef<TTSEngine | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
 
-  // Init: load auth + settings, subscribe to events.
+  // Init: load auth + settings + current connection state, subscribe to events.
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -35,6 +35,22 @@ export function App(): React.ReactElement {
       setSettings(s);
       ttsRef.current = new TTSEngine(s.tts);
       notifyLimiterRef.current = new RateLimiter(s.notifications.maxPerMinute);
+      // Pull-fetch the current connection state. The push channel
+      // (onConnectionState) only delivers UPDATES — if the main process
+      // already transitioned the WS to 'connecting' / 'connected' BEFORE we
+      // attached our listener (common on the auth-resume code path where
+      // chat.start() runs synchronously inside app.on('ready')), the
+      // renderer would otherwise stay stuck on its initial 'idle'
+      // placeholder while the feed body shows 'Listening for chat…'.
+      // This is the fix for the status-dot-says-idle / feed-says-listening
+      // mismatch (bug #1).
+      try {
+        const initialConn = await rcpp.connectionState();
+        if (!alive) return;
+        setConn(initialConn);
+      } catch (err) {
+        console.error('[App] failed to fetch initial conn state', err);
+      }
     })();
 
     const offAuth = rcpp.onAuthStatus(setAuth);
@@ -110,6 +126,13 @@ export function App(): React.ReactElement {
         <span className={`status-dot ${conn.status}`} />
         <span className="status-label">{statusLabel(conn, auth)}</span>
         <span className="spacer" />
+        <button
+          className="btn ghost"
+          title="Reveal raw-frames.jsonl in Finder for debugging"
+          onClick={() => void rcpp.revealLogs()}
+        >
+          Logs
+        </button>
         {auth.authenticated ? (
           <>
             <button className="btn ghost" onClick={() => setDrawerOpen(true)}>
@@ -125,7 +148,11 @@ export function App(): React.ReactElement {
           </button>
         )}
       </div>
-      <ChatFeed messages={visibleMessages} authenticated={auth.authenticated} />
+      <ChatFeed
+        messages={visibleMessages}
+        authenticated={auth.authenticated}
+        connection={conn}
+      />
       {drawerOpen && (
         <SettingsDrawer
           settings={settings}

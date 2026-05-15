@@ -115,10 +115,12 @@ export const IPC = {
   AUTH_STATUS: 'auth:status',
   AUTH_LOGOUT: 'auth:logout',
   CONN_STATE: 'conn:state',
+  CONN_STATE_GET: 'conn:state:get',
   CHAT_MESSAGE: 'chat:message',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   NOTIFY: 'notify',
+  REVEAL_LOGS: 'logs:reveal',
 } as const;
 
 export interface AuthStatus {
