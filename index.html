@@ -1,12 +1,184 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss:" />
-    <title>Restream Chat++</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Restream Chat++ — native Restream chat client for macOS, Windows, Linux</title>
+    <meta
+      name="description"
+      content="A native cross-platform replacement for Restream's broken Apple-Silicon Chat desktop app. Free, open source."
+    />
+    <meta name="theme-color" content="#0d1117" />
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/renderer/main.tsx"></script>
+    <header class="hero">
+      <div class="container">
+        <h1>
+          <span class="brand-mark">RC++</span>
+          Restream Chat<span class="brand-plus">++</span>
+        </h1>
+        <p class="tagline">
+          A native, cross-platform replacement for the official Restream Chat app —
+          because the real one is x86 Electron under Rosetta and crashes every audio cue.
+        </p>
+
+        <div class="cta-row">
+          <a class="cta primary" id="download-mac-arm" href="#" rel="noopener">
+            <span class="cta-label">Download for macOS</span>
+            <span class="cta-sub" id="download-mac-arm-sub">Apple Silicon</span>
+          </a>
+          <a class="cta" id="download-mac-x64" href="#" rel="noopener">
+            <span class="cta-label">macOS (Intel)</span>
+          </a>
+          <a class="cta" id="download-win" href="#" rel="noopener">
+            <span class="cta-label">Windows</span>
+          </a>
+          <a class="cta" id="download-linux" href="#" rel="noopener">
+            <span class="cta-label">Linux (.deb)</span>
+          </a>
+        </div>
+
+        <div class="version-badge" id="version-badge">
+          <span class="dot"></span>
+          <span id="version-text">Loading latest version…</span>
+          <a
+            class="version-link"
+            id="version-link"
+            href="https://github.com/EthanSK/restream-chat-plus-plus/releases"
+            rel="noopener"
+            >View all releases →</a
+          >
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <section>
+        <h2>Why does this exist?</h2>
+        <p>
+          Restream ships an official desktop chat client, but it's x86 Electron
+          running under Rosetta on Apple Silicon. Every queued audio cue
+          (notification or TTS) crashes it. It's been broken for years.
+        </p>
+        <p>
+          Restream Chat++ is a personal-use, from-scratch reimplementation that
+          runs natively on every platform — Apple Silicon and Intel macOS,
+          Windows, Linux. It connects to the same OAuth + chat WebSocket the
+          official app uses, so all your accounts and live streams work
+          identically.
+        </p>
+      </section>
+
+      <section>
+        <h2>What it does</h2>
+        <ul class="features">
+          <li>
+            <strong>Native everywhere.</strong>
+            Apple Silicon arm64, Intel x86_64, Windows x64, Linux x64.
+          </li>
+          <li>
+            <strong>Multi-platform chat in one feed.</strong>
+            Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X — all
+            normalised to a single message shape with per-platform colours and badges.
+          </li>
+          <li>
+            <strong>TTS that doesn't die.</strong>
+            Web Speech API with rate-limit so a raid can't drown you in
+            synthesized speech.
+          </li>
+          <li>
+            <strong>Native notifications.</strong>
+            Optional, with their own rate limit.
+          </li>
+          <li>
+            <strong>Settings persist.</strong>
+            TTS voice, per-platform filters, rate limits.
+          </li>
+          <li>
+            <strong>Auto-update.</strong>
+            New releases ship via GitHub. The app checks once an hour.
+          </li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Install</h2>
+        <ol class="install-steps">
+          <li>Download the package for your platform above.</li>
+          <li>
+            <strong>macOS:</strong> open the ZIP, drag <code>Restream Chat Plus Plus.app</code>
+            to <code>/Applications</code>, launch.
+          </li>
+          <li>
+            <strong>Windows:</strong> run the <code>Setup.exe</code> installer.
+          </li>
+          <li>
+            <strong>Linux:</strong>
+            <code>sudo dpkg -i restream-chat-plus-plus-*.deb</code> or use the .rpm.
+          </li>
+          <li>
+            Sign in with your Restream account. Done.
+          </li>
+        </ol>
+        <p class="note">
+          The app is signed + notarized for macOS via Apple Developer ID — no
+          Gatekeeper prompts, no right-click-open dance.
+        </p>
+      </section>
+
+      <section>
+        <h2>Open source</h2>
+        <p>
+          MIT licensed. Issues and pull requests welcome at
+          <a href="https://github.com/EthanSK/restream-chat-plus-plus" rel="noopener"
+            >github.com/EthanSK/restream-chat-plus-plus</a
+          >.
+        </p>
+        <p class="disclaimer">
+          Not affiliated with Restream. Not published to any app store.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container">
+        <p>
+          <a href="https://github.com/EthanSK/restream-chat-plus-plus" rel="noopener">GitHub</a>
+          ·
+          <a href="https://github.com/EthanSK/restream-chat-plus-plus/releases" rel="noopener">Releases</a>
+          ·
+          <a href="https://github.com/EthanSK/restream-chat-plus-plus/issues" rel="noopener">Issues</a>
+        </p>
+      </div>
+    </footer>
+
+    <script>
+      // Fetch the dynamic version + download URLs and wire the buttons.
+      // version.json is published to gh-pages by the release workflow.
+      (async function () {
+        try {
+          const res = await fetch("./version.json", { cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          const version = data.version || "unknown";
+          const tag = data.tag || "v" + version;
+          const dl = data.latestDownloads || {};
+
+          document.getElementById("version-text").textContent =
+            "Latest version: " + tag;
+          document.getElementById("version-link").href =
+            "https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/" + tag;
+
+          if (dl.macArm64) document.getElementById("download-mac-arm").href = dl.macArm64;
+          if (dl.macX64) document.getElementById("download-mac-x64").href = dl.macX64;
+          if (dl.winX64) document.getElementById("download-win").href = dl.winX64;
+          if (dl.linuxX64Deb) document.getElementById("download-linux").href = dl.linuxX64Deb;
+        } catch (err) {
+          document.getElementById("version-text").textContent =
+            "Couldn't fetch latest version — try GitHub releases:";
+        }
+      })();
+    </script>
   </body>
 </html>

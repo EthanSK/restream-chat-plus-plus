@@ -1,0 +1,258 @@
+/* Restream Chat++ landing page — dark-mode-first */
+:root {
+  --bg: #0b0e13;
+  --bg-elevated: #131720;
+  --fg: #e6edf3;
+  --fg-dim: #8b949e;
+  --accent: #5eead4;
+  --accent-hover: #2dd4bf;
+  --border: #21262d;
+  --plus-color: #f97583;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    Inter, Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.55;
+}
+
+.container {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* Hero */
+.hero {
+  padding: 80px 0 60px;
+  background: radial-gradient(
+      ellipse at top,
+      rgba(94, 234, 212, 0.08) 0%,
+      transparent 60%
+    ),
+    var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.hero h1 {
+  margin: 0 0 16px 0;
+  font-size: clamp(2.4rem, 6vw, 3.6rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  background: linear-gradient(135deg, var(--accent), var(--plus-color));
+  color: #0b0e13;
+  border-radius: 14px;
+  font-weight: 800;
+  font-size: 1.1rem;
+  letter-spacing: -0.02em;
+  flex-shrink: 0;
+}
+
+.brand-plus {
+  color: var(--plus-color);
+}
+
+.tagline {
+  font-size: 1.15rem;
+  color: var(--fg-dim);
+  max-width: 640px;
+  margin: 0 0 36px 0;
+}
+
+/* CTA row */
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.cta {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 14px 22px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--fg);
+  text-decoration: none;
+  transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+  min-width: 168px;
+}
+
+.cta:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.cta.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  color: #0b0e13;
+  border-color: transparent;
+}
+
+.cta.primary:hover {
+  background: linear-gradient(135deg, var(--accent-hover), var(--accent));
+}
+
+.cta-label {
+  font-weight: 600;
+  font-size: 0.98rem;
+}
+
+.cta-sub {
+  font-size: 0.8rem;
+  opacity: 0.8;
+  margin-top: 2px;
+}
+
+/* Version badge */
+.version-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.9rem;
+  color: var(--fg-dim);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.version-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.version-link:hover {
+  text-decoration: underline;
+}
+
+/* Sections */
+main {
+  padding: 60px 0;
+}
+
+section {
+  margin-bottom: 56px;
+}
+
+h2 {
+  font-size: 1.5rem;
+  margin: 0 0 16px 0;
+  letter-spacing: -0.01em;
+}
+
+p {
+  color: var(--fg-dim);
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: var(--bg-elevated);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.features {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.features li {
+  padding: 16px 18px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg-dim);
+}
+
+.features li strong {
+  color: var(--fg);
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.install-steps {
+  padding-left: 20px;
+  color: var(--fg-dim);
+}
+
+.install-steps li {
+  margin-bottom: 8px;
+}
+
+.note,
+.disclaimer {
+  font-size: 0.9rem;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+/* Footer */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 24px 0;
+  margin-top: 40px;
+  font-size: 0.9rem;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+footer a {
+  color: var(--fg-dim);
+  text-decoration: none;
+  margin: 0 6px;
+}
+
+footer a:hover {
+  color: var(--accent);
+}
+
+@media (min-width: 640px) {
+  .features {
+    grid-template-columns: 1fr 1fr;
+  }
+}
