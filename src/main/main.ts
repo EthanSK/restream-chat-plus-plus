@@ -11,6 +11,7 @@ import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
 import { createStore } from './store';
+import { configureAutoUpdater, checkForUpdatesInteractive } from './updater';
 import {
   DEFAULT_SETTINGS,
   IPC,
@@ -68,6 +69,13 @@ function buildMenu() {
               { role: 'about' as const },
               { type: 'separator' as const },
               {
+                label: 'Check for Updates…',
+                click: () => {
+                  void checkForUpdatesInteractive(mainWindow);
+                },
+              },
+              { type: 'separator' as const },
+              {
                 label: 'Preferences…',
                 accelerator: 'CmdOrCtrl+,',
                 click: () => mainWindow?.webContents.send('menu:open-settings'),
@@ -122,6 +130,23 @@ function buildMenu() {
           click: () =>
             shell.openExternal('https://github.com/EthanSK/restream-chat-plus-plus'),
         },
+        ...(isMac
+          ? []
+          : [
+              {
+                label: 'Check for Updates…',
+                click: () => {
+                  void checkForUpdatesInteractive(mainWindow);
+                },
+              },
+            ]),
+        {
+          label: 'View Releases',
+          click: () =>
+            shell.openExternal(
+              'https://github.com/EthanSK/restream-chat-plus-plus/releases',
+            ),
+        },
       ],
     },
   ];
@@ -136,6 +161,10 @@ app.on('ready', async () => {
   app.setName('Restream Chat++');
   buildMenu();
   await createMainWindow();
+
+  // Wire auto-update polling (update.electronjs.org → GitHub Releases).
+  // Skipped automatically in dev / when not packaged / when running unsigned.
+  configureAutoUpdater();
 
   // ----- IPC: auth -----
   ipcMain.handle(IPC.AUTH_START, async () => {
