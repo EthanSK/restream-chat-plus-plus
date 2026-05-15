@@ -80,10 +80,6 @@ jobs:
             slug: mac-arm64
             forge_args: --arch=arm64
             platform: darwin
-          - runner: macos-13
-            slug: mac-x64
-            forge_args: --arch=x64
-            platform: darwin
           - runner: windows-latest
             slug: win-x64
             forge_args: --arch=x64
