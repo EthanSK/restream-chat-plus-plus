@@ -43,6 +43,11 @@ const osxNotarize = hasMacSigningSecrets
     }
   : undefined;
 
+// App icon. Forge / electron-packager auto-appends the platform-specific
+// extension (.icns on macOS, .ico on Windows). For Linux, makers (`MakerDeb`,
+// `MakerRpm`) consume `build/icon.png` directly via their own `options.icon`.
+const iconPath = path.resolve(__dirname, 'build/icon');
+
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
@@ -50,6 +55,7 @@ const config: ForgeConfig = {
     executableName: 'restream-chat-plus-plus',
     appBundleId: 'com.ethansk.restream-chat-plus-plus',
     appCategoryType: 'public.app-category.social-networking',
+    icon: iconPath,
     // macOS is shipped as TWO separate per-arch zips (arm64 + x64) rather
     // than one universal `lipo`-merged bundle. Reasons:
     //   1. update.electronjs.org polls per-arch URLs anyway, so per-arch
@@ -65,12 +71,23 @@ const config: ForgeConfig = {
   },
   rebuildConfig: {},
   makers: [
-    new MakerSquirrel({}),
+    new MakerSquirrel({
+      // Windows installer icon (shown in Add/Remove Programs + the .exe itself).
+      setupIcon: path.resolve(__dirname, 'build/icon.ico'),
+    }),
     // MakerZIP for darwin produces the .zip that update-electron-app +
     // update.electronjs.org expect for GitHub-releases-backed auto-updates.
     new MakerZIP({}, ['darwin']),
-    new MakerRpm({}),
-    new MakerDeb({}),
+    new MakerRpm({
+      options: {
+        icon: path.resolve(__dirname, 'build/icon.png'),
+      },
+    }),
+    new MakerDeb({
+      options: {
+        icon: path.resolve(__dirname, 'build/icon.png'),
+      },
+    }),
   ],
   plugins: [
     new AutoUnpackNativesPlugin({}),

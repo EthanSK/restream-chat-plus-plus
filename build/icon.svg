@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Dark rounded-square background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#1a1a1a"/>
+
+  <!-- White chat bubble, centered, with tail bottom-left -->
+  <!-- Bubble body: rounded rect, tail formed by an extra triangle merged into the bottom-left -->
+  <path d="
+      M 232 232
+      L 792 232
+      Q 872 232 872 312
+      L 872 632
+      Q 872 712 792 712
+      L 432 712
+      L 296 836
+      L 320 712
+      L 232 712
+      Q 152 712 152 632
+      L 152 312
+      Q 152 232 232 232
+      Z"
+      fill="#ffffff"/>
+
+  <!-- "++" overlay, bright green, bottom-right corner of the icon -->
+  <!-- Each "+" is a single union path with rounded outer corners only -->
+  <g fill="#22c55e">
+    <!-- First "+" centered at (690, 860) -->
+    <path d="M 660 770
+             L 720 770 L 720 830
+             L 780 830 L 780 890
+             L 720 890 L 720 950
+             L 660 950 L 660 890
+             L 600 890 L 600 830
+             L 660 830 Z"/>
+    <!-- Second "+" centered at (850, 860) -->
+    <path d="M 820 770
+             L 880 770 L 880 830
+             L 940 830 L 940 890
+             L 880 890 L 880 950
+             L 820 950 L 820 890
+             L 760 890 L 760 830
+             L 820 830 Z"/>
+  </g>
+</svg>
