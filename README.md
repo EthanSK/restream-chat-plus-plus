@@ -74,24 +74,11 @@ src/
   shared/types.ts         Shared types between main + renderer
   __tests__/              Vitest tests (11 tests covering normalisation, WS reconnect, backoff, rate-limit)
 build/
-  entitlements.mac.plist  Hardened-runtime entitlements for notarization
+  entitlements.mac.plist
 .github/workflows/
   ci.yml                  Lint + typecheck + tests on PR + push
-  release.yml             Per-arch build + sign + notarize + GitHub Release + pages update
+  release.yml             Per-arch build + GitHub Release + pages update
 ```
-
-### Code signing + notarization
-
-CI builds are signed with an Apple Developer ID certificate and notarized via `notarytool`. The signing path is gated on the following GitHub Secrets being set:
-
-- `APPLE_CERT_P12_BASE64` — base64-encoded Developer ID `.p12`
-- `APPLE_CERT_PASSWORD` — password used when exporting the `.p12`
-- `APPLE_ID` — Apple ID email
-- `APPLE_APP_SPECIFIC_PASSWORD` — app-specific password from appleid.apple.com
-- `APPLE_TEAM_ID` — 10-character Apple Developer Team ID
-- `APPLE_IDENTITY` — full identity string, e.g. `"Developer ID Application: Ethan Sarif-Kattan (TEAMID)"`
-
-Without these, builds still succeed but are unsigned (auto-update won't work on macOS, Gatekeeper will warn on first launch). Local dev builds always skip signing.
 
 ## Status
 
