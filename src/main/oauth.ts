@@ -95,6 +95,11 @@ export class OAuthCoordinator {
   /**
    * If the access token is expired but a refresh token exists, refresh.
    * Returns the new token set or undefined if refresh failed / not possible.
+   *
+   * Per Restream docs (https://developers.restream.io/authentication/refreshing-tokens)
+   * Basic Auth is the recommended method (keeps the client_secret out of any
+   * query-string-style logging). We send credentials via the Authorization
+   * header and only the grant params in the body.
    */
   async refresh(): Promise<TokenSet | undefined> {
     const existing = this.getToken();
@@ -105,17 +110,23 @@ export class OAuthCoordinator {
     const body = new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: existing.refreshToken,
-      client_id: creds.clientId,
-      client_secret: creds.clientSecret,
     });
+    const basicAuth = Buffer.from(
+      `${creds.clientId}:${creds.clientSecret}`,
+      'utf8',
+    ).toString('base64');
     try {
       const res = await fetch(TOKEN_URL, {
         method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          authorization: `Basic ${basicAuth}`,
+        },
         body: body.toString(),
       });
       if (!res.ok) return undefined;
       const json: any = await res.json();
+      if (!json.access_token) return undefined;
       const tokenSet: TokenSet = {
         accessToken: json.access_token,
         refreshToken: json.refresh_token ?? existing.refreshToken,
