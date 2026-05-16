@@ -55,6 +55,7 @@ describe('chat-send', () => {
     const result = await sendChatText({
       text: 'hello',
       connections: [],
+      showId: 'show-1',
       parentWindow: null,
       getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
       skipColdStart: true,
@@ -64,10 +65,26 @@ describe('chat-send', () => {
     expect(result.reason).toBe('no-active-connections');
   });
 
+  it('returns no-show-id when WS has not sniffed a showId yet', async () => {
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      // showId intentionally omitted — the WS client hasn't seen an
+      // event/reply frame yet so it cannot supply one.
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: vi.fn() as any,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no-show-id');
+  });
+
   it('returns no-session-cookies when partition has no chat cookies', async () => {
     const result = await sendChatText({
       text: 'hello',
       connections: [makeConn('c1')],
+      showId: 'show-1',
       parentWindow: null,
       getSession: () => fakeSession([]),
       skipColdStart: true,
@@ -81,6 +98,7 @@ describe('chat-send', () => {
     const result = await sendChatText({
       text: 'hello',
       connections: [makeConn('c1')],
+      showId: 'show-1',
       parentWindow: null,
       getSession: () => fakeSession([{ name: 'someOther', value: 'v' }]),
       skipColdStart: true,
@@ -99,6 +117,7 @@ describe('chat-send', () => {
     const result = await sendChatText({
       text: 'hi chat',
       connections: [makeConn('user-twitch-x'), makeConn('user-youtube-y', 'error')],
+      showId: 'd2c85b30-9523-476d-a50f-eac4b80490e4',
       parentWindow: null,
       getSession: () =>
         fakeSession([
@@ -121,6 +140,10 @@ describe('chat-send', () => {
     expect(body.text).toBe('hi chat');
     expect(body.connectionIdentifiers).toEqual(['user-twitch-x']);
     expect(body.clientReplyUuid).toBe('uuid-fixed');
+    // v0.1.17: showId MUST be in the body — without it Restream's backend
+    // returns 404 because it can't resolve the active show. Regression
+    // guard so we never silently drop showId again.
+    expect(body.showId).toBe('d2c85b30-9523-476d-a50f-eac4b80490e4');
   });
 
   it('returns send-failed with status code on non-2xx', async () => {
@@ -129,6 +152,7 @@ describe('chat-send', () => {
     const result = await sendChatText({
       text: 'hi',
       connections: [makeConn('c1')],
+      showId: 'show-1',
       parentWindow: null,
       getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
       skipColdStart: true,
@@ -143,6 +167,7 @@ describe('chat-send', () => {
     const result = await sendChatText({
       text: '   ',
       connections: [makeConn('c1')],
+      showId: 'show-1',
       parentWindow: null,
       getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
       skipColdStart: true,

@@ -174,6 +174,8 @@ function prettyReason(result: SendTextResult): string {
       return 'Chat session not provisioned — click Compose once to sign in to chat.';
     case 'no-active-connections':
       return 'No connected channels to reply to.';
+    case 'no-show-id':
+      return 'Waiting for first chat frame — wait a moment, then try again.';
     case 'send-failed':
       return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}. Click Compose to refresh session.`;
     case 'error':

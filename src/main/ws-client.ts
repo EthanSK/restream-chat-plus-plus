@@ -73,6 +73,23 @@ export class ChatClient extends EventEmitter {
    */
   private connections = new Map<string, ChatConnection>();
 
+  /**
+   * The current Restream `showId` — a per-account "show" identifier that
+   * Restream's backend requires on `POST /api/v2/client/reply` to know which
+   * show's connections the reply should fan out to. Without it the endpoint
+   * returns 404 (no show context), which is the bug the v0.1.17 inline-send
+   * fix targets.
+   *
+   * We sniff it from incoming WS frames — every `event` and `reply_created`
+   * frame carries `payload.showId` set to the same value for the lifetime of
+   * the WS connection. We store the latest seen value and expose it via
+   * `getShowId()` so the inline send can include it in the POST body.
+   *
+   * Reset on every fresh WS connect so a reconnect doesn't smuggle a stale
+   * showId across an account switch.
+   */
+  private showId?: string;
+
   setToken(token: string) {
     this.accessToken = token;
   }
@@ -140,6 +157,16 @@ export class ChatClient extends EventEmitter {
   }
 
   /**
+   * Latest `showId` sniffed from incoming WS frames, or undefined if none has
+   * been seen yet (e.g. WS just connected, no events / replies received). The
+   * inline send path threads this into the `POST /client/reply` body — see
+   * the field-level comment on `this.showId` above for the why.
+   */
+  getShowId(): string | undefined {
+    return this.showId;
+  }
+
+  /**
    * Public accessor so the main process can resolve / expose the raw-frame
    * log path (e.g. for a "Reveal Logs in Finder" menu item) without having
    * to duplicate the platform-specific path-resolution logic. Returns
@@ -165,6 +192,9 @@ export class ChatClient extends EventEmitter {
       this.connections.clear();
       this.emit('connections', this.getConnections());
     }
+    // Drop any cached showId — a reconnect may be onto a different account /
+    // show. We'll re-sniff it from the first event / reply frame we see.
+    this.showId = undefined;
     this.setState({
       status: this.attempt === 0 ? 'connecting' : 'reconnecting',
       attempt: this.attempt,
@@ -190,6 +220,21 @@ export class ChatClient extends EventEmitter {
       }
       this.appendRawLog({ kind: 'frame', frame: parsed });
       this.emit('raw', parsed);
+
+      // Sniff `showId` from any frame that carries one (`event`,
+      // `reply_created`, etc). Restream's `POST /client/reply` requires
+      // showId in the body or it 404s — v0.1.17 inline-send fix. Cache the
+      // latest non-empty value; subsequent frames with the same value are
+      // idempotent. We don't gate on action type because the show context
+      // is the same across all frames in a given WS session.
+      try {
+        const pid = (parsed as any)?.payload?.showId;
+        if (typeof pid === 'string' && pid && pid !== this.showId) {
+          this.showId = pid;
+        }
+      } catch {
+        // never break delivery on a sniff failure
+      }
 
       // Server-level connection-info / connection-closed surfaces are useful
       // signal (e.g. Twitch channel disconnected, YouTube broadcast ended).

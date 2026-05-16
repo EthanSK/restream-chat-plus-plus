@@ -225,6 +225,12 @@ export interface AuthStatus {
  *                              via an invisible Compose window first; this
  *                              reason is reported only if that fails too.
  *  - `no-active-connections` — channels panel is empty (nothing to reply to).
+ *  - `no-show-id`            — WS hasn't sniffed a `showId` yet (no event or
+ *                              reply frame received this session). Restream's
+ *                              `/client/reply` endpoint 404s without it, so
+ *                              we short-circuit before the POST and ask the
+ *                              user to wait a beat or click Compose once.
+ *                              v0.1.17.
  *  - `send-failed`           — POST /client/reply returned non-2xx.
  *  - `error`                 — unexpected (network / JS) failure.
  */
@@ -234,6 +240,7 @@ export interface SendTextResult {
     | 'not-authenticated'
     | 'no-session-cookies'
     | 'no-active-connections'
+    | 'no-show-id'
     | 'send-failed'
     | 'error';
   status?: number;

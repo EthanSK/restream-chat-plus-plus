@@ -42,7 +42,15 @@ function getElectron(): {
  *     cookie:         <serialized .restream.io session cookies>
  *   Body (JSON):
  *     { connectionIdentifiers: string[], clientReplyUuid: string,
- *       text: string }
+ *       text: string, showId: string }
+ *
+ *   v0.1.17 fix: previously we omitted `showId` and the endpoint returned
+ *   404 ("send failed (HTTP 404)"). The Restream backend uses showId to
+ *   resolve the active show whose connections the reply should fan out to
+ *   — without it there is no show context and the request 404s. The
+ *   `ws-client` sniffs the showId from every incoming `event` /
+ *   `reply_created` frame and exposes it via `chat.getShowId()`; the IPC
+ *   handler in `main.ts` threads that into `sendChatText`.
  *
  * The successful send is echoed back via the WebSocket as a `reply_created`
  * frame — our `normalize.ts` already surfaces those as `self: true`
@@ -189,6 +197,15 @@ function buildHeaders(cookieHeader: string, xsrf: string): Record<string, string
 export interface ChatSendOptions {
   text: string;
   connections: ChatConnection[];
+  /**
+   * The current Restream `showId` — required in the POST body, otherwise
+   * the endpoint 404s (v0.1.17 fix). Sniffed by the WS client from any
+   * incoming `event` / `reply_created` frame. When the WS hasn't seen a
+   * frame yet (just-connected, no events), this is undefined and the
+   * send returns `no-show-id` so the renderer can prompt the user to
+   * wait or open Compose manually.
+   */
+  showId?: string;
   parentWindow: BrowserWindow | null;
   /** Injected for unit tests. */
   fetchImpl?: typeof fetch;
@@ -214,6 +231,15 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     return { ok: false, reason: 'no-active-connections' };
   }
 
+  // The Restream backend resolves the target show via `showId` in the
+  // body. Without it we get HTTP 404 (the bug v0.1.17 fixes). If the WS
+  // hasn't sniffed a showId yet — usually because no incoming event /
+  // reply has been received this session — surface a distinct reason so
+  // the renderer can suggest "wait for first message or click Compose".
+  if (!opts.showId) {
+    return { ok: false, reason: 'no-show-id' };
+  }
+
   const sess = (opts.getSession ?? getRestreamSession)();
   let cookies = await readRestreamCookies(sess);
   if (!cookies || !cookies.xsrf) {
@@ -230,6 +256,7 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     connectionIdentifiers: ids,
     clientReplyUuid: (opts.uuid ?? randomUUID)(),
     text,
+    showId: opts.showId,
   });
 
   const headers = buildHeaders(cookies.cookieHeader, cookies.xsrf);

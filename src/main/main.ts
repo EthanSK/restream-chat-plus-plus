@@ -679,10 +679,17 @@ app.on('ready', async () => {
       // wants more room. Minimums prevent the user from accidentally
       // collapsing it to unusable.
       const win = new BrowserWindow({
-        width: 380,
-        height: 320,
-        minWidth: 320,
-        minHeight: 240,
+        // v0.1.17: the previous 380x320 default was too small for Restream's
+        // /embed webchat — at that size the chat layout's min-widths kick in
+        // and the page renders at what looks like 200%+ zoom (clipped text,
+        // huge buttons). 720x720 with a more permissive minWidth gives the
+        // embed enough room to render at its natural size. `useContentSize`
+        // ensures the dimensions are the WEB content area, not including the
+        // titlebar / chrome.
+        width: 720,
+        height: 720,
+        minWidth: 480,
+        minHeight: 420,
         useContentSize: true,
         resizable: true,
         title: 'Restream Compose',
@@ -695,7 +702,27 @@ app.on('ready', async () => {
           // (`persist:restream-oauth`) so the webchat URL trips on the
           // already-authenticated session and skips the sign-in redirect.
           session: session.fromPartition('persist:restream-oauth'),
+          // Disable Chromium's per-origin zoom-factor persistence. Without
+          // this, a zoom level applied in a previous Compose session (or a
+          // mis-tuned default from Restream's site CSS) is restored across
+          // BrowserWindow lifetimes — Ethan saw the Compose window pop up at
+          // ~150% zoom after each restart. v0.1.17 fix.
+          zoomFactor: 1.0,
         },
+      });
+
+      // Force-reset zoom on load AND when the user accidentally triggers a
+      // zoom shortcut. `webPreferences.zoomFactor` is the INITIAL value but
+      // Chromium can drift if Restream's page or a pinch-zoom event fires.
+      // We hard-reset on did-finish-load to neutralise any per-origin
+      // persisted zoom and prevent the "tiny window + huge text" symptom.
+      win.webContents.on('did-finish-load', () => {
+        try {
+          win.webContents.setZoomFactor(1.0);
+          win.webContents.setVisualZoomLevelLimits(1, 1);
+        } catch (err) {
+          console.error('[main] compose zoom reset failed', err);
+        }
       });
 
       // ----------------------------------------------------------------
@@ -764,6 +791,7 @@ app.on('ready', async () => {
       const result = await sendChatText({
         text: rawText,
         connections: chat.getConnections(),
+        showId: chat.getShowId(),
         parentWindow: mainWindow,
       });
       return result;
