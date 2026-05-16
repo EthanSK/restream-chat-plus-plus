@@ -14,6 +14,7 @@ import { ChatFeed } from './ChatFeed';
 import { ChatInput } from './ChatInput';
 import { SettingsDrawer } from './SettingsDrawer';
 import { TTSEngine, RateLimiter } from './tts';
+import { shouldProceedWithSignOut } from './auth-guards';
 
 const MAX_MESSAGES = 1000;
 
@@ -136,6 +137,14 @@ export function App(): React.ReactElement {
   };
 
   const onSignOut = async () => {
+    // Sign-out is destructive — it clears the OAuth token and forces a full
+    // re-auth round-trip on next launch. Ethan accidentally clicked the
+    // button once and lost the session; guard with a confirm dialog so a
+    // mis-click is recoverable. Tests cover the cancel-path-does-not-clear
+    // behaviour via the `shouldProceedWithSignOut` helper below.
+    if (!shouldProceedWithSignOut(typeof window !== 'undefined' ? window.confirm : undefined)) {
+      return;
+    }
     const s = await rcpp.authLogout();
     setAuth(s);
     setMessages([]);
