@@ -26,18 +26,64 @@ export interface NormalizeResult {
  *                                 eventSourceId, eventTypeId, eventPayload,
  *                                 userId }, timestamp }
  *
+ * Additionally — and this is the v0.1.10 fix for "my own messages don't
+ * show up in the feed even though they show in the official app" — we now
+ * also normalise `reply_created` frames. Restream's Chat WS is read-only
+ * for third-party clients, but the OFFICIAL Restream Chat webchat sends
+ * replies via Restream's private API and the WS rebroadcasts them to all
+ * subscribers (us included) as `reply_created`. Those carry just text /
+ * connectionIdentifiers / eventSourceId, so we surface them as
+ * `self: true` ChatMessages with username "You" and the corresponding
+ * platform inferred from `eventSourceId` (when it's not the meta "all
+ * connections" id of 1).
+ *
  * Reference: https://developers.restream.io/chat/actions
  *            https://developers.restream.io/chat/events
+ *            https://developers.restream.io/chat/reply
  */
 export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
   if (!raw || typeof raw !== 'object') return { drop: { reason: 'not-object' } };
   const r = raw as Record<string, any>;
 
+  // `reply_created` is the streamer's own outgoing reply (echoed by the WS
+  // to every subscriber). Surface it as a self-message so the user can see
+  // their own posts inline with incoming chat — the official Restream Chat
+  // app does the same thing visually.
+  if (r.action === 'reply_created') {
+    const p = (r.payload ?? {}) as Record<string, any>;
+    const text = typeof p.text === 'string' ? p.text : '';
+    if (!text) return { drop: { reason: 'no-text' } };
+    // Platform inference: when the reply is sent to ALL connections,
+    // eventSourceId === 1 ("Restream" source). For direct replies the id
+    // matches the destination platform. Fall back to inspecting the first
+    // connectionIdentifier (formatted "<userId>-<platform>-<channelId>") to
+    // recover the platform for common replies too — otherwise every
+    // outgoing common reply renders as "unknown" which looks broken.
+    const platform: Platform =
+      mapEventSourceId(p.eventSourceId) ?? guessPlatformFromConnectionIds(p.connectionIdentifiers);
+    const ts = Date.now();
+    const id =
+      (typeof p.replyUuid === 'string' && p.replyUuid) ||
+      (typeof p.clientReplyUuid === 'string' && p.clientReplyUuid) ||
+      `self-${ts}-${Math.random().toString(36).slice(2, 8)}`;
+    return {
+      message: {
+        id: String(id),
+        platform,
+        username: 'You',
+        text,
+        ts,
+        self: true,
+        raw,
+      },
+    };
+  }
+
   // The Restream Chat WS protocol sends action-tagged envelopes.
   // Drop non-event actions (heartbeat, connection_info, connection_closed,
-  // reply_*, relay_*). If `action` is absent, accept the payload anyway —
-  // this is the legacy / test-fixture shape and we don't want to silently
-  // drop it.
+  // relay_*, the OTHER reply_* lifecycle actions). If `action` is absent,
+  // accept the payload anyway — this is the legacy / test-fixture shape
+  // and we don't want to silently drop it.
   if (r.action && r.action !== 'event') return { drop: { reason: 'not-event-action' } };
 
   const payload =
@@ -157,6 +203,74 @@ function mapEventTypeId(id: unknown): Platform | undefined {
     default:
       return undefined;
   }
+}
+
+/**
+ * Map Restream's `eventSourceId` (per https://developers.restream.io/chat/event-sources)
+ * to our Platform union. Used by reply_created handling; the event normaliser
+ * uses `eventTypeId` instead since events carry more granular ids.
+ *
+ * Note: `eventSourceId: 1` is the special "Restream" pseudo-source used when
+ * a reply targets ALL connections (common reply). Returning `undefined` for
+ * id=1 lets the caller fall back to guessing from `connectionIdentifiers`.
+ */
+function mapEventSourceId(id: unknown): Platform | undefined {
+  switch (id) {
+    case 2:
+      return 'twitch';
+    case 13:
+      return 'youtube';
+    case 20:
+      return 'facebook';
+    case 24:
+      return 'unknown'; // DLive
+    case 25:
+      return 'unknown'; // Discord
+    case 26:
+      return 'kick';
+    case 27:
+      return 'trovo';
+    case 28:
+      return 'x'; // Twitter / X live
+    case 29:
+      return 'rumble';
+    case 30:
+      return 'unknown'; // LinkedIn
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Best-effort platform extraction from a connectionIdentifier list — each
+ * id is shaped "<userId>-<platform>-<channelId>" (e.g.
+ * "5849342-youtube-inCvU1sYMI0"). Returns the first one that maps cleanly
+ * to a known Platform; falls back to 'unknown'.
+ *
+ * We only use this for `reply_created` common replies where we don't have
+ * a single destination platform — the message went to every connected
+ * channel and the badge has to pick one. Tagging it with the first
+ * recognised platform is a pragmatic default; the renderer marks it as
+ * `self: true` so the user can tell it's their own outgoing message
+ * regardless of which badge colour wins.
+ */
+function guessPlatformFromConnectionIds(ids: unknown): Platform {
+  if (!Array.isArray(ids)) return 'unknown';
+  for (const id of ids) {
+    if (typeof id !== 'string') continue;
+    const parts = id.split('-');
+    if (parts.length < 2) continue;
+    const platform = parts[1].toLowerCase();
+    if (platform === 'twitch') return 'twitch';
+    if (platform === 'youtube') return 'youtube';
+    if (platform === 'facebook') return 'facebook';
+    if (platform === 'kick') return 'kick';
+    if (platform === 'trovo') return 'trovo';
+    if (platform === 'rumble') return 'rumble';
+    if (platform === 'tiktok') return 'tiktok';
+    if (platform === 'twitter' || platform === 'x') return 'x';
+  }
+  return 'unknown';
 }
 
 function guessPlatform(payload: any): Platform {
