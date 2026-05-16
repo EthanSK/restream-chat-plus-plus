@@ -132,6 +132,31 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 step="0.01"
                 value={settings.tts.volume}
                 onChange={(e) => patchTts({ volume: Number(e.target.value) })}
+                // Preview the current voice at the new volume AFTER the user
+                // releases the slider (not during drag) so we don't fire a
+                // preview on every micro-step. The engine reads volume from
+                // its own settings, which updateSettings() has already
+                // propagated by the time the release handler runs.
+                onPointerUp={() => onPreviewVoice?.(settings.tts.voiceURI)}
+                onMouseUp={() => onPreviewVoice?.(settings.tts.voiceURI)}
+                onTouchEnd={() => onPreviewVoice?.(settings.tts.voiceURI)}
+                onKeyUp={(e) => {
+                  // Keyboard-driven volume changes (arrow keys, Home/End,
+                  // PageUp/PageDown) should also preview on key release so
+                  // a11y users get the same audible feedback.
+                  if (
+                    e.key === 'ArrowLeft' ||
+                    e.key === 'ArrowRight' ||
+                    e.key === 'ArrowUp' ||
+                    e.key === 'ArrowDown' ||
+                    e.key === 'Home' ||
+                    e.key === 'End' ||
+                    e.key === 'PageUp' ||
+                    e.key === 'PageDown'
+                  ) {
+                    onPreviewVoice?.(settings.tts.voiceURI);
+                  }
+                }}
               />
             </div>
             <div className="row">
