@@ -39,6 +39,13 @@ export interface ConnectionState {
 export interface Settings {
   tts: {
     enabled: boolean;
+    /**
+     * When true, TTS prefixes each message with the sender's display name,
+     * e.g. "alice says hello world". When false (default), only the message
+     * body is read aloud — Ethan's strong preference is to NOT hear the name
+     * by default because chat raids become unbearable otherwise.
+     */
+    readSenderName: boolean;
     voiceURI?: string;
     rate: number;
     pitch: number;
@@ -58,6 +65,7 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   tts: {
     enabled: false,
+    readSenderName: false,
     voiceURI: undefined,
     rate: 1.0,
     pitch: 1.0,

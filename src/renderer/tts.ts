@@ -64,7 +64,8 @@ export class TTSEngine {
   }
 
   private speak(m: ChatMessage) {
-    const utter = new SpeechSynthesisUtterance(`${m.username} says ${m.text}`);
+    const text = composeUtterance(m, this.settings.readSenderName);
+    const utter = new SpeechSynthesisUtterance(text);
     utter.rate = this.settings.rate;
     utter.pitch = this.settings.pitch;
     utter.volume = this.settings.volume;
@@ -80,12 +81,50 @@ export class TTSEngine {
     window.speechSynthesis.speak(utter);
   }
 
+  /**
+   * Play a one-off preview utterance for the given voice URI. Cancels any
+   * in-flight preview / queued chat utterances so rapid voice-dropdown
+   * changes don't pile up. Bypasses the queue + rate-limit because preview
+   * is a UI affordance, not chat playback. Returns the utterance text that
+   * was spoken (for tests / debugging).
+   */
+  previewVoice(voiceURI: string | undefined): string {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return '';
+    // Cancel everything in flight so rapid switching doesn't queue overlaps.
+    this.queue = [];
+    this.speaking = false;
+    window.speechSynthesis.cancel();
+
+    const voice = this.voices().find((v) => v.voiceURI === voiceURI);
+    const displayName = voice?.name ?? 'system default';
+    const text = `Hello, my name is ${displayName}`;
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = this.settings.rate;
+    utter.pitch = this.settings.pitch;
+    utter.volume = this.settings.volume;
+    if (voice) utter.voice = voice;
+    window.speechSynthesis.speak(utter);
+    return text;
+  }
+
   private pruneTimestamps() {
     const cutoff = Date.now() - 60_000;
     while (this.timestamps.length > 0 && this.timestamps[0] < cutoff) {
       this.timestamps.shift();
     }
   }
+}
+
+/**
+ * Build the string the synthesizer should speak for a given chat message.
+ * Exported (DOM-free) so the name-toggle behaviour can be unit-tested.
+ *
+ * - readSenderName=true  → "alice says hello world" (legacy behaviour)
+ * - readSenderName=false → "hello world" (default in v0.1.9+)
+ */
+export function composeUtterance(m: ChatMessage, readSenderName: boolean): string {
+  if (readSenderName) return `${m.username} says ${m.text}`;
+  return m.text;
 }
 
 // Export for unit testing the rate-limit math without DOM dependencies.

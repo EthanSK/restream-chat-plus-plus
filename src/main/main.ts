@@ -342,9 +342,26 @@ app.on('ready', async () => {
   });
 
   // ----- IPC: settings -----
-  ipcMain.handle(IPC.SETTINGS_GET, (): Settings => {
-    return (store.get('settings') as Settings | undefined) ?? DEFAULT_SETTINGS;
-  });
+  // Merge persisted settings over DEFAULT_SETTINGS so new fields (e.g.
+  // tts.readSenderName introduced in v0.1.9) don't come back as `undefined`
+  // when an older settings blob is loaded from disk. Shallow per-section
+  // merge is enough — every section is a flat object.
+  function loadSettings(): Settings {
+    const stored = store.get('settings') as Partial<Settings> | undefined;
+    if (!stored) return DEFAULT_SETTINGS;
+    return {
+      ...DEFAULT_SETTINGS,
+      ...stored,
+      tts: { ...DEFAULT_SETTINGS.tts, ...(stored.tts ?? {}) },
+      notifications: { ...DEFAULT_SETTINGS.notifications, ...(stored.notifications ?? {}) },
+      filter: {
+        ...DEFAULT_SETTINGS.filter,
+        ...(stored.filter ?? {}),
+        platforms: { ...DEFAULT_SETTINGS.filter.platforms, ...(stored.filter?.platforms ?? {}) },
+      },
+    };
+  }
+  ipcMain.handle(IPC.SETTINGS_GET, (): Settings => loadSettings());
   ipcMain.handle(IPC.SETTINGS_SET, (_evt, settings: Settings) => {
     store.set('settings', settings);
     return settings;
