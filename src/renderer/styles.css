@@ -63,12 +63,24 @@ body {
 }
 
 .toolbar .status-dot {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   background: var(--text-3);
+  flex: 0 0 auto;
+  /* Subtle inner highlight so the dot reads as a coloured pip even on
+     dark-on-dark backgrounds where small flat circles can look washed out. */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
-.toolbar .status-dot.connected { background: var(--ok); }
+.toolbar .status-dot.connected {
+  /* Explicit vivid green — was using --ok (#3fb950) which looked muted on
+     some displays. #22c55e + a faint glow makes the "we're live" signal
+     unmissable. */
+  background: #22c55e;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.15),
+    0 0 6px rgba(34, 197, 94, 0.55);
+}
 .toolbar .status-dot.connecting,
 .toolbar .status-dot.reconnecting { background: var(--warn); animation: pulse 1.2s infinite ease-in-out; }
 .toolbar .status-dot.error { background: var(--danger); }
