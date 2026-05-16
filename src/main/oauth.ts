@@ -1,4 +1,4 @@
-import { BrowserWindow, session } from 'electron';
+import { BrowserWindow, safeStorage, session } from 'electron';
 import http from 'node:http';
 import { URL } from 'node:url';
 import { loadRestreamCreds } from './credentials';
@@ -29,8 +29,47 @@ export class OAuthCoordinator {
   private server?: http.Server;
   constructor(private store: Store) {}
 
+  /**
+   * Whether the OS-backed `safeStorage` is currently usable for encrypting
+   * tokens at rest. macOS Keychain almost always returns true; some Linux
+   * setups without a keyring (and some sandbox/CI environments) return
+   * false, in which case we fall back to plain-JSON storage so the user is
+   * still able to authenticate — just without the at-rest protection.
+   */
+  private encryptionAvailable(): boolean {
+    try {
+      return safeStorage.isEncryptionAvailable();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Read the token from store. Prefers the encrypted `tokenEnc` field
+   * introduced in v0.1.15; transparently migrates a legacy plain `token`
+   * value to the encrypted form on first read so the secret only lives
+   * on disk in one place going forward.
+   */
   getToken(): TokenSet | undefined {
-    return this.store.get('token') as TokenSet | undefined;
+    // Encrypted path first.
+    const enc = this.store.get('tokenEnc');
+    if (enc) {
+      const decrypted = this.tryDecrypt(enc);
+      if (decrypted) return decrypted;
+      // Decryption failed (corrupt blob, OS keyring rotated). Fall through
+      // to the legacy plain key — if neither succeeds we return undefined
+      // and the next launch path is a clean sign-in prompt.
+    }
+
+    const legacy = this.store.get('token') as TokenSet | undefined;
+    if (legacy) {
+      // Migrate forward: re-encrypt under `tokenEnc` (if possible), then
+      // delete the legacy plain key.
+      this.persistToken(legacy);
+      return legacy;
+    }
+
+    return undefined;
   }
 
   isAuthenticated(): boolean {
@@ -41,6 +80,53 @@ export class OAuthCoordinator {
 
   async logout(): Promise<void> {
     this.store.delete('token');
+    this.store.delete('tokenEnc');
+  }
+
+  /**
+   * Encrypt + store the token. If safeStorage is unavailable we fall back
+   * to the legacy plain `token` key so the user can still sign in on
+   * platforms / setups without a working OS keyring.
+   */
+  private persistToken(token: TokenSet): void {
+    if (this.encryptionAvailable()) {
+      try {
+        const cipher = safeStorage.encryptString(JSON.stringify(token));
+        // electron-store serialises to JSON, so the binary buffer must be
+        // base64-encoded for round-tripping.
+        this.store.set('tokenEnc', cipher.toString('base64'));
+        this.store.delete('token');
+        return;
+      } catch (err) {
+        // Encryption blew up despite isEncryptionAvailable returning true
+        // — fall through to the plain path so we don't lose the session.
+        console.error('[oauth] safeStorage.encryptString failed', err);
+      }
+    }
+    // Plain fallback.
+    this.store.set('token', token);
+    this.store.delete('tokenEnc');
+  }
+
+  /**
+   * Decrypt a base64-encoded safeStorage ciphertext back into a TokenSet.
+   * Returns undefined on any failure (corrupt blob, key not available,
+   * JSON parse error) so the caller can fall through to the legacy path
+   * or trigger re-auth.
+   */
+  private tryDecrypt(b64: unknown): TokenSet | undefined {
+    if (typeof b64 !== 'string' || b64.length === 0) return undefined;
+    if (!this.encryptionAvailable()) return undefined;
+    try {
+      const buf = Buffer.from(b64, 'base64');
+      const json = safeStorage.decryptString(buf);
+      const parsed = JSON.parse(json) as TokenSet;
+      if (!parsed || typeof parsed.accessToken !== 'string') return undefined;
+      return parsed;
+    } catch (err) {
+      console.error('[oauth] safeStorage.decryptString failed', err);
+      return undefined;
+    }
   }
 
   /**
@@ -88,7 +174,7 @@ export class OAuthCoordinator {
     }
 
     const tokenSet = await this.exchangeCode(creds, code);
-    this.store.set('token', tokenSet);
+    this.persistToken(tokenSet);
     return tokenSet;
   }
 
@@ -134,7 +220,7 @@ export class OAuthCoordinator {
         scope: json.scope ?? existing.scope,
         expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000,
       };
-      this.store.set('token', tokenSet);
+      this.persistToken(tokenSet);
       return tokenSet;
     } catch {
       return undefined;

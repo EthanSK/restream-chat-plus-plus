@@ -1,10 +1,42 @@
 // Thin wrapper around electron-store with a typed surface we actually use.
 // electron-store is ESM-only on newer versions, so dynamic-import at runtime.
+//
+// v0.1.15 hardening — the OAuth token (access + refresh) is now encrypted at
+// rest using Electron's `safeStorage` API. On macOS that backs onto Keychain
+// (an Application-bound encryption key wrapped under the app's identity), on
+// Windows DPAPI, on Linux libsecret. Practical effect:
+//   1. Stealing the userData JSON file alone is no longer enough to hijack
+//      the session — you also need access to Keychain on the same user.
+//   2. The token survives in-place updates (Squirrel.Mac never touches
+//      userData) AND survives reinstalls (Keychain is scoped to bundle ID,
+//      which is constant `com.ethansk.restream-chat-plus-plus`).
+//
+// Migration: any pre-v0.1.15 install will have the unencrypted `token` key
+// in its store. On first read we transparently re-encrypt under the new
+// `tokenEnc` key and delete the legacy plain key so the secret never sits
+// on disk in two places. If `safeStorage.isEncryptionAvailable()` is false
+// (some Linux setups without a keyring, or a corrupt Keychain), we fall back
+// to the legacy plain `token` storage so the user is never hard-locked-out
+// — they just don't get the extra-at-rest protection.
+
 import type { Settings } from '../shared/types';
 import type { TokenSet } from './oauth';
 
 export interface StoreSchema {
+  /**
+   * Legacy plain-JSON token storage. Read-only path from v0.1.15 onwards —
+   * we migrate the value into `tokenEnc` on first read and then delete it.
+   * Kept in the schema for the migration code path; new writes always go
+   * through the encrypted path.
+   */
   token?: TokenSet;
+  /**
+   * Base64-encoded Electron `safeStorage`-encrypted ciphertext of the
+   * JSON-serialised TokenSet. The encryption key is held by the OS keyring
+   * (macOS Keychain / Windows DPAPI / Linux libsecret), scoped to the app's
+   * bundle identity.
+   */
+  tokenEnc?: string;
   settings?: Settings;
 }
 

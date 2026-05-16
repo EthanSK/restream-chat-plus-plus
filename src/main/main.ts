@@ -417,23 +417,71 @@ app.on('ready', async () => {
   buildMenu(() => revealLogsInFinder(chat.getRawLogPath()));
   await createMainWindow();
 
+  /**
+   * Helper: build + broadcast the current AuthStatus to the renderer.
+   * Centralised so every code path that mutates auth — initial resume,
+   * background refresh on startup, scheduled refresh, manual sign-in / out,
+   * Reconnect — pushes a consistent shape to the UI.
+   */
+  function pushAuthStatus(): AuthStatus {
+    const t = oauth.getToken();
+    const status: AuthStatus = {
+      authenticated: oauth.isAuthenticated(),
+      scope: t?.scope,
+      expiresAt: t?.expiresAt,
+    };
+    try {
+      mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
+    } catch (err) {
+      console.error('[main] pushAuthStatus send failed', err);
+    }
+    return status;
+  }
+
+  /**
+   * Promise that resolves when the startup auth flow has finished — either
+   * the stored access token was still valid (synchronous resume) or the
+   * background `oauth.refresh()` settled (success or failure).
+   *
+   * The `did-finish-load` handler waits on this BEFORE sending the initial
+   * AUTH_STATUS to the renderer. Without the wait we'd race: a renderer
+   * that mounts before refresh completes would receive `authenticated:
+   * false` (because the stored access token is past expiresAt) and render
+   * the "Sign in" screen — even though a successful refresh moments later
+   * silently re-armed the token. The user perceives this as "every update
+   * logs me out" because Squirrel's update-then-restart cycle puts the app
+   * into exactly this expired-access-token state. v0.1.15 fix.
+   */
+  let resolveStartupAuth: () => void = () => {
+    // Default no-op; replaced synchronously by the Promise executor below.
+  };
+  const startupAuthDone = new Promise<void>((res) => {
+    resolveStartupAuth = res;
+  });
+
   // When the renderer finishes loading, push the CURRENT connection state +
   // current auth status so the renderer doesn't sit on its initial 'idle'
   // placeholder. The push-only IPC channel (CONN_STATE) only delivers
   // updates; if chat.start() ran before the renderer mounted (auth resume
   // path), the renderer would otherwise never receive the initial state.
-  mainWindow?.webContents.on('did-finish-load', () => {
+  //
+  // We await `startupAuthDone` so a renderer that mounts BEFORE the
+  // background `oauth.refresh()` completes doesn't get a misleading
+  // `authenticated: false` snapshot and flash the sign-in screen at the
+  // user. The connection-state + connections lists ARE sent immediately
+  // so unrelated UI doesn't stall on the auth-resume code path.
+  mainWindow?.webContents.on('did-finish-load', async () => {
     try {
       mainWindow?.webContents.send(IPC.CONN_STATE, chat.getState());
       mainWindow?.webContents.send(IPC.CONNECTIONS, chat.getConnections());
-      const t = oauth.getToken();
-      mainWindow?.webContents.send(IPC.AUTH_STATUS, {
-        authenticated: oauth.isAuthenticated(),
-        scope: t?.scope,
-        expiresAt: t?.expiresAt,
-      } satisfies AuthStatus);
     } catch (err) {
-      console.error('[main] failed to send initial state on did-finish-load', err);
+      console.error('[main] failed to send initial conn state on did-finish-load', err);
+    }
+    try {
+      await startupAuthDone;
+      pushAuthStatus();
+    } catch (err) {
+      console.error('[main] failed to send initial auth status on did-finish-load', err);
     }
   });
 
@@ -737,17 +785,43 @@ app.on('ready', async () => {
   );
 
   // Resume session if a valid token already exists.
-  if (oauth.isAuthenticated()) {
-    const t = oauth.getToken()!;
-    chat.setToken(t.accessToken);
-    chat.start();
-  } else {
-    // Try refresh in the background.
-    const refreshed = await oauth.refresh();
-    if (refreshed) {
-      chat.setToken(refreshed.accessToken);
+  //
+  // Resume order:
+  //   1. If stored access token is still valid → start the WS immediately.
+  //   2. Otherwise attempt `oauth.refresh()` using the stored refresh token.
+  //      On success, persist the new token + start the WS + broadcast.
+  //      On failure, leave the user signed-out so the renderer's "Sign in"
+  //      button is the next action.
+  //
+  // Whichever leg runs, we ALWAYS:
+  //   - call `pushAuthStatus()` so the renderer's AUTH_STATUS reflects truth
+  //     (the auth subscription set up on `did-finish-load` consumes this);
+  //   - resolve `startupAuthDone` so the `did-finish-load` handler stops
+  //     waiting and pushes the initial AUTH_STATUS snapshot.
+  //
+  // This fixes the "every update logs me out" symptom: Squirrel restarts
+  // the app after replacing the bundle; the access token is usually past
+  // its 1h expiresAt by then; a synchronous check would mark the user
+  // signed-out, the refresh would silently succeed in the background, but
+  // the renderer would never hear about it.
+  try {
+    if (oauth.isAuthenticated()) {
+      const t = oauth.getToken()!;
+      chat.setToken(t.accessToken);
       chat.start();
+    } else {
+      const refreshed = await oauth.refresh();
+      if (refreshed) {
+        chat.setToken(refreshed.accessToken);
+        chat.start();
+      }
     }
+  } catch (err) {
+    console.error('[main] startup auth resume failed', err);
+  } finally {
+    // Broadcast the final auth state and unblock did-finish-load.
+    pushAuthStatus();
+    resolveStartupAuth();
   }
 });
 
