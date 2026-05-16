@@ -201,6 +201,7 @@ export function App(): React.ReactElement {
           onChange={updateSettings}
           onClose={() => setDrawerOpen(false)}
           voices={ttsRef.current?.voices() ?? []}
+          onPreviewVoice={(uri) => ttsRef.current?.previewVoice(uri)}
         />
       )}
     </div>

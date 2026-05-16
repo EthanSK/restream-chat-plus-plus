@@ -11,9 +11,15 @@ interface Props {
   onChange: (s: Settings) => void;
   onClose: () => void;
   voices: SpeechSynthesisVoice[];
+  /**
+   * Optional preview callback — when the user picks a voice in the dropdown
+   * we ask the parent's TTSEngine to play a short sample so they can hear
+   * the voice before committing. Auto-cancels any prior in-flight preview.
+   */
+  onPreviewVoice?: (voiceURI: string | undefined) => void;
 }
 
-export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoices }: Props): React.ReactElement {
+export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoices, onPreviewVoice }: Props): React.ReactElement {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>(initialVoices);
 
   // Voices on some browsers populate asynchronously.
@@ -66,10 +72,26 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
               />
             </div>
             <div className="row">
+              <label>Read sender's name aloud</label>
+              <input
+                className="switch"
+                type="checkbox"
+                checked={settings.tts.readSenderName}
+                onChange={(e) => patchTts({ readSenderName: e.target.checked })}
+              />
+            </div>
+            <div className="row">
               <label>Voice</label>
               <select
                 value={settings.tts.voiceURI ?? ''}
-                onChange={(e) => patchTts({ voiceURI: e.target.value || undefined })}
+                onChange={(e) => {
+                  const next = e.target.value || undefined;
+                  patchTts({ voiceURI: next });
+                  // Preview the freshly-chosen voice so the user can hear it
+                  // before committing. The engine cancels any prior preview
+                  // so rapid dropdown switching doesn't queue overlaps.
+                  onPreviewVoice?.(next);
+                }}
               >
                 <option value="">System default</option>
                 {voices.map((v) => (
