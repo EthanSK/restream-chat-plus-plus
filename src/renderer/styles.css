@@ -200,13 +200,33 @@ body {
 
 /* ------------------------------- Settings -------------------------------- */
 
+/*
+ * Drawer overlay — z-index notes:
+ *
+ * We render the scrim with `position: fixed; inset: 0` so it covers the
+ * full window INCLUDING the custom title bar (`.titlebar`, which sits at
+ * the top of the app shell with `-webkit-app-region: drag`). The scrim
+ * z-index is bumped well past everything else in the content layer so the
+ * drawer is unambiguously on top of the title bar text + the toolbar.
+ *
+ * macOS traffic-light buttons (close/min/max) are drawn by AppKit at the
+ * OS chrome layer with `titleBarStyle: 'hiddenInset'`, so they will always
+ * be visible above the scrim — that's a macOS invariant we can't override
+ * in CSS. We compensate by giving the drawer-head enough top padding for
+ * the buttons to sit cleanly inside the title-bar inset without colliding
+ * with the "Done" button.
+ *
+ * The scrim itself is marked `-webkit-app-region: no-drag` so clicks on
+ * the drawer's top strip don't accidentally start a window-drag.
+ */
 .scrim {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
   display: flex;
   justify-content: flex-end;
-  z-index: 50;
+  z-index: 9999;
+  -webkit-app-region: no-drag;
 }
 .drawer {
   width: min(420px, 100%);
@@ -216,13 +236,25 @@ body {
   display: flex;
   flex-direction: column;
   animation: slidein 0.18s ease-out;
+  -webkit-app-region: no-drag;
 }
 @keyframes slidein {
   from { transform: translateX(8px); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
 }
 .drawer .drawer-head {
-  padding: 12px 16px;
+  /*
+   * Top padding reserves vertical room for macOS traffic-light buttons
+   * (which AppKit overlays at the OS chrome layer) so the "Settings"
+   * heading + Done button never tuck under them — `hiddenInset` puts the
+   * lights ~12px from the top inside the inset, and the drawer covers the
+   * full window height including that strip.
+   *
+   * Left padding gives breathing room for the same lights when the drawer
+   * is so wide it reaches the left edge (sub-420px windows). 80px clears
+   * all three lights with margin.
+   */
+  padding: 18px 16px 12px 80px;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
