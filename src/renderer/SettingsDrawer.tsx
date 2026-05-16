@@ -1,10 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Platform,
   PLATFORM_COLORS,
   PLATFORM_LABELS,
   Settings,
 } from '../shared/types';
+import { sortVoicesByQuality, voiceQualityRank } from './tts';
 
 interface Props {
   settings: Settings;
@@ -35,6 +36,23 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
       };
     }
   }, []);
+
+  // Render voices grouped + sorted by quality rank — Premium/Enhanced at the
+  // top, then Neural/Natural, then Siri, then Eloquence, then the long tail of
+  // novelty voices (Albert, Bahh, Bells, …). Alphabetical-only ordering buried
+  // the actually-good voices below the robotic ones.
+  const groupedVoices = useMemo(() => {
+    const sorted = sortVoicesByQuality(voices);
+    const groups: { label: string; voices: SpeechSynthesisVoice[] }[] = [
+      { label: 'Premium / Enhanced', voices: [] },
+      { label: 'Neural / Natural', voices: [] },
+      { label: 'Siri', voices: [] },
+      { label: 'Eloquence', voices: [] },
+      { label: 'Other', voices: [] },
+    ];
+    for (const v of sorted) groups[voiceQualityRank(v)].voices.push(v);
+    return groups.filter((g) => g.voices.length > 0);
+  }, [voices]);
 
   function patchTts(patch: Partial<Settings['tts']>) {
     onChange({ ...settings, tts: { ...settings.tts, ...patch } });
@@ -94,10 +112,14 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 }}
               >
                 <option value="">System default</option>
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {v.name} ({v.lang})
-                  </option>
+                {groupedVoices.map((g) => (
+                  <optgroup key={g.label} label={g.label}>
+                    {g.voices.map((v) => (
+                      <option key={v.voiceURI} value={v.voiceURI}>
+                        {v.name} ({v.lang})
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
             </div>

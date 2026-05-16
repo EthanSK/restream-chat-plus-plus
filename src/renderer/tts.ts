@@ -127,6 +127,39 @@ export function composeUtterance(m: ChatMessage, readSenderName: boolean): strin
   return m.text;
 }
 
+/**
+ * Quality "tier" for a Web Speech voice — lower number = better quality, sort
+ * to the top of the picker. The Web Speech API doesn't expose a quality flag,
+ * so we infer from `voice.name`. macOS in particular labels its modern voices
+ * with markers like "Premium", "Enhanced", "Neural", and "(Eloquence)"; the
+ * older robotic novelty voices (Albert, Bahh, Bells, Bubbles, Cellos, …) ship
+ * unadorned. Sort by:
+ *   0 — Premium / Enhanced  (downloaded high-quality voices)
+ *   1 — Neural / Natural    (newer system voices, e.g. Siri-family)
+ *   2 — Siri / Apple system flagship voices that don't carry an explicit tier
+ *   3 — Eloquence variants  (modern accessibility voices, decent quality)
+ *   4 — Everything else     (Albert, Bahh, etc. — bottom of the list)
+ *
+ * Within a tier we secondary-sort by name (locale-aware) so the list is stable.
+ */
+export function voiceQualityRank(v: Pick<SpeechSynthesisVoice, 'name'>): number {
+  const name = v.name.toLowerCase();
+  if (name.includes('premium') || name.includes('enhanced')) return 0;
+  if (name.includes('neural') || name.includes('natural')) return 1;
+  if (name.includes('siri')) return 2;
+  if (name.includes('eloquence')) return 3;
+  return 4;
+}
+
+/** Pure helper: return a new array of voices sorted quality-first, then name. */
+export function sortVoicesByQuality<V extends Pick<SpeechSynthesisVoice, 'name'>>(voices: readonly V[]): V[] {
+  return [...voices].sort((a, b) => {
+    const r = voiceQualityRank(a) - voiceQualityRank(b);
+    if (r !== 0) return r;
+    return a.name.localeCompare(b.name);
+  });
+}
+
 // Export for unit testing the rate-limit math without DOM dependencies.
 export class RateLimiter {
   private timestamps: number[] = [];
