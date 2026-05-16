@@ -54,6 +54,198 @@ function revealLogsInFinder(rawLogPath: string | undefined): boolean {
   }
 }
 
+/**
+ * Resolve the path to the Compose-window outbound-request debug log. Sits
+ * next to raw-frames.jsonl so "Reveal Logs in Finder" surfaces both.
+ *
+ * Returns undefined if we couldn't resolve the parent log dir (e.g. the
+ * WS client hasn't picked one yet AND the Electron `app` API failed).
+ */
+function resolveComposeLogPath(rawLogPath: string | undefined): string | undefined {
+  try {
+    let dir: string | undefined;
+    if (rawLogPath) {
+      dir = path.dirname(rawLogPath);
+    } else {
+      try {
+        dir = app.getPath('logs');
+      } catch {
+        dir = undefined;
+      }
+    }
+    if (!dir) return undefined;
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, 'compose-requests.jsonl');
+  } catch {
+    return undefined;
+  }
+}
+
+function appendComposeLog(p: string, record: Record<string, unknown>): void {
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n';
+    fs.appendFileSync(p, line, 'utf8');
+  } catch (err) {
+    // logging must never crash the parent flow
+    console.error('[main] compose log append failed', err);
+  }
+}
+
+/**
+ * Best-effort decode of an uploadData[*].bytes Buffer into a string. Most
+ * Restream API calls are application/json so this is the common case.
+ * Falls back to base64 for binary so we never lose data.
+ */
+function decodeUploadBytes(buf: Buffer): { kind: 'utf8' | 'base64'; data: string } {
+  try {
+    const s = buf.toString('utf8');
+    // crude printable-ratio check — if the buffer is mostly printable ASCII
+    // we treat as utf8 (covers JSON, form-urlencoded, plain text); else b64.
+    let printable = 0;
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code === 9 || code === 10 || code === 13 || (code >= 32 && code < 127)) {
+        printable += 1;
+      }
+    }
+    if (s.length > 0 && printable / s.length > 0.85) {
+      return { kind: 'utf8', data: s };
+    }
+  } catch {
+    // fall through to base64
+  }
+  return { kind: 'base64', data: buf.toString('base64') };
+}
+
+/**
+ * Attach `webRequest` listeners to the Compose window's session that log
+ * every outgoing HTTP request — URL, method, headers, request body — to
+ * compose-requests.jsonl. This is the v0.1.12 reverse-engineering hook
+ * so we can identify Restream's private chat-send endpoint and wire an
+ * inline input in a follow-up release.
+ *
+ * Filtered to api.restream.io / backend.chat.restream.io / chat.restream.io
+ * domains so we don't drown the log with analytics / sentry / fonts noise.
+ */
+function attachComposeRequestLogger(
+  win: BrowserWindow,
+  rawLogPath: string | undefined,
+): void {
+  const logPath = resolveComposeLogPath(rawLogPath);
+  if (!logPath) {
+    console.error('[main] compose request logger: no log path resolved');
+    return;
+  }
+  appendComposeLog(logPath, {
+    kind: 'logger-attached',
+    note:
+      'Compose request logger active. Send a chat message in this window ' +
+      'to capture the underlying Restream API call. Cancel any ongoing ' +
+      'capture by closing the window.',
+  });
+
+  const sess = win.webContents.session;
+  const filter: Electron.WebRequestFilter = {
+    urls: [
+      '*://*.restream.io/*',
+      '*://restream.io/*',
+    ],
+  };
+
+  // Capture URL + method + body in onBeforeRequest (only place uploadData
+  // is exposed). Request headers don't arrive on this hook; we grab them
+  // separately in onSendHeaders below.
+  sess.webRequest.onBeforeRequest(filter, (details, callback) => {
+    try {
+      const interesting =
+        details.method !== 'GET' && details.method !== 'HEAD' && details.method !== 'OPTIONS';
+      const body =
+        Array.isArray(details.uploadData) && details.uploadData.length > 0
+          ? details.uploadData.map((u) => {
+              if (u.bytes) return { type: 'bytes', ...decodeUploadBytes(u.bytes) };
+              if ((u as any).file) return { type: 'file', file: (u as any).file };
+              return { type: 'unknown' };
+            })
+          : undefined;
+      if (interesting || body) {
+        appendComposeLog(logPath, {
+          kind: 'request',
+          id: details.id,
+          method: details.method,
+          url: details.url,
+          resourceType: details.resourceType,
+          body,
+        });
+      }
+    } catch (err) {
+      console.error('[main] compose onBeforeRequest log failed', err);
+    }
+    callback({});
+  });
+
+  // Capture headers separately. Cookies are sensitive — redact long
+  // values to keep the log readable but preserve enough for shape
+  // inspection (first 12 chars). x-axsrf-token / authorization values
+  // are similarly redacted.
+  sess.webRequest.onSendHeaders(filter, (details) => {
+    try {
+      if (details.method === 'GET' || details.method === 'HEAD' || details.method === 'OPTIONS') {
+        // Skip pure-read traffic to keep the log focused on send paths.
+        return;
+      }
+      const safeHeaders: Record<string, string> = {};
+      for (const [key, raw] of Object.entries(details.requestHeaders ?? {})) {
+        const lower = key.toLowerCase();
+        const value = String(raw);
+        if (
+          lower === 'cookie' ||
+          lower === 'authorization' ||
+          lower === 'x-axsrf-token' ||
+          lower === 'x-rxsrf-token'
+        ) {
+          safeHeaders[key] = value.length > 16 ? `${value.slice(0, 12)}…(${value.length})` : value;
+        } else {
+          safeHeaders[key] = value;
+        }
+      }
+      appendComposeLog(logPath, {
+        kind: 'request-headers',
+        id: details.id,
+        method: details.method,
+        url: details.url,
+        headers: safeHeaders,
+      });
+    } catch (err) {
+      console.error('[main] compose onSendHeaders log failed', err);
+    }
+  });
+
+  // Capture response status to confirm whether a candidate send endpoint
+  // actually succeeded (2xx) vs. errored (4xx/5xx).
+  sess.webRequest.onCompleted(filter, (details) => {
+    try {
+      if (details.method === 'GET' || details.method === 'HEAD' || details.method === 'OPTIONS') {
+        return;
+      }
+      appendComposeLog(logPath, {
+        kind: 'response',
+        id: details.id,
+        method: details.method,
+        url: details.url,
+        statusCode: details.statusCode,
+        statusLine: details.statusLine,
+        fromCache: details.fromCache,
+      });
+    } catch (err) {
+      console.error('[main] compose onCompleted log failed', err);
+    }
+  });
+
+  win.on('closed', () => {
+    appendComposeLog(logPath, { kind: 'window-closed' });
+  });
+}
+
 async function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 460,
@@ -414,10 +606,19 @@ app.on('ready', async () => {
       // Open in a dedicated BrowserWindow rather than the system browser so
       // Ethan can leave it docked next to our app and the OAuth session
       // stays separate from his daily-driver browser.
+      //
+      // Sized as a narrow chat-input pane (content size, not window chrome),
+      // resizable so the user can stretch it if Restream's webchat layout
+      // wants more room. Minimums prevent the user from accidentally
+      // collapsing it to unusable.
       const win = new BrowserWindow({
-        width: 420,
-        height: 640,
-        title: 'Restream Chat++ — Compose',
+        width: 380,
+        height: 320,
+        minWidth: 320,
+        minHeight: 240,
+        useContentSize: true,
+        resizable: true,
+        title: 'Restream Compose',
         backgroundColor: '#0d1117',
         parent: mainWindow ?? undefined,
         webPreferences: {
@@ -429,6 +630,35 @@ app.on('ready', async () => {
           session: session.fromPartition('persist:restream-oauth'),
         },
       });
+
+      // ----------------------------------------------------------------
+      // v0.1.12 reverse-engineering hook
+      // ----------------------------------------------------------------
+      // Restream's webchat is a black box: it POSTs the user's typed
+      // message to some endpoint, the WS then broadcasts back a
+      // `reply_created` frame which we already render as a `self`
+      // message in the feed. We don't yet KNOW the endpoint shape —
+      // public docs don't document one ("This API works one way" —
+      // https://developers.restream.io/chat/getting-started).
+      //
+      // We have strong leads from the chat-frontend bundle though:
+      //   POST https://backend.chat.restream.io/api/v2/client/reply
+      //   body: { connectionIdentifiers, clientReplyUuid, text,
+      //           showId? | eventId? | instant? }
+      //   auth: cookies (.restream.io session) + header
+      //         x-axsrf-token = value of cookie "accessXsrfToken"
+      //
+      // To confirm and capture the exact request shape, instrument the
+      // Compose webContents' session-level webRequest listeners. Every
+      // outbound HTTP request gets its URL + method + headers + body
+      // appended to a JSONL debug log next to raw-frames.jsonl. Ethan
+      // opens Compose, sends a message, and the log contains the truth.
+      // No GUI launches needed on the dev side.
+      try {
+        attachComposeRequestLogger(win, chat.getRawLogPath());
+      } catch (err) {
+        console.error('[main] failed to attach compose request logger', err);
+      }
       void win.loadURL(url);
       return { ok: true as const };
     } catch (err) {
