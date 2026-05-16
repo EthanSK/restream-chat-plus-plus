@@ -2,13 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { rcpp } from './api';
 import {
   AuthStatus,
+  ChatConnection,
   ChatMessage,
   ConnectionState,
   DEFAULT_SETTINGS,
   Platform,
   Settings,
 } from '../shared/types';
+import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
+import { ChatInput } from './ChatInput';
 import { SettingsDrawer } from './SettingsDrawer';
 import { TTSEngine, RateLimiter } from './tts';
 
@@ -18,6 +21,7 @@ export function App(): React.ReactElement {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [auth, setAuth] = useState<AuthStatus>({ authenticated: false });
   const [conn, setConn] = useState<ConnectionState>({ status: 'idle', attempt: 0 });
+  const [connections, setConnections] = useState<ChatConnection[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
@@ -52,10 +56,22 @@ export function App(): React.ReactElement {
       } catch (err) {
         console.error('[App] failed to fetch initial conn state', err);
       }
+      // Pull-fetch the connections list on mount for the same reason as
+      // connectionState above — the connection_info push channel only
+      // delivers UPDATES, so if Restream replayed its current set BEFORE
+      // we attached `onConnections`, the channels panel would stay empty.
+      try {
+        const initialConnections = await rcpp.getConnections();
+        if (!alive) return;
+        setConnections(initialConnections);
+      } catch (err) {
+        console.error('[App] failed to fetch initial connections', err);
+      }
     })();
 
     const offAuth = rcpp.onAuthStatus(setAuth);
     const offConn = rcpp.onConnectionState(setConn);
+    const offConnections = rcpp.onConnections(setConnections);
     const offChat = rcpp.onChatMessage((m) => {
       setMessages((prev) => {
         const next = [...prev, m];
@@ -68,15 +84,20 @@ export function App(): React.ReactElement {
       alive = false;
       offAuth();
       offConn();
+      offConnections();
       offChat();
       offMenu();
     };
   }, []);
 
   // Forward each new message to TTS + native notifications, honoring filters.
+  // Self-originated messages (reply_created echoes of Ethan's own outgoing
+  // replies) are skipped — TTS-reading your own message back at you and
+  // popping a native notification for it is just annoying.
   useEffect(() => {
     if (messages.length === 0) return;
     const m = messages[messages.length - 1];
+    if (m.self) return;
     if (!settings.filter.platforms[m.platform]) return;
 
     if (settings.tts.enabled) {
@@ -167,6 +188,7 @@ export function App(): React.ReactElement {
             </svg>
           </button>
         )}
+        {auth.authenticated && <ChannelsPanel connections={connections} />}
         <span className="spacer" />
         <button
           className="btn ghost"
@@ -194,6 +216,10 @@ export function App(): React.ReactElement {
         messages={visibleMessages}
         authenticated={auth.authenticated}
         connection={conn}
+      />
+      <ChatInput
+        authenticated={auth.authenticated}
+        connected={conn.status === 'connected'}
       />
       {drawerOpen && (
         <SettingsDrawer

@@ -3,7 +3,12 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { ChatMessage, ConnectionState } from '../shared/types';
+import type {
+  ChatConnection,
+  ChatMessage,
+  ConnectionState,
+  Platform,
+} from '../shared/types';
 import { normalizeRestreamEventDetailed } from './normalize';
 
 /**
@@ -30,6 +35,14 @@ export interface ChatClientEvents {
   message: (m: ChatMessage) => void;
   state: (s: ConnectionState) => void;
   raw: (raw: unknown) => void;
+  /**
+   * Emitted whenever the map of Restream `connection_info` entries
+   * changes (new connect, status flip, close). Receivers get the full
+   * deduped list sorted by platform — see ChatConnection in shared/types.
+   * Used by the channels panel in the renderer to show N connected
+   * channels + per-platform expansion.
+   */
+  connections: (cs: ChatConnection[]) => void;
 }
 
 /**
@@ -50,6 +63,15 @@ export class ChatClient extends EventEmitter {
   private state: ConnectionState = { status: 'idle', attempt: 0 };
   private rawLogPath?: string;
   private rawLogResolved = false;
+  /**
+   * Map of Restream connection_info entries keyed by connectionIdentifier.
+   * Replaces on every fresh connection_info, deleted on connection_closed
+   * matching the stored connectionUuid (per Restream's docs).
+   *
+   * Reset on every fresh WS connect so a reconnect doesn't accumulate
+   * stale entries from a previous session.
+   */
+  private connections = new Map<string, ChatConnection>();
 
   setToken(token: string) {
     this.accessToken = token;
@@ -109,6 +131,15 @@ export class ChatClient extends EventEmitter {
   }
 
   /**
+   * Snapshot the current connection_info map as a sorted array. Used by
+   * the pull-fetch IPC handler so the renderer can sync on mount without
+   * waiting for the next connection_info push.
+   */
+  getConnections(): ChatConnection[] {
+    return sortConnections(Array.from(this.connections.values()));
+  }
+
+  /**
    * Public accessor so the main process can resolve / expose the raw-frame
    * log path (e.g. for a "Reveal Logs in Finder" menu item) without having
    * to duplicate the platform-specific path-resolution logic. Returns
@@ -126,6 +157,13 @@ export class ChatClient extends EventEmitter {
     if (!this.accessToken) {
       this.setState({ status: 'error', attempt: this.attempt, lastError: 'no token' });
       return;
+    }
+    // Clear stale connections — Restream replays all current connection_info
+    // entries on every fresh subscribe, so anything left in the map is by
+    // definition out of date and would mislead the channels panel.
+    if (this.connections.size > 0) {
+      this.connections.clear();
+      this.emit('connections', this.getConnections());
     }
     this.setState({
       status: this.attempt === 0 ? 'connecting' : 'reconnecting',
@@ -158,21 +196,28 @@ export class ChatClient extends EventEmitter {
       // Log them as their own kind so Ethan can see *why* a stream went quiet
       // without grepping for frame.payload.status === 'error'. These do NOT
       // affect our overall ChatClient status — the WS itself is still healthy.
+      //
+      // We also feed connection_info / connection_closed into the in-memory
+      // connections map so the renderer's channels panel stays in sync.
       if (parsed && typeof parsed === 'object') {
         const p = parsed as Record<string, any>;
-        if (p.action === 'connection_info' && p.payload?.status === 'error') {
-          this.appendRawLog({
-            kind: 'connection-info-error',
-            eventSourceId: p.payload?.eventSourceId,
-            reason: p.payload?.reason,
-            connectionIdentifier: p.payload?.connectionIdentifier,
-          });
+        if (p.action === 'connection_info') {
+          if (p.payload?.status === 'error') {
+            this.appendRawLog({
+              kind: 'connection-info-error',
+              eventSourceId: p.payload?.eventSourceId,
+              reason: p.payload?.reason,
+              connectionIdentifier: p.payload?.connectionIdentifier,
+            });
+          }
+          this.applyConnectionInfo(p.payload);
         } else if (p.action === 'connection_closed') {
           this.appendRawLog({
             kind: 'connection-closed',
             connectionUuid: p.payload?.connectionUuid,
             reason: p.payload?.reason,
           });
+          this.applyConnectionClosed(p.payload);
         }
       }
 
@@ -284,6 +329,61 @@ export class ChatClient extends EventEmitter {
     }
   }
 
+  /**
+   * Fold a `connection_info` payload into the in-memory connections map.
+   * Restream documents that we should keep the LAST received payload per
+   * `connectionIdentifier` — so plain `Map.set` is correct here (no merge).
+   * Emits a `connections` event whenever the resulting list differs from
+   * what we previously had, so the renderer doesn't redraw on duplicate
+   * frames (Restream sometimes repeats them).
+   */
+  private applyConnectionInfo(payload: unknown): void {
+    if (!payload || typeof payload !== 'object') return;
+    const p = payload as Record<string, any>;
+    const connectionIdentifier = p.connectionIdentifier;
+    if (typeof connectionIdentifier !== 'string') return;
+    const next: ChatConnection = {
+      connectionIdentifier,
+      connectionUuid: String(p.connectionUuid ?? ''),
+      eventSourceId: Number(p.eventSourceId ?? 0),
+      platform: platformFromEventSourceId(p.eventSourceId, connectionIdentifier),
+      status: p.status === 'connected' || p.status === 'error' || p.status === 'connecting'
+        ? p.status
+        : 'connecting',
+      reason: p.reason ?? null,
+      channelName: extractChannelName(p.target),
+      avatarUrl: extractAvatar(p.target),
+      url: extractUrl(p.target),
+      updatedAt: Date.now(),
+    };
+    const prev = this.connections.get(connectionIdentifier);
+    if (prev && connectionsEqual(prev, next)) return; // skip noisy duplicates
+    this.connections.set(connectionIdentifier, next);
+    this.emit('connections', this.getConnections());
+  }
+
+  /**
+   * Remove the entry whose `connectionUuid` matches the closed-frame's
+   * uuid. Per Restream docs (https://developers.restream.io/chat/connections)
+   * we use connectionUuid here, NOT connectionIdentifier — the latter can
+   * have been overwritten by a fresher replacement connection.
+   */
+  private applyConnectionClosed(payload: unknown): void {
+    if (!payload || typeof payload !== 'object') return;
+    const p = payload as Record<string, any>;
+    const uuid = p.connectionUuid;
+    if (typeof uuid !== 'string') return;
+    let changed = false;
+    for (const [key, entry] of this.connections) {
+      if (entry.connectionUuid === uuid) {
+        this.connections.delete(key);
+        changed = true;
+        break;
+      }
+    }
+    if (changed) this.emit('connections', this.getConnections());
+  }
+
   private resolveRawLogPath(): string | undefined {
     if (this.rawLogResolved) return this.rawLogPath;
     this.rawLogResolved = true;
@@ -318,3 +418,140 @@ export class ChatClient extends EventEmitter {
 // Re-export Backoff math for unit tests.
 export const __test_backoff_for = (attempt: number): number =>
   Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * Math.pow(2, Math.min(10, attempt - 1)));
+
+// ---------------------------------------------------------------------------
+// Connection helpers (free-standing so they're trivially unit-testable and
+// not bound to the EventEmitter class instance).
+// ---------------------------------------------------------------------------
+
+const PLATFORM_ORDER: Platform[] = [
+  'twitch',
+  'youtube',
+  'kick',
+  'facebook',
+  'trovo',
+  'rumble',
+  'tiktok',
+  'x',
+  'unknown',
+];
+
+/**
+ * Map Restream eventSourceId → Platform, falling back to parsing the
+ * platform slug out of the connectionIdentifier
+ * ("<userId>-<platform>-<channelId>") so that DLive / Discord etc — for
+ * which we don't have a Platform yet — still surface useful badge data.
+ */
+function platformFromEventSourceId(
+  eventSourceId: unknown,
+  connectionIdentifier: string,
+): Platform {
+  switch (eventSourceId) {
+    case 2:
+      return 'twitch';
+    case 13:
+      return 'youtube';
+    case 20:
+      return 'facebook';
+    case 26:
+      return 'kick';
+    case 27:
+      return 'trovo';
+    case 28:
+      return 'x';
+    case 29:
+      return 'rumble';
+    default:
+      break;
+  }
+  // Fallback: scrape the platform from connectionIdentifier's middle segment.
+  const parts = connectionIdentifier.split('-');
+  if (parts.length >= 2) {
+    const slug = parts[1].toLowerCase();
+    if (slug === 'twitch') return 'twitch';
+    if (slug === 'youtube') return 'youtube';
+    if (slug === 'facebook') return 'facebook';
+    if (slug === 'kick') return 'kick';
+    if (slug === 'trovo') return 'trovo';
+    if (slug === 'rumble') return 'rumble';
+    if (slug === 'tiktok') return 'tiktok';
+    if (slug === 'twitter' || slug === 'x') return 'x';
+  }
+  return 'unknown';
+}
+
+function extractChannelName(target: unknown): string | undefined {
+  if (!target || typeof target !== 'object') return undefined;
+  const t = target as Record<string, any>;
+  // Order matters: Discord's `target.channel.name` is the discord channel
+  // (the actual "where chat appears" entity) and should win over
+  // `target.owner.name` (the user who linked it). For Twitch / YouTube /
+  // Kick / Trovo the channel-relevant identity lives on `owner.displayName`.
+  return (
+    t.channel?.name ??
+    t.page?.name ??
+    t.owner?.displayName ??
+    t.owner?.name ??
+    t.owner?.username ??
+    t.user?.name ??
+    t.organization?.name ??
+    t.event?.title ??
+    undefined
+  );
+}
+
+function extractAvatar(target: unknown): string | undefined {
+  if (!target || typeof target !== 'object') return undefined;
+  const t = target as Record<string, any>;
+  return (
+    t.owner?.avatar ??
+    t.user?.avatar ??
+    t.page?.picture ??
+    t.server?.icon ??
+    t.organization?.avatarUrl ??
+    undefined
+  );
+}
+
+function extractUrl(target: unknown): string | undefined {
+  if (!target || typeof target !== 'object') return undefined;
+  const t = target as Record<string, any>;
+  return (
+    t.owner?.url ??
+    t.channel?.url ??
+    t.event?.url ??
+    t.liveVideo?.url ??
+    t.post?.url ??
+    undefined
+  );
+}
+
+function connectionsEqual(a: ChatConnection, b: ChatConnection): boolean {
+  return (
+    a.connectionUuid === b.connectionUuid &&
+    a.status === b.status &&
+    a.reason === b.reason &&
+    a.channelName === b.channelName &&
+    a.platform === b.platform &&
+    a.url === b.url &&
+    a.avatarUrl === b.avatarUrl
+  );
+}
+
+function sortConnections(list: ChatConnection[]): ChatConnection[] {
+  return list.slice().sort((a, b) => {
+    const ai = PLATFORM_ORDER.indexOf(a.platform);
+    const bi = PLATFORM_ORDER.indexOf(b.platform);
+    if (ai !== bi) return ai - bi;
+    const an = a.channelName ?? '';
+    const bn = b.channelName ?? '';
+    return an.localeCompare(bn);
+  });
+}
+
+// Re-export for unit tests.
+export const __test_helpers = {
+  platformFromEventSourceId,
+  extractChannelName,
+  sortConnections,
+};

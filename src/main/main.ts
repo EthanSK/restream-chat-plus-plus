@@ -4,6 +4,7 @@ import {
   ipcMain,
   Menu,
   Notification,
+  session,
   shell,
 } from 'electron';
 import path from 'node:path';
@@ -230,6 +231,7 @@ app.on('ready', async () => {
   mainWindow?.webContents.on('did-finish-load', () => {
     try {
       mainWindow?.webContents.send(IPC.CONN_STATE, chat.getState());
+      mainWindow?.webContents.send(IPC.CONNECTIONS, chat.getConnections());
       const t = oauth.getToken();
       mainWindow?.webContents.send(IPC.AUTH_STATUS, {
         authenticated: oauth.isAuthenticated(),
@@ -379,9 +381,72 @@ app.on('ready', async () => {
     return true;
   });
 
+  // ----- IPC: connections (channels panel pull-fetch) -----
+  ipcMain.handle(IPC.CONNECTIONS_GET, () => chat.getConnections());
+
+  // ----- IPC: open Restream's official webchat compose window -----
+  // Restream's public Chat API is RECEIVE-ONLY for third-party clients —
+  // see https://developers.restream.io/chat/getting-started: "This API
+  // works one way — from the server to the client. The server will ignore
+  // any incoming messages." So to actually let the user TYPE a reply we
+  // delegate to Restream's first-party webchat URL (the same one used by
+  // the official Restream Chat app), which uses an internal API. The
+  // reply ends up echoed back to us as a `reply_created` WS frame, and
+  // we surface it as a `self: true` ChatMessage in our feed — closing the
+  // round-trip so Ethan sees his own messages here too.
+  ipcMain.handle(IPC.CHAT_OPEN_COMPOSE, async () => {
+    try {
+      const token = oauth.getToken();
+      if (!token) return { ok: false as const, reason: 'not-authenticated' as const };
+      const res = await fetch('https://api.restream.io/v2/user/webchat/url', {
+        headers: { authorization: `Bearer ${token.accessToken}` },
+      });
+      if (!res.ok) {
+        return {
+          ok: false as const,
+          reason: 'webchat-fetch-failed' as const,
+          status: res.status,
+        };
+      }
+      const json: any = await res.json();
+      const url = typeof json?.webchatUrl === 'string' ? json.webchatUrl : '';
+      if (!url) return { ok: false as const, reason: 'no-webchat-url' as const };
+      // Open in a dedicated BrowserWindow rather than the system browser so
+      // Ethan can leave it docked next to our app and the OAuth session
+      // stays separate from his daily-driver browser.
+      const win = new BrowserWindow({
+        width: 420,
+        height: 640,
+        title: 'Restream Chat++ — Compose',
+        backgroundColor: '#0d1117',
+        parent: mainWindow ?? undefined,
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          // Re-use the same persistent partition the OAuth flow uses
+          // (`persist:restream-oauth`) so the webchat URL trips on the
+          // already-authenticated session and skips the sign-in redirect.
+          session: session.fromPartition('persist:restream-oauth'),
+        },
+      });
+      void win.loadURL(url);
+      return { ok: true as const };
+    } catch (err) {
+      console.error('[main] open compose failed', err);
+      return {
+        ok: false as const,
+        reason: 'error' as const,
+        error: String((err as Error)?.message ?? err),
+      };
+    }
+  });
+
   // ----- Forward chat & state to renderer -----
   chat.on('message', (m) => mainWindow?.webContents.send(IPC.CHAT_MESSAGE, m));
   chat.on('state', (s) => mainWindow?.webContents.send(IPC.CONN_STATE, s));
+  chat.on('connections', (cs) =>
+    mainWindow?.webContents.send(IPC.CONNECTIONS, cs),
+  );
 
   // Resume session if a valid token already exists.
   if (oauth.isAuthenticated()) {
