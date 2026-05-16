@@ -139,8 +139,14 @@ function EmptyFeedBody({
 
 function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElement {
   const color = m.color || PLATFORM_COLORS[m.platform];
+  // Self-originated messages (echoes of replies WE sent via the official
+  // Restream Chat webchat / our Compose button) render visually distinct
+  // — accent-tinted background + "You" username + "self" badge — so the
+  // user can clearly tell their outgoing post landed without confusing it
+  // for an incoming chat. v0.1.10 introduced this when we started
+  // normalising reply_created frames as self ChatMessages.
   return (
-    <div className="message-row">
+    <div className={`message-row${m.self ? ' self' : ''}`}>
       <span className="platform-badge" style={{ background: color }} />
       <div className="message-meta">
         <div className="message-header">
@@ -148,6 +154,7 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
             {m.username}
           </span>
           <span className="platform-label">{PLATFORM_LABELS[m.platform]}</span>
+          {m.self && <span className="self-badge">self</span>}
           <span className="timestamp">{formatTs(m.ts)}</span>
         </div>
         <div className="body">{m.text}</div>

@@ -19,6 +19,46 @@ export interface ChatMessage {
   ts: number; // epoch ms
   color?: string;
   raw?: unknown;
+  /**
+   * True when the message was originated by the local user — produced by
+   * normalising a `reply_created` frame from Restream's WebSocket.
+   *
+   * Restream's Chat API is RECEIVE-ONLY for third-party clients: the
+   * official Restream Chat webchat (or any other first-party flow) is what
+   * actually sends, and the WS broadcasts `reply_created` to every
+   * subscriber including us. v0.1.7 silently dropped these, which is why
+   * Ethan's own messages showed up in the official app but not here. v0.1.10
+   * surfaces them as `self: true` ChatMessages rendered visually distinct
+   * (right-aligned, accent-tinted) in the feed.
+   */
+  self?: boolean;
+}
+
+/**
+ * One connected event source as reported by Restream's WS `connection_info`
+ * action. We keep the latest payload keyed by `connectionIdentifier` and
+ * push the whole list to the renderer whenever it changes, so the channels
+ * panel can show "N connected • click to expand → list of platforms".
+ *
+ * Restream-side reference: https://developers.restream.io/chat/connections
+ */
+export interface ChatConnection {
+  connectionIdentifier: string;
+  connectionUuid: string;
+  eventSourceId: number;
+  platform: Platform;
+  /** 'connecting' | 'connected' | 'error' per Restream docs. */
+  status: 'connecting' | 'connected' | 'error';
+  /** Error code (per docs table) when status='error', else null. */
+  reason?: string | null;
+  /** Human-readable channel name extracted from the source-specific target. */
+  channelName?: string;
+  /** Per-source profile picture / icon URL when available. */
+  avatarUrl?: string;
+  /** Public URL of the channel (when Restream gives us one). */
+  url?: string;
+  /** ms epoch of when we last saw this connection_info update. */
+  updatedAt: number;
 }
 
 export type ConnectionStatus =
@@ -126,6 +166,26 @@ export const IPC = {
   CONN_STATE_GET: 'conn:state:get',
   CONN_RECONNECT: 'conn:reconnect',
   CHAT_MESSAGE: 'chat:message',
+  /**
+   * Push channel — main → renderer — fires whenever the in-memory map of
+   * Restream `connection_info` entries changes (new connect, status flip,
+   * close). Payload is the full deduped ChatConnection[] sorted by platform.
+   */
+  CONNECTIONS: 'connections:list',
+  /** Pull-fetch counterpart so the renderer can sync on mount. */
+  CONNECTIONS_GET: 'connections:get',
+  /**
+   * Open Restream's official webchat compose window in a separate
+   * BrowserWindow. Restream's Chat API is RECEIVE-ONLY for third-party
+   * clients (https://developers.restream.io/chat/getting-started: "This
+   * API works one way — from the server to the client. The server will
+   * ignore any incoming messages.") so to actually send a message we
+   * delegate to Restream's first-party webchat URL, which uses the
+   * private API internally. The reply we send through that window comes
+   * BACK to us as a normal `reply_created` WS frame, which we now render
+   * as a `self: true` ChatMessage in the feed.
+   */
+  CHAT_OPEN_COMPOSE: 'chat:open-compose',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   NOTIFY: 'notify',
