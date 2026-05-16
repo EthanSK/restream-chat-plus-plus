@@ -41,16 +41,29 @@ export function ChatInputInline({
   const [err, setErr] = useState<string | undefined>();
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Hide entirely until the user is signed in.
-  if (!authenticated) return null;
-
   // Auto-grow the textarea height as the user types (max 4 visible lines).
+  //
+  // IMPORTANT: This hook MUST sit ABOVE the `if (!authenticated) return null`
+  // early-return below. Hooks must run in the same order on every render —
+  // declaring useState/useRef before the early-return and useEffect AFTER it
+  // means the hook count jumps from 5 → 6 the moment `authenticated` flips
+  // from false → true, which trips React's "Rendered more hooks than during
+  // the previous render" guard (production error #310) and blanks the entire
+  // app. v0.1.15 surfaced this every launch because the new
+  // `startupAuthDone` gating in main.ts guarantees the renderer always boots
+  // with `authenticated: false` and flips to true a tick later (instead of
+  // the synchronous-resume path that occasionally masked the hook ordering
+  // bug in v0.1.14). v0.1.16 fix.
   useEffect(() => {
+    if (!authenticated) return;
     const el = taRef.current;
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = Math.min(96, el.scrollHeight) + 'px';
-  }, [text]);
+  }, [text, authenticated]);
+
+  // Hide entirely until the user is signed in. MUST stay below ALL hooks.
+  if (!authenticated) return null;
 
   const doSend = async () => {
     const value = text.trim();

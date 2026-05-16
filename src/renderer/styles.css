@@ -642,3 +642,77 @@ body {
   height: 8px;
   border-radius: 50%;
 }
+
+/* ------------------------------- Error boundary -------------------------- */
+/* Renderer-wide React error boundary fallback — shown if the App tree
+   throws during render. Without this the user sees a blank window (the
+   exact symptom v0.1.15 shipped because of the ChatInputInline hook
+   ordering bug). v0.1.16 introduces both the boundary and these styles. */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+  overflow: auto;
+  user-select: text;
+}
+.error-boundary-card {
+  max-width: 520px;
+  background: var(--bg-1);
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  padding: 20px 22px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+}
+.error-boundary-card h1 {
+  margin: 0 0 8px;
+  font-size: 17px;
+  color: var(--danger);
+}
+.error-boundary-msg {
+  margin: 0 0 14px;
+  color: var(--text-1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.error-boundary-stack {
+  margin: 0 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+.error-boundary-stack summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.error-boundary-stack pre {
+  margin: 0;
+  padding: 8px 12px 12px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+.error-boundary-stack strong {
+  display: block;
+  padding: 4px 12px 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.error-boundary-actions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.error-boundary-foot {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
