@@ -447,6 +447,50 @@ body {
   flex-basis: 100%;
 }
 
+/* --- Inline chat input (v0.1.14) — direct send via /client/reply --- */
+
+.chat-input.chat-input-inline {
+  align-items: flex-end;
+  gap: 6px;
+}
+.chat-input-text {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  background: var(--bg-2);
+  color: var(--text-0);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  max-height: 96px;
+  overflow-y: auto;
+  /* Allow the textarea to grow with content via JS-set height. */
+}
+.chat-input-text:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.chat-input-text:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.chat-input-send {
+  height: 30px;
+  min-width: 44px;
+  justify-content: center;
+  padding: 6px 10px;
+}
+.chat-input-send svg { display: block; }
+.chat-input-compose-fallback {
+  height: 30px;
+  font-size: 11px;
+  padding: 6px 10px;
+}
+
 /* ------------------------------- Settings -------------------------------- */
 
 /*

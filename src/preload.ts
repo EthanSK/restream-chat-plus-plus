@@ -5,6 +5,7 @@ import type {
   ChatConnection,
   ChatMessage,
   ConnectionState,
+  SendTextResult,
   Settings,
 } from './shared/types';
 
@@ -80,6 +81,18 @@ const api = {
         error?: string;
       }
   > => ipcRenderer.invoke(IPC.CHAT_OPEN_COMPOSE),
+  /**
+   * Send a chat reply inline via Restream's internal
+   * `POST /api/v2/client/reply` endpoint. The reply gets broadcast back as
+   * a `reply_created` WS frame which surfaces in the feed as a
+   * `self: true` ChatMessage — no optimistic rendering needed.
+   *
+   * The first call (cold start) MAY auto-spawn an invisible Compose window
+   * to provision chat-session cookies in the `persist:restream-oauth`
+   * partition; subsequent sends are pure fetch + cookies.
+   */
+  sendChatText: (text: string): Promise<SendTextResult> =>
+    ipcRenderer.invoke(IPC.CHAT_SEND_TEXT, text),
   onMenuOpenSettings: (cb: () => void): Unsub => {
     const h = () => cb();
     ipcRenderer.on('menu:open-settings', h);

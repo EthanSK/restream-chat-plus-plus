@@ -186,6 +186,19 @@ export const IPC = {
    * as a `self: true` ChatMessage in the feed.
    */
   CHAT_OPEN_COMPOSE: 'chat:open-compose',
+  /**
+   * Send a chat reply text directly via Restream's internal
+   * `POST /api/v2/client/reply` endpoint. The renderer's inline chat-input
+   * bar invokes this — no Compose window needed for the common case.
+   *
+   * Main process pulls the chat-session cookies from the
+   * `persist:restream-oauth` Electron partition (provisioned when the user
+   * signed in / Compose was opened at least once), grabs the
+   * `accessXsrfToken` cookie as the `x-axsrf-token` header, and POSTs the
+   * body. The successful send is echoed back as a `reply_created` WS frame
+   * which our normaliser already surfaces as a `self: true` ChatMessage.
+   */
+  CHAT_SEND_TEXT: 'chat:send-text',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   NOTIFY: 'notify',
@@ -196,4 +209,33 @@ export interface AuthStatus {
   authenticated: boolean;
   scope?: string;
   expiresAt?: number;
+}
+
+/**
+ * Result of an inline `rcpp.sendChatText(text)` call. Used by the renderer
+ * to surface inline errors next to the chat-input bar.
+ *
+ * `reason` codes:
+ *  - `not-authenticated`     — OAuth token missing/expired.
+ *  - `no-session-cookies`    — `persist:restream-oauth` partition has no
+ *                              chat-session cookies yet. The user needs to
+ *                              open the Compose window once so Restream
+ *                              provisions the `.restream.io` cookies +
+ *                              `accessXsrfToken`. We auto-attempt provision
+ *                              via an invisible Compose window first; this
+ *                              reason is reported only if that fails too.
+ *  - `no-active-connections` — channels panel is empty (nothing to reply to).
+ *  - `send-failed`           — POST /client/reply returned non-2xx.
+ *  - `error`                 — unexpected (network / JS) failure.
+ */
+export interface SendTextResult {
+  ok: boolean;
+  reason?:
+    | 'not-authenticated'
+    | 'no-session-cookies'
+    | 'no-active-connections'
+    | 'send-failed'
+    | 'error';
+  status?: number;
+  error?: string;
 }

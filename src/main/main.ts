@@ -13,6 +13,7 @@ import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
 import { createStore } from './store';
+import { sendChatText } from './chat-send';
 import { configureAutoUpdater, checkForUpdatesInteractive } from './updater';
 import {
   DEFAULT_SETTINGS,
@@ -20,6 +21,7 @@ import {
   Settings,
   AuthStatus,
   ConnectionState,
+  SendTextResult,
 } from '../shared/types';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -590,19 +592,36 @@ app.on('ready', async () => {
     try {
       const token = oauth.getToken();
       if (!token) return { ok: false as const, reason: 'not-authenticated' as const };
-      const res = await fetch('https://api.restream.io/v2/user/webchat/url', {
-        headers: { authorization: `Bearer ${token.accessToken}` },
-      });
-      if (!res.ok) {
-        return {
-          ok: false as const,
-          reason: 'webchat-fetch-failed' as const,
-          status: res.status,
-        };
+      // The official documented endpoint for fetching a one-shot webchat
+      // URL: GET /v2/user/webchat/url. This has been intermittently
+      // returning 4xx/5xx for Ethan's account (v0.1.13 — "could not fetch
+      // web chat URL"). Per v0.1.14 the failure path is no longer a
+      // hard error: we fall back to opening https://chat.restream.io
+      // directly. The same persistent partition still carries the
+      // user's session cookies, so the webchat trips on the existing
+      // login. If the partition is cold the webchat will redirect to
+      // login → user signs in once → cookies provisioned for next time.
+      let url = '';
+      try {
+        const res = await fetch('https://api.restream.io/v2/user/webchat/url', {
+          headers: { authorization: `Bearer ${token.accessToken}` },
+        });
+        if (res.ok) {
+          const json: any = await res.json();
+          if (typeof json?.webchatUrl === 'string') url = json.webchatUrl;
+        } else {
+          console.warn(
+            '[main] webchat-url fetch failed status=' + res.status + ', falling back to chat.restream.io',
+          );
+        }
+      } catch (err) {
+        console.warn('[main] webchat-url fetch threw, falling back to chat.restream.io', err);
       }
-      const json: any = await res.json();
-      const url = typeof json?.webchatUrl === 'string' ? json.webchatUrl : '';
-      if (!url) return { ok: false as const, reason: 'no-webchat-url' as const };
+      if (!url) {
+        // Fall back to the canonical chat URL; user's session cookies in
+        // `persist:restream-oauth` will be sent automatically.
+        url = 'https://chat.restream.io';
+      }
       // Open in a dedicated BrowserWindow rather than the system browser so
       // Ethan can leave it docked next to our app and the OAuth session
       // stays separate from his daily-driver browser.
@@ -666,6 +685,45 @@ app.on('ready', async () => {
       return {
         ok: false as const,
         reason: 'error' as const,
+        error: String((err as Error)?.message ?? err),
+      };
+    }
+  });
+
+  // ----- IPC: inline chat send via Restream's /client/reply endpoint -----
+  // Direct fetch from main using the OAuth partition's chat-session cookies.
+  // Reverse-engineered in v0.1.12; shipped behind an inline input bar in
+  // v0.1.14. 1 msg/sec rate-limited so accidental rapid-fire (e.g. holding
+  // Enter on a stuck key) can't hammer Restream's edge.
+  let lastSendAt = 0;
+  ipcMain.handle(IPC.CHAT_SEND_TEXT, async (_evt, rawText: string): Promise<SendTextResult> => {
+    try {
+      if (!oauth.isAuthenticated()) {
+        return { ok: false, reason: 'not-authenticated' };
+      }
+      const now = Date.now();
+      const dt = now - lastSendAt;
+      if (dt < 1000) {
+        // Tiny client-side rate-limit. Surfaces as a soft error in the UI
+        // so the user sees "wait a sec" rather than a silent drop.
+        return {
+          ok: false,
+          reason: 'error',
+          error: `Sending too fast — wait ${Math.ceil((1000 - dt) / 100) / 10}s`,
+        };
+      }
+      lastSendAt = now;
+      const result = await sendChatText({
+        text: rawText,
+        connections: chat.getConnections(),
+        parentWindow: mainWindow,
+      });
+      return result;
+    } catch (err) {
+      console.error('[main] sendChatText failed', err);
+      return {
+        ok: false,
+        reason: 'error',
         error: String((err as Error)?.message ?? err),
       };
     }

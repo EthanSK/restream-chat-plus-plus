@@ -11,7 +11,7 @@ import {
 } from '../shared/types';
 import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
-import { ChatInput } from './ChatInput';
+import { ChatInputInline } from './ChatInputInline';
 import { SettingsDrawer } from './SettingsDrawer';
 import { TTSEngine, RateLimiter } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
@@ -226,7 +226,7 @@ export function App(): React.ReactElement {
         authenticated={auth.authenticated}
         connection={conn}
       />
-      <ChatInput
+      <ChatInputInline
         authenticated={auth.authenticated}
         connected={conn.status === 'connected'}
       />
