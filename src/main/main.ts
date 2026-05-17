@@ -280,6 +280,20 @@ async function createMainWindow() {
   });
 }
 
+/**
+ * Broadcast the renderer-side "clear chat" action — used by both the
+ * application-menu "Clear chat" item (Cmd+K) and the chat-feed context-menu
+ * "Clear chat" item. Wraps the IPC send in a try/catch so a torn-down
+ * mainWindow can't crash a menu click handler. v0.1.18.
+ */
+function broadcastChatClear(win: BrowserWindow | null): void {
+  try {
+    win?.webContents.send(IPC.CHAT_CLEAR);
+  } catch (err) {
+    console.error('[main] broadcastChatClear failed', err);
+  }
+}
+
 function buildMenu(onRevealLogs: () => void) {
   const isMac = process.platform === 'darwin';
   const template: Electron.MenuItemConstructorOptions[] = [
@@ -353,6 +367,16 @@ function buildMenu(onRevealLogs: () => void) {
         { role: 'copy' },
         { role: 'paste' },
         { role: 'selectAll' },
+      ],
+    },
+    {
+      label: 'Chat',
+      submenu: [
+        {
+          label: 'Clear Chat',
+          accelerator: 'CmdOrCtrl+K',
+          click: () => broadcastChatClear(mainWindow),
+        },
       ],
     },
     {
@@ -802,6 +826,27 @@ app.on('ready', async () => {
         reason: 'error',
         error: String((err as Error)?.message ?? err),
       };
+    }
+  });
+
+  // ----- IPC: pop native chat-feed context menu (right-click on feed) -----
+  // Renderer's `.feed` element wires `onContextMenu` to call this handler.
+  // We use a native popup (Menu.buildFromTemplate + popup) rather than a
+  // CSS overlay so the context menu matches macOS dark-blur conventions and
+  // gets full system keyboard navigation for free. v0.1.18.
+  ipcMain.handle(IPC.CHAT_SHOW_CONTEXT_MENU, () => {
+    try {
+      if (!mainWindow) return;
+      const menu = Menu.buildFromTemplate([
+        {
+          label: 'Clear Chat',
+          accelerator: 'CmdOrCtrl+K',
+          click: () => broadcastChatClear(mainWindow),
+        },
+      ]);
+      menu.popup({ window: mainWindow });
+    } catch (err) {
+      console.error('[main] chat:show-context-menu failed', err);
     }
   });
 

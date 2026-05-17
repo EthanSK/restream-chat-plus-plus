@@ -15,6 +15,7 @@ import { ChatInputInline } from './ChatInputInline';
 import { SettingsDrawer } from './SettingsDrawer';
 import { TTSEngine, RateLimiter } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
+import { clearChatMessages } from './chat-actions';
 
 const MAX_MESSAGES = 1000;
 
@@ -81,6 +82,14 @@ export function App(): React.ReactElement {
       });
     });
     const offMenu = rcpp.onMenuOpenSettings(() => setDrawerOpen(true));
+    // "Clear chat" can be triggered from either the chat-feed right-click
+    // context menu or the application menu's Chat → Clear Chat (Cmd+K).
+    // Both flow through the same main → renderer broadcast so we only need
+    // one renderer-side listener that resets the buffer via the pure
+    // `clearChatMessages` reducer. v0.1.18.
+    const offClear = rcpp.onChatClear(() => {
+      setMessages((prev) => clearChatMessages(prev));
+    });
     return () => {
       alive = false;
       offAuth();
@@ -88,6 +97,7 @@ export function App(): React.ReactElement {
       offConnections();
       offChat();
       offMenu();
+      offClear();
     };
   }, []);
 

@@ -1,5 +1,6 @@
 import React from 'react';
 import { Virtuoso } from 'react-virtuoso';
+import { rcpp } from './api';
 import {
   ChatMessage,
   ConnectionState,
@@ -22,6 +23,26 @@ interface Props {
   connection: ConnectionState;
 }
 
+/**
+ * Right-click handler attached to the feed container — asks the main
+ * process to pop a native context menu (Menu.buildFromTemplate + popup).
+ * The native menu items dispatch back via the `chat:clear` IPC broadcast
+ * which `App.tsx` consumes. v0.1.18.
+ *
+ * We use `preventDefault` to suppress Chromium's default DevTools-style
+ * context menu, then fire-and-forget the IPC. Failures are swallowed —
+ * a context menu refusing to open should not interrupt the UI.
+ */
+function onFeedContextMenu(e: React.MouseEvent<HTMLDivElement>): void {
+  e.preventDefault();
+  try {
+    void rcpp.showChatContextMenu();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[ChatFeed] showChatContextMenu failed', err);
+  }
+}
+
 export function ChatFeed({
   messages,
   authenticated,
@@ -29,7 +50,7 @@ export function ChatFeed({
 }: Props): React.ReactElement {
   if (!authenticated) {
     return (
-      <div className="feed">
+      <div className="feed" onContextMenu={onFeedContextMenu}>
         <div className="empty">
           <h2>Welcome to Restream Chat++</h2>
           <p>
@@ -45,7 +66,7 @@ export function ChatFeed({
   }
   if (messages.length === 0) {
     return (
-      <div className="feed">
+      <div className="feed" onContextMenu={onFeedContextMenu}>
         <div className="empty">
           <EmptyFeedBody connection={connection} />
         </div>
@@ -53,7 +74,7 @@ export function ChatFeed({
     );
   }
   return (
-    <div className="feed">
+    <div className="feed" onContextMenu={onFeedContextMenu}>
       <Virtuoso
         data={messages}
         followOutput="smooth"
