@@ -141,18 +141,20 @@ afterEach(() => {
   uninstallFakeSpeechSynthesis();
 });
 
-describe('TTSEngine — preview cancel/speak race fix (v0.1.22)', () => {
-  it('previewVoice defers speak() on a 100ms setTimeout after cancel()', () => {
+describe('TTSEngine — preview cancel/speak race fix (v0.1.22 / v0.1.23)', () => {
+  it('previewVoice defers speak() on a 100ms setTimeout, skipping idle cancel() (v0.1.23 latching fix)', () => {
     const log = installFakeSpeechSynthesis();
     const engine = new TTSEngine(baseTts);
 
     engine.previewVoice(undefined);
 
-    // cancel() runs synchronously, speak() is deferred to a 100ms task.
-    expect(log.cancel).toBe(1);
+    // v0.1.23: cancel() is GATED on speechSynthesis.speaking || pending so we
+    // don't trigger Electron 42 Chromium's idle-cancel silence latch. Engine
+    // starts idle, so no cancel fires. speak() is still deferred 100ms.
+    expect(log.cancel).toBe(0);
     expect(log.speak.length).toBe(0);
 
-    // Microtask flush is NOT enough any more — must be a task tick.
+    // Microtask flush is NOT enough — must be a task tick.
     vi.advanceTimersByTime(50);
     expect(log.speak.length).toBe(0);
 
@@ -160,6 +162,50 @@ describe('TTSEngine — preview cancel/speak race fix (v0.1.22)', () => {
     vi.advanceTimersByTime(100);
     expect(log.speak.length).toBe(1);
     expect(log.speak[0].text).toContain('Hello, my name is');
+  });
+
+  it('previewVoice DOES call cancel() when engine is actively speaking', () => {
+    const log = installFakeSpeechSynthesis();
+    const engine = new TTSEngine(baseTts);
+    // Simulate an in-flight utterance.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ((globalThis as any).window.speechSynthesis as FakeSpeechSynthesis).speaking = true;
+
+    engine.previewVoice(undefined);
+
+    // Cancel fires because the engine is genuinely speaking — this is the
+    // "rapid switching" case the cancel is for.
+    expect(log.cancel).toBe(1);
+  });
+
+  it('repeated previewVoice calls all speak (v0.1.23 latching regression)', () => {
+    // The v0.1.22 bug: the FIRST preview played, every subsequent preview
+    // was silent. The fix is to NOT call speechSynthesis.cancel() on an idle
+    // engine — Electron 42 Chromium latches silent if you do.
+    const log = installFakeSpeechSynthesis();
+    const engine = new TTSEngine(baseTts);
+
+    engine.previewVoice(undefined);
+    vi.advanceTimersByTime(200);
+    expect(log.speak.length).toBe(1);
+
+    // updateSettings is what App.tsx fires before each previewVoice in the
+    // settings drawer flow. With enabled=false (DEFAULT_SETTINGS.tts.enabled
+    // is false until user opts in) this used to fire cancel() and contribute
+    // to the latch. v0.1.23 gates that cancel() on speaking || pending.
+    engine.updateSettings({ ...baseTts, enabled: false });
+    engine.previewVoice(undefined);
+    vi.advanceTimersByTime(200);
+    expect(log.speak.length).toBe(2);
+
+    engine.updateSettings({ ...baseTts, enabled: false });
+    engine.previewVoice(undefined);
+    vi.advanceTimersByTime(200);
+    expect(log.speak.length).toBe(3);
+
+    // Critical: NO cancels fired on the idle engine across all 3 previews.
+    // The cancel() calls in the old code were the silence-latch trigger.
+    expect(log.cancel).toBe(0);
   });
 
   it('previewVoice carries volume / rate / pitch through to the utterance', () => {
@@ -177,17 +223,17 @@ describe('TTSEngine — preview cancel/speak race fix (v0.1.22)', () => {
 });
 
 describe('TTSEngine — auto-resume paused state (still required)', () => {
-  it('resumes BEFORE cancel in previewVoice (cancel-on-paused can defer)', () => {
+  it('resumes BEFORE (possible) cancel in previewVoice — paused engine still gets a deferred speak', () => {
     const log = installFakeSpeechSynthesis({ startPaused: true });
     const engine = new TTSEngine(baseTts);
 
     engine.previewVoice(undefined);
 
-    // The synchronous portion of previewVoice must have lifted the pause
-    // BEFORE calling cancel — otherwise cancel itself can be deferred on a
-    // paused engine.
+    // The synchronous portion of previewVoice must lift the pause first.
+    // v0.1.23: cancel is gated on speaking || pending — idle paused engine
+    // skips cancel to avoid Chromium's idle-cancel silence latch.
     expect(log.resume).toBeGreaterThanOrEqual(1);
-    expect(log.cancel).toBe(1);
+    expect(log.cancel).toBe(0);
 
     vi.advanceTimersByTime(200);
     expect(log.speak.length).toBe(1);

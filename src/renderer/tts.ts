@@ -8,8 +8,35 @@ import type { ChatMessage, Settings } from '../shared/types';
  *   from spiraling during a chat raid)
  * - Allows the user to pick a system voice by URI
  *
- * v0.1.22 regression-fix notes (supersedes v0.1.21)
- * =================================================
+ * v0.1.23 latching-fix notes (supersedes v0.1.22)
+ * ===============================================
+ *
+ * v0.1.22 fixed the FIRST-call silence but introduced a latching bug: the
+ * preview played the first time, then was silent on every subsequent voice
+ * pick / volume-slider release. Root cause:
+ *
+ *   - `updateSettings()` called `this.cancel()` whenever `enabled=false`
+ *     (DEFAULT_SETTINGS.tts.enabled is `false` until the user opts in).
+ *   - App.tsx fires `updateSettings()` synchronously BEFORE `previewVoice()`
+ *     on every voice/volume change (patchTts → onChange → updateSettings, then
+ *     onPreviewVoice in the same event handler).
+ *   - `previewVoice()` THEN called `speechSynthesis.cancel()` again
+ *     unconditionally.
+ *   - Result: every preview after the first fired TWO `cancel()` calls on an
+ *     IDLE engine. Real Electron 42 Chromium silently latches its internal
+ *     synthesis queue when cancel() is called on an idle engine; subsequent
+ *     speak() calls return without producing audio. (The fake speechSynthesis
+ *     in tts-regression.test.ts didn't model the latch, so tests passed.)
+ *
+ * Fix: gate every `cancel()` behind `speechSynthesis.speaking || pending`.
+ * Both `updateSettings()` (when disabling) and `previewVoice()` now skip the
+ * cancel when the engine is idle and only fire it when there's actually a
+ * live utterance to interrupt — which is the only case `cancel()` is needed
+ * for. The setTimeout(speak, 100) defer + name-fallback resolve + resume-
+ * before-cancel from v0.1.22 remain unchanged.
+ *
+ * v0.1.22 notes (still current, kept for context)
+ * -----------------------------------------------
  *
  * v0.1.21 attempted three fixes but the unit tests in tts-regression.test.ts
  * used a fake `speechSynthesis` that didn't model Chromium's real behaviour;
@@ -85,7 +112,11 @@ export class TTSEngine {
       pitch: settings.pitch,
     });
     this.settings = settings;
-    if (!settings.enabled) this.cancel();
+    if (!settings.enabled) {
+      this.queue = [];
+      this.speaking = false;
+      if (this.hasActiveSpeechSynthesis()) this.cancel();
+    }
   }
 
   enqueue(message: ChatMessage) {
@@ -199,15 +230,18 @@ export class TTSEngine {
       window.speechSynthesis.resume();
     }
 
-    // Cancel everything in flight so rapid switching doesn't queue overlaps.
+    // Cancel active speech so rapid switching doesn't queue overlaps, but do
+    // not cancel an idle Chromium engine: Electron 42 can latch silent after
+    // idle cancel() calls.
     this.queue = [];
     this.speaking = false;
-    log('previewVoice: calling cancel()', {
+    const shouldCancel = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+    log(shouldCancel ? 'previewVoice: calling cancel()' : 'previewVoice: skipping cancel() — engine idle', {
       paused: window.speechSynthesis.paused,
       speaking: window.speechSynthesis.speaking,
       pending: window.speechSynthesis.pending,
     });
-    window.speechSynthesis.cancel();
+    if (shouldCancel) window.speechSynthesis.cancel();
 
     const voice = this.resolveVoice(voiceURI);
     const displayName = voice?.name ?? 'system default';
@@ -298,6 +332,11 @@ export class TTSEngine {
     while (this.timestamps.length > 0 && this.timestamps[0] < cutoff) {
       this.timestamps.shift();
     }
+  }
+
+  private hasActiveSpeechSynthesis(): boolean {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return false;
+    return window.speechSynthesis.speaking || window.speechSynthesis.pending;
   }
 }
 
