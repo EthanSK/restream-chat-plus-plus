@@ -33,7 +33,40 @@ import {
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
-if (started) app.quit();
+// ---------------------------------------------------------------------------
+// `--mcp-stdio` MCP server entrypoint. v0.1.29.
+// ---------------------------------------------------------------------------
+//
+// When invoked with `--mcp-stdio`, the binary runs as a Model Context
+// Protocol (MCP) server over stdin/stdout instead of launching the GUI.
+// Agents can then configure the app (TTS prefs, notification prefs, regex
+// ignore lists, etc.) without the user touching the Settings drawer.
+//
+// Architecture: this process never calls `app.whenReady()` or creates a
+// BrowserWindow. The MCP layer reads/writes the electron-store JSON file
+// directly via `src/mcp/store-io.ts` — the running GUI (if any) re-fetches
+// settings on each renderer `IPC.SETTINGS_GET` pull, so MCP mutations flow
+// through naturally. Runtime-only state (live WS connections, recent-
+// message buffer) is not introspectable from this process; those tools
+// return a `guiNotIntrospectable: true` hint payload so agents get clear
+// feedback rather than a silent no-op.
+//
+// We MUST detect the flag before the `if (started) app.quit()` line so a
+// fresh-install Squirrel hook doesn't yank the process out from under the
+// MCP loop.
+if (process.argv.includes('--mcp-stdio')) {
+  // Lazy require so the GUI launch path doesn't pull the MCP module
+  // (and its `tools.ts` electron-app reference) at startup time.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { startStdioServer } = require('../mcp/stdio') as typeof import('../mcp/stdio');
+  startStdioServer();
+  // Don't fall through to the normal Electron boot. We intentionally do
+  // NOT call `app.quit()` — that would tear down stdin before our handler
+  // can drain the queue on EOF. Instead the stdio server calls
+  // `process.exit(0)` on stdin EOF.
+} else if (started) {
+  app.quit();
+}
 
 let mainWindow: BrowserWindow | null = null;
 
