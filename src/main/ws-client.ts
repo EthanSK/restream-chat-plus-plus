@@ -167,6 +167,19 @@ export class ChatClient extends EventEmitter {
   }
 
   /**
+   * v0.1.28: drop the cached `showId` without tearing down the WS. Used by
+   * the inline-send retry path when a POST 404s — the showId we held was
+   * stale-but-present (Restream returned the format-valid value across an
+   * `event_ended` boundary, or the user re-streamed and the show id rolled
+   * over). The next sniff on an incoming frame will re-populate it; until
+   * then `getShowId()` returns undefined so the send path falls back to a
+   * REST hydration.
+   */
+  invalidateShowId(): void {
+    this.showId = undefined;
+  }
+
+  /**
    * Public accessor so the main process can resolve / expose the raw-frame
    * log path (e.g. for a "Reveal Logs in Finder" menu item) without having
    * to duplicate the platform-specific path-resolution logic. Returns

@@ -303,4 +303,208 @@ describe('chat-send', () => {
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('error');
   });
+
+  // --------------------------------------------------------------------
+  // v0.1.28: stale-but-present showId — 404 → invalidate → retry once
+  // --------------------------------------------------------------------
+  // The v0.1.20 path only hydrated showId when it was UNDEFINED. Real-world
+  // case: WS sniffed `show-A` from a previous stream, that stream ended, WS
+  // stayed up, user tries to send. opts.showId is set to the stale 'show-A',
+  // Restream returns 404. v0.1.28 invalidates the cached value, re-hydrates
+  // via the REST API, and retries the POST. Only after the retry also 404s
+  // do we surface no-show-id.
+
+  it('v0.1.28: retries with refreshed showId after first 404 (recovers cleanly)', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      // First call: stale show-A → 404. Second call: fresh show-B → 200.
+      if (calls.length === 1) return new Response('show not found', { status: 404 });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    let refreshCalls = 0;
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'stale-show-A',
+      refreshShowId: async () => {
+        refreshCalls += 1;
+        return 'fresh-show-B';
+      },
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls.length).toBe(2);
+    expect(refreshCalls).toBe(1);
+    const firstBody = JSON.parse(String(calls[0].init.body));
+    const secondBody = JSON.parse(String(calls[1].init.body));
+    expect(firstBody.showId).toBe('stale-show-A');
+    expect(secondBody.showId).toBe('fresh-show-B');
+    // Same UUID across both attempts — Restream sees one logical reply.
+    expect(secondBody.clientReplyUuid).toBe(firstBody.clientReplyUuid);
+  });
+
+  it('v0.1.28: returns no-show-id after retry also 404s', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response('show not found', { status: 404 });
+    };
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'stale-show-A',
+      refreshShowId: async () => undefined, // No active in-progress event.
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no-show-id');
+    expect(result.status).toBe(404);
+    expect(result.error).toContain('No active show');
+    expect(calls.length).toBe(2); // First attempt + retry, no third.
+    const secondBody = JSON.parse(String(calls[1].init.body));
+    // Retry POSTed without showId because refresh returned undefined.
+    expect('showId' in secondBody).toBe(false);
+  });
+
+  it('v0.1.28: retry with refreshed id still 404 → no-show-id error', async () => {
+    // Both attempts get 404 even though refresh returned a value (e.g. the
+    // refreshed id was ALSO stale, or the user genuinely has no show despite
+    // the REST API returning something). Same actionable error.
+    const fakeFetch = async () => new Response('not found', { status: 404 });
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'stale-A',
+      refreshShowId: async () => 'still-stale-B',
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no-show-id');
+    expect(result.error).toContain('No active show');
+  });
+
+  it('v0.1.28: retry path is skipped when no refreshShowId hook is provided', async () => {
+    // Back-compat: if main.ts doesn't wire refreshShowId, the v0.1.20 contract
+    // (single attempt → no-show-id only when body lacked showId) must hold.
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response('not found', { status: 404 });
+    };
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'stale-A',
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('send-failed'); // Stale showId → 404 → send-failed (v0.1.20 contract).
+    expect(calls.length).toBe(1);
+  });
+
+  it('v0.1.28: log callback fires per POST attempt with redacted headers', async () => {
+    const logRecords: Array<any> = [];
+    const fakeFetch = async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200 });
+    await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'show-X',
+      parentWindow: null,
+      getSession: () =>
+        fakeSession([
+          { name: 'accessXsrfToken', value: 'XSRF-SUPER-SECRET' },
+          { name: 'session', value: 'SESS-COOKIE-VALUE-DO-NOT-LEAK' },
+        ]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      log: (r) => logRecords.push(r),
+    });
+    expect(logRecords.length).toBe(1);
+    expect(logRecords[0].attempt).toBe(1);
+    expect(logRecords[0].response.status).toBe(200);
+    expect(logRecords[0].body.showId).toBe('show-X');
+    expect(logRecords[0].showIdRefreshed).toBe(false);
+    // Cookie + xsrf MUST be redacted — log goes to disk.
+    expect(logRecords[0].headers.cookie).toMatch(/^<redacted len=\d+>$/);
+    expect(logRecords[0].headers.cookie).not.toContain('SUPER-SECRET');
+    expect(logRecords[0].headers.cookie).not.toContain('SESS-COOKIE-VALUE');
+    expect(logRecords[0].headers['x-axsrf-token']).toMatch(/^sha256:/);
+    expect(logRecords[0].headers['x-axsrf-token']).not.toContain('XSRF-SUPER-SECRET');
+    // Non-sensitive headers stay verbatim.
+    expect(logRecords[0].headers.origin).toBe('https://chat.restream.io');
+  });
+
+  it('v0.1.28: log records both attempt:1 and attempt:2 on the retry path', async () => {
+    const logRecords: Array<any> = [];
+    let n = 0;
+    const fakeFetch = async () => {
+      n += 1;
+      if (n === 1) return new Response('not found', { status: 404 });
+      return new Response('{}', { status: 200 });
+    };
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      showId: 'stale',
+      refreshShowId: async () => 'fresh',
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      log: (r) => logRecords.push(r),
+    });
+    expect(result.ok).toBe(true);
+    expect(logRecords.length).toBe(2);
+    expect(logRecords[0].attempt).toBe(1);
+    expect(logRecords[0].response.status).toBe(404);
+    expect(logRecords[0].showIdRefreshed).toBe(false);
+    expect(logRecords[0].body.showId).toBe('stale');
+    expect(logRecords[1].attempt).toBe(2);
+    expect(logRecords[1].response.status).toBe(200);
+    expect(logRecords[1].showIdRefreshed).toBe(true);
+    expect(logRecords[1].body.showId).toBe('fresh');
+  });
+
+  it('v0.1.28: non-404 errors do NOT trigger the retry path', async () => {
+    // 429, 500, etc are NOT the stale-showId signal — only 404 is. Retrying
+    // would just waste a request. Guard against accidental retry-on-everything.
+    const calls: number[] = [];
+    const fakeFetch = async () => {
+      calls.push(1);
+      return new Response('rate limited', { status: 429 });
+    };
+    let refreshCalls = 0;
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      showId: 'show-A',
+      refreshShowId: async () => {
+        refreshCalls += 1;
+        return 'show-B';
+      },
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('send-failed');
+    expect(result.status).toBe(429);
+    expect(calls.length).toBe(1);
+    expect(refreshCalls).toBe(0);
+  });
 });

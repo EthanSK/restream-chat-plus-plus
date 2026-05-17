@@ -13,8 +13,12 @@ import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
 import { createStore } from './store';
-import { sendChatText } from './chat-send';
-import { configureAutoUpdater, checkForUpdatesInteractive } from './updater';
+import { sendChatText, type ChatSendLogRecord } from './chat-send';
+import {
+  configureAutoUpdater,
+  checkForUpdatesInteractive,
+  quitAndInstallStagedUpdate,
+} from './updater';
 import {
   getLastUpdateInfo,
   performGithubUpdateCheck,
@@ -692,6 +696,22 @@ app.on('ready', async () => {
         ...(stored.filter ?? {}),
         platforms: { ...DEFAULT_SETTINGS.filter.platforms, ...(stored.filter?.platforms ?? {}) },
       },
+      // v0.1.26 regex-ignore lists. Two-level merge so a persisted blob
+      // that has `filters.tts.ignoreRegex` but not `filters.notifications`
+      // (or vice versa, or neither — pre-v0.1.26 blobs lack the section
+      // entirely) still resolves to fully-typed arrays via the defaults.
+      filters: {
+        ...DEFAULT_SETTINGS.filters,
+        ...(stored.filters ?? {}),
+        tts: {
+          ...DEFAULT_SETTINGS.filters.tts,
+          ...(stored.filters?.tts ?? {}),
+        },
+        notifications: {
+          ...DEFAULT_SETTINGS.filters.notifications,
+          ...(stored.filters?.notifications ?? {}),
+        },
+      },
       update: { ...DEFAULT_SETTINGS.update, ...(stored.update ?? {}) },
     };
   }
@@ -727,6 +747,13 @@ app.on('ready', async () => {
   // `shell.openExternal` so a malicious renderer (XSS in a future feature)
   // can't trick the main process into opening a `file://` URL or a
   // custom-protocol handler.
+  // ----- IPC: Squirrel restart-to-install (v0.1.25) -----
+  // Bound to the renderer's UpdateBanner Restart button when the banner
+  // is in `ready-to-install` state. Guarded so a stray call before
+  // `update-downloaded` can't crash the app — see
+  // `quitAndInstallStagedUpdate()`.
+  ipcMain.handle(IPC.UPDATE_QUIT_AND_INSTALL, () => quitAndInstallStagedUpdate());
+
   ipcMain.handle(IPC.OPEN_EXTERNAL, async (_evt, url: string): Promise<boolean> => {
     try {
       if (typeof url !== 'string') return false;
@@ -911,10 +938,20 @@ app.on('ready', async () => {
   // per session (showIdRestCache) — Restream's event id changes per
   // stream session, so a stale cache is acceptable until the user
   // reconnects the WS.
+  //
+  // v0.1.28: stale-but-present invalidation. The cache could ALSO hold a
+  // showId from a show that ended hours ago — Restream returns 404 on
+  // /client/reply for both "never had a show" AND "show ended" with the
+  // same status code and body, so we can't tell pre-send. Two layers
+  // defend against this:
+  //   1. On a POST 404 the inline send path calls `refreshShowIdForce()`
+  //      which clears both the REST cache + the WS sniff, re-hits the
+  //      REST API, and feeds the result into a single retry POST.
+  //   2. A 10-minute periodic poller (while WS connected) re-hydrates
+  //      the cache so a stale show id can't linger across multiple sends.
   let lastSendAt = 0;
   let showIdRestCache: string | undefined;
-  const fetchActiveShowIdFromApi = async (): Promise<string | undefined> => {
-    if (showIdRestCache) return showIdRestCache;
+  const hydrateShowIdViaRest = async (): Promise<string | undefined> => {
     const token = oauth.getToken();
     if (!token) return undefined;
     try {
@@ -932,8 +969,7 @@ app.on('ready', async () => {
       if (Array.isArray(json) && json.length > 0) {
         const first = json[0] as { id?: unknown };
         if (typeof first?.id === 'string' && first.id) {
-          showIdRestCache = first.id;
-          return showIdRestCache;
+          return first.id;
         }
       }
       return undefined;
@@ -942,14 +978,139 @@ app.on('ready', async () => {
       return undefined;
     }
   };
-  // Reset the REST cache whenever the WS sniffs a fresh showId — that
-  // value is authoritative once seen, and a stale REST cache could
-  // smuggle the wrong show across an account switch / reconnect.
+  /**
+   * Cache-coherent hydration used as `fetchShowId` on the FIRST POST.
+   * Returns the cached value if present; otherwise hits the REST API and
+   * caches the result for subsequent sends within this WS session.
+   */
+  const fetchActiveShowIdFromApi = async (): Promise<string | undefined> => {
+    if (showIdRestCache) return showIdRestCache;
+    const fresh = await hydrateShowIdViaRest();
+    if (fresh) showIdRestCache = fresh;
+    return fresh;
+  };
+  /**
+   * v0.1.28: force-refresh used as `refreshShowId` on the retry path AFTER
+   * a 404. Invalidates BOTH the REST cache AND the WS-sniffed value (so
+   * `chat.getShowId()` returns undefined until a new frame lands), then
+   * re-hits the REST API. The returned value is cached as the new
+   * authority. If the REST API also returns nothing (no active in-progress
+   * event), we return undefined and the retry POSTs without showId —
+   * Restream will 404 again and the user sees the "no active show" error.
+   */
+  const refreshShowIdForce = async (): Promise<string | undefined> => {
+    showIdRestCache = undefined;
+    try {
+      chat.invalidateShowId();
+    } catch (err) {
+      console.error('[main] chat.invalidateShowId failed', err);
+    }
+    const fresh = await hydrateShowIdViaRest();
+    if (fresh) showIdRestCache = fresh;
+    return fresh;
+  };
+
+  // Reset the REST cache whenever the WS reconnects — that value is
+  // authoritative once seen, and a stale REST cache could smuggle the
+  // wrong show across an account switch / reconnect.
   chat.on('state', (s) => {
     if (s.status === 'connecting' || s.status === 'reconnecting') {
       showIdRestCache = undefined;
     }
   });
+
+  // ---- v0.1.28: periodic showId refresh (10-minute interval) ----------
+  // While the WS is connected, re-hit the REST API every 10 minutes and
+  // overwrite the cache. Catches the "stream ended hours ago but the app
+  // kept running" case before the user hits send and gets a 404. Only
+  // armed while connected; torn down on disconnect / reconnect / app quit
+  // so we don't waste API calls when the WS is down.
+  const SHOW_ID_REFRESH_INTERVAL_MS = 10 * 60_000; // 10 minutes
+  let showIdRefreshTimer: NodeJS.Timeout | undefined;
+  const stopShowIdRefresh = (): void => {
+    if (showIdRefreshTimer) {
+      clearInterval(showIdRefreshTimer);
+      showIdRefreshTimer = undefined;
+    }
+  };
+  const startShowIdRefresh = (): void => {
+    stopShowIdRefresh();
+    showIdRefreshTimer = setInterval(() => {
+      void (async () => {
+        try {
+          const fresh = await hydrateShowIdViaRest();
+          if (fresh) {
+            // Overwrite cache unconditionally — the REST endpoint is the
+            // authoritative "currently in-progress" signal for the user's
+            // primary event. The WS-sniffed value stays untouched (it's
+            // still the canonical "what arrived on the wire") but the
+            // cache used by the send path is now fresh.
+            showIdRestCache = fresh;
+          } else {
+            // No in-progress event — invalidate cache so the next send
+            // falls through to the 404 → no-show-id error rather than
+            // POSTing with a stale id.
+            showIdRestCache = undefined;
+          }
+        } catch (err) {
+          console.warn('[main] periodic showId refresh threw', err);
+        }
+      })();
+    }, SHOW_ID_REFRESH_INTERVAL_MS);
+  };
+  chat.on('state', (s) => {
+    if (s.status === 'connected') {
+      startShowIdRefresh();
+    } else if (
+      s.status === 'connecting' ||
+      s.status === 'reconnecting' ||
+      s.status === 'disconnected' ||
+      s.status === 'error'
+    ) {
+      // Cancel on any transition out of connected. Re-armed on next connect.
+      stopShowIdRefresh();
+    }
+  });
+  app.on('before-quit', () => stopShowIdRefresh());
+
+  // ---- v0.1.28: dedicated chat-send.jsonl log -------------------------
+  // The Compose-window logger only captures requests originating from the
+  // webview (used during reverse-engineering). The MAIN-process inline send
+  // bypasses it entirely. Without this log, "v0.1.28 chat-send still 404s"
+  // bug reports have no way to see the actual request shape, status codes,
+  // or whether the retry path triggered. Redacts cookie/xsrf headers in
+  // chat-send.ts before this callback ever sees them.
+  const resolveChatSendLogPath = (): string | undefined => {
+    try {
+      const rawLogPath = chat.getRawLogPath();
+      const dir = rawLogPath
+        ? path.dirname(rawLogPath)
+        : (() => {
+            try {
+              return app.getPath('logs');
+            } catch {
+              return undefined;
+            }
+          })();
+      if (!dir) return undefined;
+      fs.mkdirSync(dir, { recursive: true });
+      return path.join(dir, 'chat-send.jsonl');
+    } catch {
+      return undefined;
+    }
+  };
+  const appendChatSendLog = (record: ChatSendLogRecord): void => {
+    try {
+      const p = resolveChatSendLogPath();
+      if (!p) return;
+      const line =
+        JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n';
+      fs.appendFileSync(p, line, 'utf8');
+    } catch (err) {
+      console.error('[main] chat-send log append failed', err);
+    }
+  };
+
   ipcMain.handle(IPC.CHAT_SEND_TEXT, async (_evt, rawText: string): Promise<SendTextResult> => {
     try {
       if (!oauth.isAuthenticated()) {
@@ -972,6 +1133,8 @@ app.on('ready', async () => {
         connections: chat.getConnections(),
         showId: chat.getShowId(),
         fetchShowId: fetchActiveShowIdFromApi,
+        refreshShowId: refreshShowIdForce,
+        log: appendChatSendLog,
         parentWindow: mainWindow,
       });
       return result;
