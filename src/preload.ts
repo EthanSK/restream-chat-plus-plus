@@ -93,6 +93,27 @@ const api = {
    */
   sendChatText: (text: string): Promise<SendTextResult> =>
     ipcRenderer.invoke(IPC.CHAT_SEND_TEXT, text),
+  /**
+   * Ask the main process to pop a native context menu anchored at the
+   * current cursor position. The only item today is "Clear chat" — on
+   * click, main sends `CHAT_CLEAR` back to the renderer which empties its
+   * message buffer. Native popup is preferred over a CSS overlay so the
+   * context menu matches macOS dark-blur conventions + system keyboard nav.
+   * v0.1.18.
+   */
+  showChatContextMenu: (): Promise<void> =>
+    ipcRenderer.invoke(IPC.CHAT_SHOW_CONTEXT_MENU),
+  /**
+   * Subscribe to "clear chat" broadcasts from main — fired by either the
+   * chat context-menu "Clear chat" item or the application menu's
+   * "Clear chat" (Cmd+K). Renderer handler empties its in-memory buffer;
+   * Restream-side state is untouched. v0.1.18.
+   */
+  onChatClear: (cb: () => void): Unsub => {
+    const h = () => cb();
+    ipcRenderer.on(IPC.CHAT_CLEAR, h);
+    return () => ipcRenderer.removeListener(IPC.CHAT_CLEAR, h);
+  },
   onMenuOpenSettings: (cb: () => void): Unsub => {
     const h = () => cb();
     ipcRenderer.on('menu:open-settings', h);

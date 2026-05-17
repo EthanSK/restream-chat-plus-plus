@@ -199,6 +199,23 @@ export const IPC = {
    * which our normaliser already surfaces as a `self: true` ChatMessage.
    */
   CHAT_SEND_TEXT: 'chat:send-text',
+  /**
+   * Renderer → main. Asks the main process to pop a native context menu
+   * (Menu.buildFromTemplate + popup) anchored at the cursor. Currently the
+   * only item is "Clear chat"; when clicked, main sends back `CHAT_CLEAR`
+   * which the renderer consumes by emptying its in-memory message buffer.
+   * Native popup is used (rather than a custom CSS menu) so context-menu UX
+   * matches macOS conventions — dark blur, full-system keyboard nav, etc.
+   * v0.1.18.
+   */
+  CHAT_SHOW_CONTEXT_MENU: 'chat:show-context-menu',
+  /**
+   * Main → renderer broadcast: clear the chat-message buffer (renderer state
+   * only — this never touches the WebSocket or Restream-side state). Fired
+   * by either the chat context-menu "Clear chat" item or the application
+   * menu's "Clear chat" item (Cmd+K). v0.1.18.
+   */
+  CHAT_CLEAR: 'chat:clear',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   NOTIFY: 'notify',
