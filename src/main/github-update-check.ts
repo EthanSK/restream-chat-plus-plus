@@ -99,6 +99,23 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
     return disabled;
   }
 
+  // Broadcast `checking` so the renderer can show a spinner while the
+  // network round-trip is in flight. We DON'T cache this in `lastInfo`
+  // because it would overwrite the most recent terminal state (e.g.
+  // `available`), making a fresh renderer mount lose the banner. v0.1.25.
+  const checkingInfo: UpdateInfo = {
+    kind: 'checking',
+    currentVersion,
+    checkedAt: now,
+  };
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      win.webContents.send(IPC.UPDATE_STATUS, checkingInfo);
+    } catch (err) {
+      log.error('[updater-gh] checking broadcast failed', err);
+    }
+  }
+
   try {
     log.info('[updater-gh] checking', RELEASES_URL);
     // AbortController gives us a hard timeout — `fetch()` itself has no

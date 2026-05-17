@@ -6,6 +6,7 @@ import {
   Settings,
 } from '../shared/types';
 import { sortVoicesByQuality, voiceQualityRank } from './tts';
+import { validateIgnoreList } from './message-filters';
 
 interface Props {
   settings: Settings;
@@ -93,6 +94,39 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
   function patchUpdate(patch: Partial<Settings['update']>) {
     onChange({ ...settings, update: { ...settings.update, ...patch } });
   }
+
+  // v0.1.26 — regex-ignore textareas. The textarea binds to a string-array
+  // surface (one regex per line). Splitting on "\n" is intentional: blank
+  // mid-edit lines produce empty strings which the filter helpers already
+  // treat as no-op, so the user can press Enter freely.
+  function patchTtsFilter(lines: string[]) {
+    onChange({
+      ...settings,
+      filters: {
+        ...settings.filters,
+        tts: { ...settings.filters.tts, ignoreRegex: lines },
+      },
+    });
+  }
+  function patchNotifFilter(lines: string[]) {
+    onChange({
+      ...settings,
+      filters: {
+        ...settings.filters,
+        notifications: { ...settings.filters.notifications, ignoreRegex: lines },
+      },
+    });
+  }
+  // Per-textarea validation memos — recompute only when the list changes.
+  const ttsIgnoreErrors = useMemo(
+    () => validateIgnoreList(settings.filters?.tts?.ignoreRegex ?? []),
+    [settings.filters?.tts?.ignoreRegex],
+  );
+  const notifIgnoreErrors = useMemo(
+    () => validateIgnoreList(settings.filters?.notifications?.ignoreRegex ?? []),
+    [settings.filters?.notifications?.ignoreRegex],
+  );
+
   function togglePlatform(p: Platform) {
     onChange({
       ...settings,
@@ -232,6 +266,65 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 max="120"
                 value={settings.notifications.maxPerMinute}
                 onChange={(e) => patchNotif({ maxPerMinute: Math.max(1, Number(e.target.value) || 1) })}
+              />
+            </div>
+          </section>
+
+          <section className="section">
+            <h3>Filters</h3>
+            <p className="section-hint">
+              One JavaScript regex per line. Matches are{' '}
+              <strong>case-insensitive</strong> and tested against the message
+              body. Empty lines are ignored; invalid patterns are skipped.
+            </p>
+            <div className="filter-row">
+              <label htmlFor="tts-ignore-regex">
+                Ignore TTS for messages matching:
+              </label>
+              <textarea
+                id="tts-ignore-regex"
+                className={`filter-regex${
+                  ttsIgnoreErrors.length > 0 ? ' invalid' : ''
+                }`}
+                rows={4}
+                spellCheck={false}
+                placeholder={'e.g. ^!\\s*\\w+\nbot$\n\\bspam\\b'}
+                value={(settings.filters?.tts?.ignoreRegex ?? []).join('\n')}
+                onChange={(e) => patchTtsFilter(e.target.value.split('\n'))}
+                title={
+                  ttsIgnoreErrors.length > 0
+                    ? ttsIgnoreErrors
+                        .map((er) => `Line ${er.line}: ${er.error}`)
+                        .join('\n')
+                    : 'TTS will skip any message whose body matches one of these regexes.'
+                }
+                aria-invalid={ttsIgnoreErrors.length > 0}
+              />
+            </div>
+            <div className="filter-row">
+              <label htmlFor="notif-ignore-regex">
+                Ignore notifications for messages matching:
+              </label>
+              <textarea
+                id="notif-ignore-regex"
+                className={`filter-regex${
+                  notifIgnoreErrors.length > 0 ? ' invalid' : ''
+                }`}
+                rows={4}
+                spellCheck={false}
+                placeholder={'e.g. ^!\\s*\\w+\nbot$\n\\bspam\\b'}
+                value={(
+                  settings.filters?.notifications?.ignoreRegex ?? []
+                ).join('\n')}
+                onChange={(e) => patchNotifFilter(e.target.value.split('\n'))}
+                title={
+                  notifIgnoreErrors.length > 0
+                    ? notifIgnoreErrors
+                        .map((er) => `Line ${er.line}: ${er.error}`)
+                        .join('\n')
+                    : 'Native notifications will be suppressed for any message whose body matches one of these regexes.'
+                }
+                aria-invalid={notifIgnoreErrors.length > 0}
               />
             </div>
           </section>

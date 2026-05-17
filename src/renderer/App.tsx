@@ -18,6 +18,10 @@ import { UpdateBanner } from './UpdateBanner';
 import { TTSEngine, RateLimiter } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
+import {
+  applyMessageFilters,
+  compileIgnorePatterns,
+} from './message-filters';
 
 const MAX_MESSAGES = 1000;
 
@@ -36,6 +40,26 @@ export function App(): React.ReactElement {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const ttsRef = useRef<TTSEngine | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
+
+  // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
+  // and stash both in refs so the mount-only `onChatMessage` subscription
+  // can read the freshest lists without being torn down on every tweak.
+  const ttsIgnoreCompiled = useMemo(
+    () => compileIgnorePatterns(settings.filters?.tts?.ignoreRegex ?? []),
+    [settings.filters?.tts?.ignoreRegex],
+  );
+  const notifIgnoreCompiled = useMemo(
+    () => compileIgnorePatterns(settings.filters?.notifications?.ignoreRegex ?? []),
+    [settings.filters?.notifications?.ignoreRegex],
+  );
+  const ttsIgnoreRef = useRef<RegExp[]>(ttsIgnoreCompiled);
+  const notifIgnoreRef = useRef<RegExp[]>(notifIgnoreCompiled);
+  useEffect(() => {
+    ttsIgnoreRef.current = ttsIgnoreCompiled;
+  }, [ttsIgnoreCompiled]);
+  useEffect(() => {
+    notifIgnoreRef.current = notifIgnoreCompiled;
+  }, [notifIgnoreCompiled]);
 
   // Init: load auth + settings + current connection state, subscribe to events.
   useEffect(() => {
@@ -94,8 +118,22 @@ export function App(): React.ReactElement {
     const offConn = rcpp.onConnectionState(setConn);
     const offConnections = rcpp.onConnections(setConnections);
     const offChat = rcpp.onChatMessage((m) => {
+      // v0.1.26: apply regex-ignore filters BEFORE pushing to state so
+      // the resulting ChatMessage carries `ignoredByTts` /
+      // `ignoredByNotifications`. The forward-to-side-effects useEffect
+      // below reads those flags to skip TTS / notifications, and
+      // ChatFeed renders the "regex-ignored" badge from the same flags.
+      const flags = applyMessageFilters(
+        m.text,
+        ttsIgnoreRef.current,
+        notifIgnoreRef.current,
+      );
+      const flagged: ChatMessage =
+        flags.ignoredByTts || flags.ignoredByNotifications
+          ? { ...m, ...flags }
+          : m;
       setMessages((prev) => {
-        const next = [...prev, m];
+        const next = [...prev, flagged];
         if (next.length > MAX_MESSAGES) next.splice(0, next.length - MAX_MESSAGES);
         return next;
       });
@@ -110,18 +148,26 @@ export function App(): React.ReactElement {
       setMessages((prev) => clearChatMessages(prev));
     });
     // Live update-check broadcasts — fires when the GH poller completes a
-    // check (hourly + once at startup) AND on every explicit "Check Now".
-    // Reset the per-session dismiss flag whenever the LATEST tag advances:
-    // if the user dismissed v0.1.24 and we now see v0.1.25 is out, the
-    // user almost certainly wants to know.
+    // check (hourly + once at startup), on every explicit "Check Now",
+    // AND on Squirrel `download-progress` / `update-downloaded` events
+    // (v0.1.25). Reset the per-session dismiss flag in two cases:
+    //
+    //   1. New `available` tag — if the user dismissed v0.1.24 and we now
+    //      see v0.1.25 is out, they almost certainly want to know.
+    //   2. Transition to `downloading` / `ready-to-install` — even if the
+    //      user dismissed the earlier `available` banner, once Squirrel
+    //      has started downloading we want the progress + Restart UI to
+    //      surface.
     const offUpdate = rcpp.onUpdateStatus((info) => {
       setUpdateInfo((prev) => {
-        if (
+        const newAvailable =
           info.kind === 'available' &&
           prev?.latestVersion &&
           info.latestVersion &&
-          info.latestVersion !== prev.latestVersion
-        ) {
+          info.latestVersion !== prev.latestVersion;
+        const stateProgressed =
+          info.kind === 'downloading' || info.kind === 'ready-to-install';
+        if (newAvailable || stateProgressed) {
           setUpdateDismissed(false);
         }
         return info;
@@ -139,20 +185,25 @@ export function App(): React.ReactElement {
     };
   }, []);
 
-  // Forward each new message to TTS + native notifications, honoring filters.
-  // Self-originated messages (reply_created echoes of Ethan's own outgoing
-  // replies) are skipped — TTS-reading your own message back at you and
-  // popping a native notification for it is just annoying.
+  // Forward each new message to TTS + native notifications, honouring the
+  // platform filter and the v0.1.26 regex-ignore lists.
+  //
+  // v0.1.26 product direction: ALL messages are read aloud / notified by
+  // default, including the user's own `self: true` reply_created echoes.
+  // v0.1.10's self-exclusion is deliberately removed. Users who want to
+  // silence their own outgoing messages add a regex to the corresponding
+  // `Settings.filters.*.ignoreRegex` list — the per-message `ignoredByTts`
+  // / `ignoredByNotifications` flags set at insertion time tell us to
+  // skip the side effect AND render the badge.
   useEffect(() => {
     if (messages.length === 0) return;
     const m = messages[messages.length - 1];
-    if (m.self) return;
     if (!settings.filter.platforms[m.platform]) return;
 
-    if (settings.tts.enabled) {
+    if (settings.tts.enabled && !m.ignoredByTts) {
       ttsRef.current?.enqueue(m);
     }
-    if (settings.notifications.enabled) {
+    if (settings.notifications.enabled && !m.ignoredByNotifications) {
       if (notifyLimiterRef.current.tryConsume()) {
         rcpp.notify(`${m.username} (${m.platform})`, m.text);
       }
@@ -221,6 +272,7 @@ export function App(): React.ReactElement {
         dismissed={updateDismissed}
         onDismiss={() => setUpdateDismissed(true)}
         onDownload={(url) => void rcpp.openExternal(url)}
+        onRestart={() => void rcpp.quitAndInstall()}
       />
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />

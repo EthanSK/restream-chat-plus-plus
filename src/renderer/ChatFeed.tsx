@@ -7,6 +7,7 @@ import {
   PLATFORM_COLORS,
   PLATFORM_LABELS,
 } from '../shared/types';
+import { regexIgnoredBadgeLabel } from './message-filters';
 
 interface Props {
   messages: ChatMessage[];
@@ -166,6 +167,13 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
   // user can clearly tell their outgoing post landed without confusing it
   // for an incoming chat. v0.1.10 introduced this when we started
   // normalising reply_created frames as self ChatMessages.
+  //
+  // v0.1.26: when the message tripped one of the regex-ignore lists, we
+  // also render a small subtle chip — "🔇 regex-ignored (TTS)" /
+  // "🔕 regex-ignored (notif)" / "🔇🔕 regex-ignored" — next to the
+  // message text. Muted color so it doesn't dominate; gives the user
+  // immediate positional feedback that their regex matched.
+  const ignoredLabel = regexIgnoredBadgeLabel(m);
   return (
     <div className={`message-row${m.self ? ' self' : ''}`}>
       <span className="platform-badge" style={{ background: color }} />
@@ -178,7 +186,17 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
           {m.self && <span className="self-badge">self</span>}
           <span className="timestamp">{formatTs(m.ts)}</span>
         </div>
-        <div className="body">{m.text}</div>
+        <div className="body">
+          {m.text}
+          {ignoredLabel && (
+            <span
+              className="regex-ignored-badge"
+              title="A pattern in Settings → Filters matched this message, so the corresponding side effect was suppressed."
+            >
+              {ignoredLabel}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

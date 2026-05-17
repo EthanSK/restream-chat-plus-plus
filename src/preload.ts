@@ -165,6 +165,15 @@ const api = {
    */
   openExternal: (url: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.OPEN_EXTERNAL, url),
+  /**
+   * Trigger Squirrel's `autoUpdater.quitAndInstall()` from the renderer.
+   * Bound to the `UpdateBanner` "Restart" button in the `ready-to-install`
+   * state. Main-process handler guards on whether an update has actually
+   * been downloaded; resolves with `{ ok: false, reason }` otherwise so
+   * the renderer can surface a graceful error rather than crashing. v0.1.25.
+   */
+  quitAndInstall: (): Promise<{ ok: boolean; reason?: string }> =>
+    ipcRenderer.invoke(IPC.UPDATE_QUIT_AND_INSTALL),
 };
 
 contextBridge.exposeInMainWorld('rcpp', api);

@@ -15,9 +15,10 @@
 // - `update-electron-app` swallows errors from update.electronjs.org so
 //   they don't disrupt the user; we surface them through electron-log.
 
-import { app, BrowserWindow, dialog, shell } from 'electron';
+import { app, autoUpdater, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
 import { updateElectronApp, UpdateSourceType } from 'update-electron-app';
+import { IPC, UpdateInfo } from '../shared/types';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
 
@@ -32,6 +33,120 @@ let feedURLReady = false;
 // check is already mid-flight (each click adds a `once` listener; without
 // this guard multiple "you're on the latest version" dialogs would stack).
 let checkInFlight = false;
+// True after Squirrel emits `update-downloaded` — guards `quitAndInstall()`
+// so the renderer's Restart button can't trigger a sync throw if it
+// somehow fires before the download settled. v0.1.25.
+let updateDownloaded = false;
+
+/**
+ * Push an UpdateInfo payload to every live BrowserWindow via the existing
+ * `IPC.UPDATE_STATUS` channel — shared with the GH-Releases poller so the
+ * renderer's `onUpdateStatus` subscription handles both signal sources
+ * uniformly. We deliberately do NOT route through `github-update-check`'s
+ * internal `broadcast()` because that helper is gated on a meaningful
+ * payload diff (kind/latestVersion/error) — Squirrel emits dozens of
+ * `download-progress` events with the same kind, and they all need to
+ * reach the renderer for the percentage to animate. v0.1.25.
+ */
+function broadcastSquirrelStatus(info: UpdateInfo): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      win.webContents.send(IPC.UPDATE_STATUS, info);
+    } catch (err) {
+      log.error('[updater] broadcast failed', err);
+    }
+  }
+}
+
+/**
+ * Subscribe to Squirrel's autoUpdater events and forward each into the
+ * renderer's `UpdateBanner` via `IPC.UPDATE_STATUS` so the user gets live
+ * feedback while a background download is in flight. v0.1.25.
+ *
+ * Events of interest:
+ *   - `download-progress` (newer Electron + Squirrel-mac builds) — fires
+ *     with `{ percent, bytesPerSecond, total, transferred }`. We forward
+ *     `percent` only; the banner's progress bar doesn't need the rest.
+ *     NOTE: not every Squirrel.Mac build emits this event; on older
+ *     builds the user sees an indeterminate "Downloading…" bar instead.
+ *   - `update-downloaded` — fires once the new bundle is staged + ready
+ *     to apply. Renderer flips to the `ready-to-install` state.
+ *
+ * `update-electron-app`'s `notifyUser: true` ALSO listens to
+ * `update-downloaded` and shows its own native restart-to-update dialog.
+ * That's fine: both UI paths coexist — the user can click either the
+ * banner's Restart button or the dialog's button; both call
+ * `quitAndInstall()` in the end.
+ */
+function attachSquirrelProgressForwarders(): void {
+  // `download-progress` isn't in Electron's `autoUpdater` d.ts (Squirrel
+  // emits it internally). Cast through EventEmitter so we can subscribe
+  // without TS complaining about the unknown event name. Runtime contract
+  // from Squirrel: the callback receives a single
+  // `{ percent, bytesPerSecond?, total?, transferred? }` object.
+  (autoUpdater as unknown as NodeJS.EventEmitter).on(
+    'download-progress',
+    (progress?: { percent?: number }) => {
+      try {
+        const raw = progress?.percent;
+        const percent =
+          typeof raw === 'number' && Number.isFinite(raw)
+            ? Math.max(0, Math.min(100, raw))
+            : undefined;
+        broadcastSquirrelStatus({
+          kind: 'downloading',
+          currentVersion: app.getVersion(),
+          downloadPercent: percent,
+          checkedAt: Date.now(),
+        });
+      } catch (err) {
+        log.error('[updater] download-progress forward failed', err);
+      }
+    },
+  );
+
+  autoUpdater.on(
+    'update-downloaded',
+    (_evt: Electron.Event, _releaseNotes?: string, releaseName?: string) => {
+      try {
+        updateDownloaded = true;
+        broadcastSquirrelStatus({
+          kind: 'ready-to-install',
+          currentVersion: app.getVersion(),
+          // `releaseName` is the version string per Electron's autoUpdater
+          // contract on macOS (Squirrel.Mac sets it to the new bundle's
+          // CFBundleShortVersionString).
+          latestVersion: typeof releaseName === 'string' ? releaseName : undefined,
+          checkedAt: Date.now(),
+        });
+        log.info('[updater] update downloaded, ready to install', { releaseName });
+      } catch (err) {
+        log.error('[updater] update-downloaded forward failed', err);
+      }
+    },
+  );
+}
+
+/**
+ * Renderer-triggered restart. Bound to `IPC.UPDATE_QUIT_AND_INSTALL` in
+ * `main.ts`. `autoUpdater.quitAndInstall()` throws synchronously if no
+ * update has been staged — guarded with `updateDownloaded` so the
+ * Restart button can't accidentally crash the app. v0.1.25.
+ */
+export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
+  if (!updateDownloaded) {
+    log.warn('[updater] quit-and-install requested but no update staged');
+    return { ok: false, reason: 'no-update-downloaded' };
+  }
+  try {
+    log.info('[updater] quit-and-install triggered from renderer');
+    autoUpdater.quitAndInstall();
+    return { ok: true };
+  } catch (err) {
+    log.error('[updater] quit-and-install threw', err);
+    return { ok: false, reason: String((err as Error)?.message ?? err) };
+  }
+}
 
 export function configureAutoUpdater(): void {
   if (configured) return;
@@ -57,6 +172,12 @@ export function configureAutoUpdater(): void {
       notifyUser: true, // built-in restart-to-update dialog
     });
     feedURLReady = true;
+    // Wire Squirrel download-progress + update-downloaded forwarders so
+    // the renderer's `UpdateBanner` can show a progress bar + restart
+    // button respectively. Must be attached AFTER `updateElectronApp`
+    // configures the feed URL — before that, the autoUpdater isn't set
+    // up. v0.1.25.
+    attachSquirrelProgressForwarders();
     log.info('[updater] auto-update configured for', REPO);
   } catch (err) {
     log.error('[updater] failed to configure auto-update', err);
@@ -173,9 +294,9 @@ export async function checkForUpdatesInteractive(
   checkInFlight = true;
 
   try {
-    // Lazy require to avoid pulling Electron's autoUpdater into module
-    // scope until the menu is actually clicked.
-    const { autoUpdater } = await import('electron');
+    // `autoUpdater` is imported at module scope (we need it for the
+    // Squirrel download-progress / update-downloaded forwarders); no need
+    // to lazy-require it inside this handler. v0.1.25.
 
     // Settle the flow via the next emitted event. `update-not-available`,
     // `update-downloaded`, or `error` are guaranteed to fire after a

@@ -30,8 +30,30 @@ export interface ChatMessage {
    * Ethan's own messages showed up in the official app but not here. v0.1.10
    * surfaces them as `self: true` ChatMessages rendered visually distinct
    * (right-aligned, accent-tinted) in the feed.
+   *
+   * NOTE: v0.1.10 ALSO short-circuited TTS + notifications for self
+   * messages. v0.1.26 reverts that — TTS now reads ALL messages by default,
+   * including the user's own. The visual distinction remains, but the
+   * audible/notification side effects no longer skip on `self`. Users who
+   * want to silence specific patterns (their own outgoing markers,
+   * commands, bot output, etc.) should use the new
+   * `Settings.filters.*.ignoreRegex` lists.
    */
   self?: boolean;
+  /**
+   * Renderer-side flag set during the App.tsx forward-to-side-effects
+   * effect when a regex in `Settings.filters.tts.ignoreRegex` matched
+   * `text`. The message is NOT enqueued to the TTS engine; the badge
+   * "🔇 regex-ignored (TTS)" renders in `ChatFeed`. v0.1.26.
+   */
+  ignoredByTts?: boolean;
+  /**
+   * Counterpart to `ignoredByTts` for `Settings.filters.notifications.ignoreRegex`.
+   * When true, the native notification is skipped and the badge
+   * "🔕 regex-ignored (notif)" renders. If both flags are set the badge
+   * collapses to "🔇🔕 regex-ignored". v0.1.26.
+   */
+  ignoredByNotifications?: boolean;
 }
 
 /**
@@ -101,6 +123,34 @@ export interface Settings {
     platforms: Record<Platform, boolean>;
   };
   /**
+   * Per-side-effect regex ignore lists, v0.1.26.
+   *
+   * The strings are user-authored JS regex patterns — one per line in the
+   * Settings drawer textarea. Empty strings (blank lines) are ignored.
+   * Invalid patterns (syntax errors) are silently SKIPPED at compile time:
+   * the Settings UI flags them with a red border + tooltip so the user
+   * can fix them, but a typo never breaks the rest of the list. Patterns
+   * are matched case-insensitively against `ChatMessage.text` only.
+   *
+   * If any pattern in `tts.ignoreRegex` matches, the incoming message is
+   * NOT enqueued to the TTS engine and `ignoredByTts` is set on the
+   * persisted message so the feed renders the "🔇 regex-ignored (TTS)"
+   * badge. Same flow for `notifications.ignoreRegex`. The two lists are
+   * independent — a message can be regex-ignored for TTS but still
+   * trigger a notification (or vice versa).
+   *
+   * Defaults to empty arrays — out of the box, every message is read
+   * aloud (when TTS is enabled) per the v0.1.26 product direction.
+   */
+  filters: {
+    tts: {
+      ignoreRegex: string[];
+    };
+    notifications: {
+      ignoreRegex: string[];
+    };
+  };
+  /**
    * Update-checker preferences. The GH-Releases-API-backed poller in
    * `src/main/github-update-check.ts` reads `update.autoCheck` at every
    * tick — toggling the setting takes effect on the next interval without
@@ -142,6 +192,12 @@ export const DEFAULT_SETTINGS: Settings = {
       x: true,
       unknown: true,
     },
+  },
+  filters: {
+    // Empty by default — v0.1.26 product direction is "read everything";
+    // users opt in to filtering by adding patterns in the Settings drawer.
+    tts: { ignoreRegex: [] },
+    notifications: { ignoreRegex: [] },
   },
   update: {
     // Opt-out, not opt-in: unsigned builds get no other update signal.
@@ -267,22 +323,66 @@ export const IPC = {
    * install on macOS.
    */
   OPEN_EXTERNAL: 'shell:open-external',
+  /**
+   * Renderer → main. Triggered by the "Restart" button on the
+   * `ready-to-install` banner state. Calls `autoUpdater.quitAndInstall()`
+   * which closes the app and lets Squirrel swap the bundle. Only valid
+   * after a Squirrel `update-downloaded` event has fired — otherwise the
+   * autoUpdater throws synchronously. The main-process handler guards on
+   * that. v0.1.25.
+   */
+  UPDATE_QUIT_AND_INSTALL: 'update:quit-and-install',
 } as const;
 
 /**
  * Result of an update check, broadcast over IPC.UPDATE_STATUS / returned
- * from IPC.UPDATE_CHECK_NOW. The renderer's UpdateBanner only renders for
- * `kind: 'available'`; the other kinds are still useful for logging /
- * future "Check for Updates Now…" feedback surfaces.
+ * from IPC.UPDATE_CHECK_NOW. The renderer's UpdateBanner renders distinct
+ * visuals per `kind`:
+ *
+ *   - `checking`         → small spinner + "Checking for updates…" text.
+ *                          Fired by the GH poller at the start of every
+ *                          check AND by the manual "Check for Updates Now"
+ *                          path so the renderer can show progress while
+ *                          the network round-trip is in flight. v0.1.25.
+ *   - `available`        → "Update available" banner with Download button
+ *                          (opens release page) + Later (dismiss).
+ *   - `downloading`      → progress bar with percent. Driven by the
+ *                          Squirrel `download-progress` event in
+ *                          `src/main/updater.ts` (v0.1.25). Only fires on
+ *                          signed builds where Squirrel can actually fetch
+ *                          the payload; unsigned builds skip straight from
+ *                          `available` to whatever the user does manually.
+ *   - `ready-to-install` → "Restart to install" banner with a Restart
+ *                          button that calls `autoUpdater.quitAndInstall()`.
+ *                          Fired by Squirrel's `update-downloaded` event.
+ *   - `up-to-date`       → no banner (the silent happy path).
+ *   - `disabled`         → no banner (the auto-check toggle is off).
+ *   - `error`            → no banner; the error is logged for the
+ *                          "Check Now" menu item's dialog.
  */
 export interface UpdateInfo {
-  kind: 'available' | 'up-to-date' | 'disabled' | 'error';
+  kind:
+    | 'checking'
+    | 'available'
+    | 'downloading'
+    | 'ready-to-install'
+    | 'up-to-date'
+    | 'disabled'
+    | 'error';
   /** Currently-running app version (from `app.getVersion()`). */
   currentVersion: string;
-  /** Latest GH release tag — populated when kind === 'available'. */
+  /** Latest GH release tag — populated when kind === 'available'/'downloading'/'ready-to-install'. */
   latestVersion?: string;
   /** GH release page URL — populated when kind === 'available'. */
   releaseUrl?: string;
+  /**
+   * Squirrel download progress, 0-100. Populated when kind === 'downloading'.
+   * Squirrel's `download-progress` event exposes `percent`; we forward it
+   * verbatim. Undefined while we know the download is in progress but
+   * Squirrel hasn't reported its first chunk yet — UI should render an
+   * indeterminate state in that case.
+   */
+  downloadPercent?: number;
   /** Error message — populated when kind === 'error'. */
   error?: string;
   /** Epoch ms of when this check completed. */

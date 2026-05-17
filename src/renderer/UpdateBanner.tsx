@@ -1,44 +1,74 @@
-// Update-available banner — v0.1.19.
+// Update banner — v0.1.25.
 //
-// Renders a thin amber strip below the titlebar when the GH-Releases poller
-// reports `kind: 'available'`. Two buttons:
+// Renders a thin strip below the titlebar that surfaces the current
+// state of the auto-update flow. v0.1.24 had a single "Update available"
+// state; v0.1.25 adds three more so the user gets continuous feedback
+// while the background download is happening:
 //
-//   - Download  → opens the release page in the user's default browser
-//                 (`rcpp.openExternal(releaseUrl)`), then dismisses the
-//                 banner for this session. The next launch will re-check
-//                 and re-show the banner if the user hasn't actually
-//                 installed the newer build yet, which is the desired
-//                 "nag, but not too hard" behavior.
-//   - Later     → dismisses the banner for this session. Same re-show
-//                 behavior on next launch.
+//   `checking`         → small spinner + "Checking for updates…".
+//                        Fired by the GH-Releases poller AND by the
+//                        manual "Check for Updates Now…" path.
+//   `available`        → "Update available {version}" + Download +
+//                        Later buttons. Same as v0.1.24.
+//   `downloading`      → "Downloading update… NN%" + progress bar.
+//                        Driven by Squirrel's `download-progress` event;
+//                        on signed builds only. NO Dismiss button — once
+//                        the download is underway we want the user to
+//                        see it through to the restart prompt.
+//   `ready-to-install` → "Update ready — Restart to install" + Restart
+//                        button. Fired by `update-downloaded`. Restart
+//                        calls `quitAndInstall()` via IPC.
 //
-// State machine (pure, tested via `updateBannerState` below):
-//   info.kind === 'available' AND !dismissed → 'visible'
-//   info.kind === 'available' AND  dismissed → 'hidden'
-//   anything else                            → 'hidden'
+// State machine (pure, tested via `updateBannerState`):
+//   info.kind === 'available'        AND !dismissed → 'available'
+//   info.kind === 'available'        AND  dismissed → 'hidden'
+//   info.kind === 'checking'                       → 'checking'
+//   info.kind === 'downloading'                    → 'downloading'
+//   info.kind === 'ready-to-install'               → 'ready-to-install'
+//   anything else (up-to-date / disabled / error)  → 'hidden'
 //
-// We intentionally don't persist the dismissed flag across launches — Ethan
-// preferred a soft nag over a sticky one. Same pattern as Producer Player.
+// The `dismissed` flag is intentionally session-only and only applies to
+// the `available` state — once a download starts, dismissing it would
+// hide a process the user can't easily restart. The pattern matches
+// Producer Player's update banner.
 
 import React from 'react';
 import type { UpdateInfo } from '../shared/types';
 
 /**
- * Pure state-machine helper. Exported separately so the test suite can drive
- * the banner without a real DOM. Keep this side-effect-free.
+ * Pure state-machine helper. Exported separately so the test suite can
+ * drive the banner without a real DOM. Keep this side-effect-free.
  */
+export type BannerState =
+  | 'hidden'
+  | 'checking'
+  | 'available'
+  | 'downloading'
+  | 'ready-to-install';
+
 export function updateBannerState(
   info: UpdateInfo | null,
   dismissed: boolean,
-): 'visible' | 'hidden' {
+): BannerState {
   if (!info) return 'hidden';
-  if (info.kind !== 'available') return 'hidden';
-  if (dismissed) return 'hidden';
-  // `available` implies latestVersion + releaseUrl are populated per the
-  // main-process contract (`github-update-check.ts`); guard anyway so a
-  // malformed payload doesn't render a button with no URL.
-  if (!info.latestVersion || !info.releaseUrl) return 'hidden';
-  return 'visible';
+  switch (info.kind) {
+    case 'checking':
+      return 'checking';
+    case 'available':
+      if (dismissed) return 'hidden';
+      // `available` implies latestVersion + releaseUrl are populated per
+      // the main-process contract (`github-update-check.ts`); guard
+      // anyway so a malformed payload doesn't render a button with no URL.
+      if (!info.latestVersion || !info.releaseUrl) return 'hidden';
+      return 'available';
+    case 'downloading':
+      return 'downloading';
+    case 'ready-to-install':
+      return 'ready-to-install';
+    default:
+      // 'up-to-date' / 'disabled' / 'error' — no banner.
+      return 'hidden';
+  }
 }
 
 interface Props {
@@ -47,32 +77,107 @@ interface Props {
   onDismiss: () => void;
   /**
    * Opens the release URL in the user's default browser via the preload
-   * `rcpp.openExternal` API. The component is dumb — it doesn't know about
-   * IPC — so this is injected from App.tsx for test-friendliness.
+   * `rcpp.openExternal` API. The component is dumb — it doesn't know
+   * about IPC — so this is injected from App.tsx for test-friendliness.
    */
   onDownload: (url: string) => void;
+  /**
+   * Triggers Squirrel's `quitAndInstall()` via the preload
+   * `rcpp.quitAndInstall` API. Injected for test-friendliness. v0.1.25.
+   */
+  onRestart: () => void;
 }
 
-export function UpdateBanner({ info, dismissed, onDismiss, onDownload }: Props): React.ReactElement | null {
-  if (updateBannerState(info, dismissed) === 'hidden') return null;
-  // After updateBannerState confirms 'visible', latestVersion + releaseUrl
-  // are guaranteed non-undefined.
-  const version = info!.latestVersion!;
-  const url = info!.releaseUrl!;
+export function UpdateBanner({
+  info,
+  dismissed,
+  onDismiss,
+  onDownload,
+  onRestart,
+}: Props): React.ReactElement | null {
+  const state = updateBannerState(info, dismissed);
+  if (state === 'hidden') return null;
+
+  if (state === 'checking') {
+    return (
+      <div className="update-banner update-banner-checking" role="status" aria-live="polite">
+        <span className="update-banner-spinner" aria-hidden="true" />
+        <span className="update-banner-text">Checking for updates…</span>
+      </div>
+    );
+  }
+
+  if (state === 'available') {
+    const version = info!.latestVersion!;
+    const url = info!.releaseUrl!;
+    return (
+      <div className="update-banner" role="status" aria-live="polite">
+        <span className="update-banner-text">
+          Update available {version} — running {info!.currentVersion}
+        </span>
+        <div className="update-banner-actions">
+          <button
+            className="btn primary"
+            onClick={() => {
+              onDownload(url);
+              onDismiss();
+            }}
+          >
+            Download
+          </button>
+          <button className="btn ghost" onClick={onDismiss}>
+            Later
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state === 'downloading') {
+    // `downloadPercent` may be undefined on the very first event before
+    // Squirrel reports its first chunk; render an indeterminate bar in
+    // that case so the user still sees "something is happening".
+    const pct = info!.downloadPercent;
+    const hasPct = typeof pct === 'number';
+    const display = hasPct ? `${Math.round(pct as number)}%` : '…';
+    return (
+      <div
+        className="update-banner update-banner-downloading"
+        role="status"
+        aria-live="polite"
+        aria-label={
+          hasPct
+            ? `Downloading update, ${Math.round(pct as number)} percent complete`
+            : 'Downloading update'
+        }
+      >
+        <span className="update-banner-text">Downloading update… {display}</span>
+        <div
+          className="update-progress"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={hasPct ? Math.round(pct as number) : undefined}
+        >
+          <div
+            className={`update-progress-bar${hasPct ? '' : ' indeterminate'}`}
+            style={hasPct ? { width: `${Math.max(0, Math.min(100, pct as number))}%` } : undefined}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // ready-to-install
+  const readyVersion = info!.latestVersion;
   return (
-    <div className="update-banner" role="status" aria-live="polite">
+    <div className="update-banner update-banner-ready" role="status" aria-live="polite">
       <span className="update-banner-text">
-        Update available {version} — running {info!.currentVersion}
+        Update ready{readyVersion ? ` (${readyVersion})` : ''} — Restart to install
       </span>
       <div className="update-banner-actions">
-        <button
-          className="btn primary"
-          onClick={() => {
-            onDownload(url);
-            onDismiss();
-          }}
-        >
-          Download
+        <button className="btn primary" onClick={onRestart}>
+          Restart
         </button>
         <button className="btn ghost" onClick={onDismiss}>
           Later
