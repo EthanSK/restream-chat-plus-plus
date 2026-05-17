@@ -26,6 +26,7 @@ function migrate(stored: Partial<Settings> | undefined): Settings {
         ...(stored.filter?.platforms ?? {}),
       },
     },
+    update: { ...DEFAULT_SETTINGS.update, ...(stored.update ?? {}) },
   };
 }
 
@@ -63,5 +64,52 @@ describe('Settings migration', () => {
 
   it('returns full defaults when nothing is persisted', () => {
     expect(migrate(undefined)).toEqual(DEFAULT_SETTINGS);
+  });
+
+  // -------------------------------------------------------------------------
+  // v0.1.24 — `update.autoCheck` toggle for the GH-Releases poller.
+  //
+  // The GH-API-backed update checker (`src/main/github-update-check.ts`) is
+  // the primary "is there a new version?" signal for unsigned macOS builds,
+  // because Squirrel.Mac silently rejects unsigned auto-updates and leaves
+  // users stranded on whatever version they first installed. The setting is
+  // opt-out: defaulting to ON means a fresh install with no persisted
+  // settings starts polling immediately. Defaulting to OFF would re-create
+  // the "I never know there's an update" problem we're trying to fix.
+  //
+  // These tests pin that contract so a future refactor can't silently flip
+  // the default to false without us noticing.
+  // -------------------------------------------------------------------------
+  it('DEFAULT_SETTINGS.update.autoCheck is true (opt-out, not opt-in)', () => {
+    expect(DEFAULT_SETTINGS.update.autoCheck).toBe(true);
+  });
+
+  it('defaults update.autoCheck to true when absent in persisted blob (pre-v0.1.24 user upgrade)', () => {
+    // Simulate a pre-v0.1.24 settings blob: no `update` section at all.
+    const legacy = {
+      tts: {
+        enabled: true,
+        readSenderName: false,
+        rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
+        maxPerMinute: 20,
+      },
+    } as unknown as Partial<Settings>;
+
+    const merged = migrate(legacy);
+    expect(merged.update.autoCheck).toBe(true);
+  });
+
+  it('preserves a user-set update.autoCheck=false across migration', () => {
+    const stored: Partial<Settings> = {
+      update: { autoCheck: false },
+    };
+    const merged = migrate(stored);
+    expect(merged.update.autoCheck).toBe(false);
+  });
+
+  it('returns autoCheck=true when nothing is persisted (clean install)', () => {
+    expect(migrate(undefined).update.autoCheck).toBe(true);
   });
 });

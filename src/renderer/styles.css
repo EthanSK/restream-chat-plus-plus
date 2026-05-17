@@ -62,6 +62,33 @@ body {
   background: var(--bg-1);
 }
 
+/* GH-Releases update banner — thin amber strip below the titlebar. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #4a3a14;
+  color: #fef3c7;
+  border-bottom: 1px solid #6b4f1c;
+  font-size: 12px;
+}
+.update-banner-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.update-banner-actions {
+  display: flex;
+  gap: 6px;
+}
+.update-banner-actions .btn {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
 .toolbar .status-dot {
   width: 10px;
   height: 10px;

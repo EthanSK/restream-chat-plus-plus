@@ -100,6 +100,19 @@ export interface Settings {
   filter: {
     platforms: Record<Platform, boolean>;
   };
+  /**
+   * Update-checker preferences. The GH-Releases-API-backed poller in
+   * `src/main/github-update-check.ts` reads `update.autoCheck` at every
+   * tick — toggling the setting takes effect on the next interval without
+   * needing an app restart. The "Check for Updates Now…" menu item always
+   * fires regardless of this flag (it's the explicit user request path).
+   *
+   * Defaults to `true` — Ethan ships unsigned builds so the only signal he
+   * gets that a new version exists is this banner; opt-out only.
+   */
+  update: {
+    autoCheck: boolean;
+  };
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -129,6 +142,10 @@ export const DEFAULT_SETTINGS: Settings = {
       x: true,
       unknown: true,
     },
+  },
+  update: {
+    // Opt-out, not opt-in: unsigned builds get no other update signal.
+    autoCheck: true,
   },
 };
 
@@ -220,7 +237,57 @@ export const IPC = {
   SETTINGS_SET: 'settings:set',
   NOTIFY: 'notify',
   REVEAL_LOGS: 'logs:reveal',
+  /**
+   * Push channel — main → renderer — fires whenever the GH-Releases poller
+   * (`src/main/github-update-check.ts`) finishes a check. Payload is an
+   * `UpdateInfo` describing whether an update is available, the app is up
+   * to date, the check is disabled, or the check failed. The renderer's
+   * UpdateBanner subscribes to this to decide whether to show its strip.
+   */
+  UPDATE_STATUS: 'update:status',
+  /**
+   * Pull-fetch counterpart to UPDATE_STATUS — used by a renderer that
+   * mounted AFTER a check already completed so it doesn't miss the banner.
+   * Returns the last broadcast `UpdateInfo`, or `undefined` if no check
+   * has run yet.
+   */
+  UPDATE_STATUS_GET: 'update:status:get',
+  /**
+   * Renderer → main. Force an immediate GH-Releases check, bypassing the
+   * `settings.update.autoCheck` gate (this is the path used by the
+   * "Check for Updates Now…" menu item). Resolves with the resulting
+   * `UpdateInfo`.
+   */
+  UPDATE_CHECK_NOW: 'update:check-now',
+  /**
+   * Renderer → main. Open an arbitrary URL in the user's default browser
+   * via `shell.openExternal`. Used by the UpdateBanner's Download button
+   * to navigate to the GitHub release page — we intentionally don't try
+   * to apply the update in-place because unsigned builds can't auto-
+   * install on macOS.
+   */
+  OPEN_EXTERNAL: 'shell:open-external',
 } as const;
+
+/**
+ * Result of an update check, broadcast over IPC.UPDATE_STATUS / returned
+ * from IPC.UPDATE_CHECK_NOW. The renderer's UpdateBanner only renders for
+ * `kind: 'available'`; the other kinds are still useful for logging /
+ * future "Check for Updates Now…" feedback surfaces.
+ */
+export interface UpdateInfo {
+  kind: 'available' | 'up-to-date' | 'disabled' | 'error';
+  /** Currently-running app version (from `app.getVersion()`). */
+  currentVersion: string;
+  /** Latest GH release tag — populated when kind === 'available'. */
+  latestVersion?: string;
+  /** GH release page URL — populated when kind === 'available'. */
+  releaseUrl?: string;
+  /** Error message — populated when kind === 'error'. */
+  error?: string;
+  /** Epoch ms of when this check completed. */
+  checkedAt: number;
+}
 
 export interface AuthStatus {
   authenticated: boolean;

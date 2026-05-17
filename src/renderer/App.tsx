@@ -8,11 +8,13 @@ import {
   DEFAULT_SETTINGS,
   Platform,
   Settings,
+  UpdateInfo,
 } from '../shared/types';
 import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
 import { SettingsDrawer } from './SettingsDrawer';
+import { UpdateBanner } from './UpdateBanner';
 import { TTSEngine, RateLimiter } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
@@ -27,6 +29,11 @@ export function App(): React.ReactElement {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  // Banner-dismiss is session-only by design (see UpdateBanner.tsx docstring) —
+  // we want a soft nag, not a sticky one. The next launch re-checks and
+  // re-shows the banner if the user hasn't actually installed the new build.
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   const ttsRef = useRef<TTSEngine | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
 
@@ -69,6 +76,18 @@ export function App(): React.ReactElement {
       } catch (err) {
         console.error('[App] failed to fetch initial connections', err);
       }
+      // Pull-fetch the most recent UpdateInfo on mount. The GH poller's
+      // first check fires ~3s after `app.ready`, so a renderer that mounts
+      // before that won't have anything to fetch yet — the subsequent push
+      // (onUpdateStatus) covers the case. Renderers that mount AFTER the
+      // check completed get the banner immediately via this pull.
+      try {
+        const u = await rcpp.getUpdateStatus();
+        if (!alive) return;
+        if (u) setUpdateInfo(u);
+      } catch (err) {
+        console.error('[App] failed to fetch initial update status', err);
+      }
     })();
 
     const offAuth = rcpp.onAuthStatus(setAuth);
@@ -90,6 +109,24 @@ export function App(): React.ReactElement {
     const offClear = rcpp.onChatClear(() => {
       setMessages((prev) => clearChatMessages(prev));
     });
+    // Live update-check broadcasts — fires when the GH poller completes a
+    // check (hourly + once at startup) AND on every explicit "Check Now".
+    // Reset the per-session dismiss flag whenever the LATEST tag advances:
+    // if the user dismissed v0.1.24 and we now see v0.1.25 is out, the
+    // user almost certainly wants to know.
+    const offUpdate = rcpp.onUpdateStatus((info) => {
+      setUpdateInfo((prev) => {
+        if (
+          info.kind === 'available' &&
+          prev?.latestVersion &&
+          info.latestVersion &&
+          info.latestVersion !== prev.latestVersion
+        ) {
+          setUpdateDismissed(false);
+        }
+        return info;
+      });
+    });
     return () => {
       alive = false;
       offAuth();
@@ -98,6 +135,7 @@ export function App(): React.ReactElement {
       offChat();
       offMenu();
       offClear();
+      offUpdate();
     };
   }, []);
 
@@ -178,6 +216,12 @@ export function App(): React.ReactElement {
   return (
     <div className="app">
       <div className="titlebar">Restream Chat++</div>
+      <UpdateBanner
+        info={updateInfo}
+        dismissed={updateDismissed}
+        onDismiss={() => setUpdateDismissed(true)}
+        onDownload={(url) => void rcpp.openExternal(url)}
+      />
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />
         <span className="status-label">{statusLabel(conn, auth)}</span>

@@ -60,6 +60,9 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
   function patchNotif(patch: Partial<Settings['notifications']>) {
     onChange({ ...settings, notifications: { ...settings.notifications, ...patch } });
   }
+  function patchUpdate(patch: Partial<Settings['update']>) {
+    onChange({ ...settings, update: { ...settings.update, ...patch } });
+  }
   function togglePlatform(p: Platform) {
     onChange({
       ...settings,
@@ -221,6 +224,19 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 max="120"
                 value={settings.notifications.maxPerMinute}
                 onChange={(e) => patchNotif({ maxPerMinute: Math.max(1, Number(e.target.value) || 1) })}
+              />
+            </div>
+          </section>
+
+          <section className="section">
+            <h3>Updates</h3>
+            <div className="row">
+              <label>Auto-check for updates</label>
+              <input
+                className="switch"
+                type="checkbox"
+                checked={settings.update.autoCheck}
+                onChange={(e) => patchUpdate({ autoCheck: e.target.checked })}
               />
             </div>
           </section>

@@ -16,12 +16,18 @@ import { createStore } from './store';
 import { sendChatText } from './chat-send';
 import { configureAutoUpdater, checkForUpdatesInteractive } from './updater';
 import {
+  getLastUpdateInfo,
+  performGithubUpdateCheck,
+  startGithubUpdatePoller,
+} from './github-update-check';
+import {
   DEFAULT_SETTINGS,
   IPC,
   Settings,
   AuthStatus,
   ConnectionState,
   SendTextResult,
+  UpdateInfo,
 } from '../shared/types';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -305,14 +311,29 @@ function buildMenu(onRevealLogs: () => void) {
               { role: 'about' as const },
               { type: 'separator' as const },
               {
-                id: 'check-for-updates',
-                label: 'Check for Updates…',
+                id: 'check-for-updates-now',
+                label: 'Check for Updates Now…',
                 enabled: true,
+                // Two checks fire on click:
+                //   1. The GH-Releases poller — always works because no
+                //      signature check is involved. Surfaces the banner if
+                //      a newer release is published. This is the primary
+                //      signal for unsigned builds where Squirrel can't
+                //      auto-install.
+                //   2. The Squirrel/update-electron-app path — only useful
+                //      on signed builds; in dev / unsigned it shows an
+                //      info dialog pointing at the releases page. We keep
+                //      it because once signing lands it'll surface the
+                //      restart-to-update dialog.
+                //
                 // The click handler MUST NOT throw synchronously — Electron
                 // surfaces a sync throw as the macOS system alert "this
                 // command is disabled and cannot be executed". Wrap defensively.
                 click: () => {
                   try {
+                    void performGithubUpdateCheck(true).catch((err) =>
+                      console.error('[menu] gh-check-for-updates failed', err),
+                    );
                     void checkForUpdatesInteractive(mainWindow).catch((err) =>
                       console.error('[menu] check-for-updates failed', err),
                     );
@@ -406,10 +427,13 @@ function buildMenu(onRevealLogs: () => void) {
           : [
               {
                 id: 'check-for-updates-help',
-                label: 'Check for Updates…',
+                label: 'Check for Updates Now…',
                 enabled: true,
                 click: () => {
                   try {
+                    void performGithubUpdateCheck(true).catch((err) =>
+                      console.error('[menu] gh-check-for-updates failed', err),
+                    );
                     void checkForUpdatesInteractive(mainWindow).catch((err) =>
                       console.error('[menu] check-for-updates failed', err),
                     );
@@ -512,6 +536,14 @@ app.on('ready', async () => {
   // Wire auto-update polling (update.electronjs.org → GitHub Releases).
   // Skipped automatically in dev / when not packaged / when running unsigned.
   configureAutoUpdater();
+
+  // Wire the GH-Releases-API-backed update checker. Unlike the Squirrel-based
+  // path above, this works on unsigned builds — it only ANSWERS "is there a
+  // newer release?" and "where is it?", then surfaces a banner with a
+  // Download button that opens the release page in the user's browser.
+  // The poller reads `settings.update.autoCheck` at every tick so toggling
+  // the Settings switch takes effect without a restart.
+  startGithubUpdatePoller(() => loadSettings().update.autoCheck);
 
   // ----- IPC: auth -----
   ipcMain.handle(IPC.AUTH_START, async () => {
@@ -627,12 +659,55 @@ app.on('ready', async () => {
         ...(stored.filter ?? {}),
         platforms: { ...DEFAULT_SETTINGS.filter.platforms, ...(stored.filter?.platforms ?? {}) },
       },
+      update: { ...DEFAULT_SETTINGS.update, ...(stored.update ?? {}) },
     };
   }
   ipcMain.handle(IPC.SETTINGS_GET, (): Settings => loadSettings());
   ipcMain.handle(IPC.SETTINGS_SET, (_evt, settings: Settings) => {
     store.set('settings', settings);
     return settings;
+  });
+
+  // ----- IPC: GH-update status (pull-fetch on renderer mount) -----
+  // The push channel (UPDATE_STATUS) only delivers updates; a renderer that
+  // mounted AFTER the poller's 3s startup check completed would otherwise
+  // never hear about an available update for the full hour until the next
+  // poll. This handler returns the last broadcast UpdateInfo (or undefined
+  // if no check has yet completed) so the renderer can sync on mount.
+  ipcMain.handle(IPC.UPDATE_STATUS_GET, (): UpdateInfo | undefined => getLastUpdateInfo());
+
+  // ----- IPC: force GH-update check (bypasses autoCheck setting) -----
+  // Triggered by the "Check for Updates Now…" menu item AND optionally by a
+  // future explicit-check button in Settings. Always runs regardless of
+  // settings.update.autoCheck because it's an explicit user request.
+  ipcMain.handle(IPC.UPDATE_CHECK_NOW, async (): Promise<UpdateInfo> => {
+    return performGithubUpdateCheck(true);
+  });
+
+  // ----- IPC: open arbitrary URL in default browser -----
+  // Used by the UpdateBanner's Download button to navigate to the GH release
+  // page. We intentionally don't try to apply the update in-place because
+  // unsigned macOS builds can't auto-install — opening the release page in
+  // the browser is the only viable path until signing lands.
+  //
+  // Sanity-check that the URL is http(s) before forwarding to
+  // `shell.openExternal` so a malicious renderer (XSS in a future feature)
+  // can't trick the main process into opening a `file://` URL or a
+  // custom-protocol handler.
+  ipcMain.handle(IPC.OPEN_EXTERNAL, async (_evt, url: string): Promise<boolean> => {
+    try {
+      if (typeof url !== 'string') return false;
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        console.warn('[main] openExternal refused non-http(s) URL:', parsed.protocol);
+        return false;
+      }
+      await shell.openExternal(url);
+      return true;
+    } catch (err) {
+      console.error('[main] openExternal failed', err);
+      return false;
+    }
   });
 
   // ----- IPC: notifications (renderer asks main to fire native notif) -----

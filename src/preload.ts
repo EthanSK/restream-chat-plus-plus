@@ -7,6 +7,7 @@ import type {
   ConnectionState,
   SendTextResult,
   Settings,
+  UpdateInfo,
 } from './shared/types';
 
 type Unsub = () => void;
@@ -130,6 +131,40 @@ const api = {
     ipcRenderer.invoke(IPC.SETTINGS_SET, s),
   notify: (title: string, body: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.NOTIFY, { title, body }),
+  /**
+   * Subscribe to GH-Releases-API update-check broadcasts. The main process
+   * fires this on every poll completion AND on every explicit "Check Now"
+   * — payload describes whether an update is available, the build is up to
+   * date, checks are disabled, or the check errored. Renderer drives the
+   * `UpdateBanner` from this signal.
+   */
+  onUpdateStatus: (cb: (info: UpdateInfo) => void): Unsub => {
+    const h = (_: unknown, info: UpdateInfo) => cb(info);
+    ipcRenderer.on(IPC.UPDATE_STATUS, h);
+    return () => ipcRenderer.removeListener(IPC.UPDATE_STATUS, h);
+  },
+  /**
+   * Pull-fetch the last broadcast UpdateInfo on mount. Returns `undefined`
+   * if no check has completed yet. Pairs with `onUpdateStatus` to avoid
+   * missing the banner when the renderer mounts AFTER the 3s startup check.
+   */
+  getUpdateStatus: (): Promise<UpdateInfo | undefined> =>
+    ipcRenderer.invoke(IPC.UPDATE_STATUS_GET),
+  /**
+   * Force an immediate GH-Releases check, bypassing the `update.autoCheck`
+   * setting. Used by the "Check for Updates Now…" menu item and any future
+   * explicit-check button in Settings. Resolves with the resulting
+   * `UpdateInfo`.
+   */
+  checkForUpdatesNow: (): Promise<UpdateInfo> =>
+    ipcRenderer.invoke(IPC.UPDATE_CHECK_NOW),
+  /**
+   * Open the given http(s) URL in the user's default browser via
+   * `shell.openExternal`. Non-http(s) URLs are refused in main. Used by
+   * the UpdateBanner's Download button to navigate to the release page.
+   */
+  openExternal: (url: string): Promise<boolean> =>
+    ipcRenderer.invoke(IPC.OPEN_EXTERNAL, url),
 };
 
 contextBridge.exposeInMainWorld('rcpp', api);
