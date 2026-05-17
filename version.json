@@ -1,12 +1,12 @@
 {
-  "version": "0.1.23",
-  "tag": "v0.1.23",
-  "releaseUrl": "https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.23",
+  "version": "0.1.24",
+  "tag": "v0.1.24",
+  "releaseUrl": "https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.24",
   "latestDownloads": {
-    "macArm64": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-mac-arm64-0.1.23.zip",
-    "winX64": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-win-x64-0.1.23-Setup.exe",
-    "linuxX64Deb": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-linux-x64-0.1.23.deb",
-    "linuxX64Rpm": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-linux-x64-0.1.23.rpm"
+    "macArm64": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-mac-arm64-0.1.24.zip",
+    "winX64": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-win-x64-0.1.24-Setup.exe",
+    "linuxX64Deb": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-linux-x64-0.1.24.deb",
+    "linuxX64Rpm": "https://github.com/EthanSK/restream-chat-plus-plus/releases/latest/download/restream-chat-plus-plus-linux-x64-0.1.24.rpm"
   },
-  "publishedAt": "2026-05-17T13:15:07Z"
+  "publishedAt": "2026-05-17T13:17:55Z"
 }
