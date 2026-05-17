@@ -1,4 +1,4 @@
-// Auto-update wiring for Restream Chat Plus Plus.
+// Auto-update wiring for Restream Chat++.
 //
 // Uses the `update-electron-app` wrapper, which polls
 // `https://update.electronjs.org/<owner>/<repo>/<platform>-<arch>/<version>`
