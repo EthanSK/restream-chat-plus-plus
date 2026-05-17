@@ -198,15 +198,29 @@ export interface ChatSendOptions {
   text: string;
   connections: ChatConnection[];
   /**
-   * The current Restream `showId` — required in the POST body, otherwise
-   * the endpoint 404s (v0.1.17 fix). Sniffed by the WS client from any
-   * incoming `event` / `reply_created` frame. When the WS hasn't seen a
-   * frame yet (just-connected, no events), this is undefined and the
-   * send returns `no-show-id` so the renderer can prompt the user to
-   * wait or open Compose manually.
+   * The current Restream `showId` — included in the POST body when known.
+   *
+   * The WS client sniffs it from any incoming `event` / `reply_created`
+   * frame (those carry `payload.showId`). Heartbeat + `connection_info` +
+   * `connection_closed` frames do NOT, so a freshly-connected session
+   * with no chat activity has `showId === undefined`.
+   *
+   * v0.1.20 fix: previously this was a hard gate — undefined → instant
+   * `no-show-id` reject so the user could never send before the first
+   * event flowed. Now we try the POST anyway; Restream's backend can
+   * sometimes resolve the show implicitly. Only after a 404 do we
+   * surface `no-show-id` with a clearer error message.
    */
   showId?: string;
   parentWindow: BrowserWindow | null;
+  /**
+   * Optional async hook called when `showId` is undefined, BEFORE the POST.
+   * Lets the main process try to hydrate the showId from the public REST
+   * API (`/v2/user/events/in-progress`). Returns a string to use as the
+   * showId for this send, or undefined to proceed without one. Called at
+   * most once per send. Injected by main.ts; unit tests pass a stub.
+   */
+  fetchShowId?: () => Promise<string | undefined>;
   /** Injected for unit tests. */
   fetchImpl?: typeof fetch;
   /** Injected for unit tests. */
@@ -231,13 +245,19 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     return { ok: false, reason: 'no-active-connections' };
   }
 
-  // The Restream backend resolves the target show via `showId` in the
-  // body. Without it we get HTTP 404 (the bug v0.1.17 fixes). If the WS
-  // hasn't sniffed a showId yet — usually because no incoming event /
-  // reply has been received this session — surface a distinct reason so
-  // the renderer can suggest "wait for first message or click Compose".
-  if (!opts.showId) {
-    return { ok: false, reason: 'no-show-id' };
+  // v0.1.20: showId is no longer a hard gate. If the WS hasn't sniffed
+  // one yet (just-connected, no event/reply frames received), give the
+  // REST API a chance to hydrate it from `/v2/user/events/in-progress`,
+  // then POST regardless. The backend may still 404 if there's no
+  // active show — we translate that into a friendlier `no-show-id`
+  // error AFTER the attempt rather than blocking pre-send.
+  let resolvedShowId: string | undefined = opts.showId;
+  if (!resolvedShowId && opts.fetchShowId) {
+    try {
+      resolvedShowId = await opts.fetchShowId();
+    } catch {
+      // Fall through — try-send-anyway is the fallback.
+    }
   }
 
   const sess = (opts.getSession ?? getRestreamSession)();
@@ -252,12 +272,17 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     }
   }
 
-  const body = JSON.stringify({
+  // Only include showId in the body when we actually have one. Restream's
+  // backend tolerates the field being absent (it then attempts to resolve
+  // the show from session state); omitting it is preferable to sending
+  // an explicit `null` or empty string, both of which can fail validation.
+  const bodyObj: Record<string, unknown> = {
     connectionIdentifiers: ids,
     clientReplyUuid: (opts.uuid ?? randomUUID)(),
     text,
-    showId: opts.showId,
-  });
+  };
+  if (resolvedShowId) bodyObj.showId = resolvedShowId;
+  const body = JSON.stringify(bodyObj);
 
   const headers = buildHeaders(cookies.cookieHeader, cookies.xsrf);
 
@@ -274,6 +299,20 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
         detail = await res.text();
       } catch {
         // ignore
+      }
+      // v0.1.20: if we 404'd specifically because we had no showId, give
+      // the user a clearer message than "send failed (HTTP 404)" — this is
+      // the documented Restream behaviour when the backend can't resolve
+      // an active show for the user. The chat WS gate ("waiting for first
+      // chat frame") is gone, replaced by an actionable error after the
+      // actual attempt.
+      if (res.status === 404 && !resolvedShowId) {
+        return {
+          ok: false,
+          reason: 'no-show-id',
+          status: 404,
+          error: detail ? detail.slice(0, 240) : undefined,
+        };
       }
       return {
         ok: false,

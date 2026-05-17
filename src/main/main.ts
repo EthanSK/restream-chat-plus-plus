@@ -794,7 +794,54 @@ app.on('ready', async () => {
   // Reverse-engineered in v0.1.12; shipped behind an inline input bar in
   // v0.1.14. 1 msg/sec rate-limited so accidental rapid-fire (e.g. holding
   // Enter on a stuck key) can't hammer Restream's edge.
+  //
+  // showId hydration (v0.1.20): the WS sniffs showId from `event` /
+  // `reply_created` frames, but those only flow when chat is active.
+  // If the user opens the app cold and tries to send before any frame
+  // arrives, we hit Restream's public REST API for in-progress events
+  // and use that event id as a candidate showId. The result is cached
+  // per session (showIdRestCache) — Restream's event id changes per
+  // stream session, so a stale cache is acceptable until the user
+  // reconnects the WS.
   let lastSendAt = 0;
+  let showIdRestCache: string | undefined;
+  const fetchActiveShowIdFromApi = async (): Promise<string | undefined> => {
+    if (showIdRestCache) return showIdRestCache;
+    const token = oauth.getToken();
+    if (!token) return undefined;
+    try {
+      const res = await fetch('https://api.restream.io/v2/user/events/in-progress', {
+        headers: {
+          authorization: `Bearer ${token.accessToken}`,
+          accept: 'application/json',
+        },
+      });
+      if (!res.ok) {
+        console.warn('[main] in-progress events fetch failed status=' + res.status);
+        return undefined;
+      }
+      const json: unknown = await res.json();
+      if (Array.isArray(json) && json.length > 0) {
+        const first = json[0] as { id?: unknown };
+        if (typeof first?.id === 'string' && first.id) {
+          showIdRestCache = first.id;
+          return showIdRestCache;
+        }
+      }
+      return undefined;
+    } catch (err) {
+      console.warn('[main] in-progress events fetch threw', err);
+      return undefined;
+    }
+  };
+  // Reset the REST cache whenever the WS sniffs a fresh showId — that
+  // value is authoritative once seen, and a stale REST cache could
+  // smuggle the wrong show across an account switch / reconnect.
+  chat.on('state', (s) => {
+    if (s.status === 'connecting' || s.status === 'reconnecting') {
+      showIdRestCache = undefined;
+    }
+  });
   ipcMain.handle(IPC.CHAT_SEND_TEXT, async (_evt, rawText: string): Promise<SendTextResult> => {
     try {
       if (!oauth.isAuthenticated()) {
@@ -816,6 +863,7 @@ app.on('ready', async () => {
         text: rawText,
         connections: chat.getConnections(),
         showId: chat.getShowId(),
+        fetchShowId: fetchActiveShowIdFromApi,
         parentWindow: mainWindow,
       });
       return result;

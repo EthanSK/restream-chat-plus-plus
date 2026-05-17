@@ -242,12 +242,16 @@ export interface AuthStatus {
  *                              via an invisible Compose window first; this
  *                              reason is reported only if that fails too.
  *  - `no-active-connections` — channels panel is empty (nothing to reply to).
- *  - `no-show-id`            — WS hasn't sniffed a `showId` yet (no event or
- *                              reply frame received this session). Restream's
- *                              `/client/reply` endpoint 404s without it, so
- *                              we short-circuit before the POST and ask the
- *                              user to wait a beat or click Compose once.
- *                              v0.1.17.
+ *  - `no-show-id`            — Restream's `/client/reply` returned HTTP 404
+ *                              AND we had no showId to send. In v0.1.17–
+ *                              v0.1.19 this was a pre-flight gate; v0.1.20
+ *                              flipped it to a post-attempt failure mode
+ *                              so users CAN send before the first WS event
+ *                              flows (Restream's backend can sometimes
+ *                              resolve the show implicitly from session
+ *                              cookies + the user's only active show).
+ *                              When this comes back the most likely cause
+ *                              is no active stream / no in-progress event.
  *  - `send-failed`           — POST /client/reply returned non-2xx.
  *  - `error`                 — unexpected (network / JS) failure.
  */

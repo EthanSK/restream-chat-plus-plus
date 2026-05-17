@@ -175,7 +175,7 @@ function prettyReason(result: SendTextResult): string {
     case 'no-active-connections':
       return 'No connected channels to reply to.';
     case 'no-show-id':
-      return 'Waiting for first chat frame — wait a moment, then try again.';
+      return 'No active Restream show — start streaming (or send one message from Restream’s website) so we can pick up the show.';
     case 'send-failed':
       return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}. Click Compose to refresh session.`;
     case 'error':

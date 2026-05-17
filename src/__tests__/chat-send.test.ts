@@ -65,19 +65,146 @@ describe('chat-send', () => {
     expect(result.reason).toBe('no-active-connections');
   });
 
-  it('returns no-show-id when WS has not sniffed a showId yet', async () => {
+  it('v0.1.20: attempts the POST even when no showId is known (try-send-anyway)', async () => {
+    // Previously this returned a pre-flight `no-show-id` reject so users
+    // couldn't send before the first WS event flowed. The new contract is:
+    // try the POST regardless. The body MUST omit `showId` (rather than
+    // sending null/empty, which Restream's validator rejects).
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
     const result = await sendChatText({
       text: 'hello',
       connections: [makeConn('c1')],
-      // showId intentionally omitted — the WS client hasn't seen an
-      // event/reply frame yet so it cannot supply one.
+      // showId intentionally omitted — WS hasn't sniffed one yet.
       parentWindow: null,
       getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
       skipColdStart: true,
-      fetchImpl: vi.fn() as any,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls.length).toBe(1);
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body.text).toBe('hello');
+    expect(body.connectionIdentifiers).toEqual(['c1']);
+    // Critical: showId is OMITTED from the body when unknown, not sent
+    // as null / empty-string (Restream's backend validates it).
+    expect('showId' in body).toBe(false);
+  });
+
+  it('v0.1.20: surfaces no-show-id only AFTER a 404 with no showId in body', async () => {
+    // The 404 path is now the clear signal that the backend couldn't
+    // resolve an active show. Render that as `no-show-id` with the
+    // actionable message — not as a generic `send-failed (HTTP 404)`.
+    const fakeFetch = async () =>
+      new Response('show not found', { status: 404 });
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
     });
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('no-show-id');
+    expect(result.status).toBe(404);
+  });
+
+  it('v0.1.20: a 404 WITH a showId in body still falls through to send-failed', async () => {
+    // When the body DID contain a showId, a 404 isn't the "no active show"
+    // case — surface the regular send-failed so the user can act on it.
+    const fakeFetch = async () =>
+      new Response('not found', { status: 404 });
+    const result = await sendChatText({
+      text: 'hello',
+      connections: [makeConn('c1')],
+      showId: 'sid-abc',
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('send-failed');
+    expect(result.status).toBe(404);
+  });
+
+  it('v0.1.20: hydrates showId via fetchShowId hook when none was supplied', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    let hydrateCount = 0;
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      // showId undefined — main.ts threads in fetchShowId pointing at the
+      // /v2/user/events/in-progress hydration helper.
+      fetchShowId: async () => {
+        hydrateCount += 1;
+        return 'rest-hydrated-show-id';
+      },
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(true);
+    expect(hydrateCount).toBe(1);
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body.showId).toBe('rest-hydrated-show-id');
+  });
+
+  it('v0.1.20: skips fetchShowId hook when a showId is already known', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    let hydrateCount = 0;
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      showId: 'ws-sniffed-show-id',
+      fetchShowId: async () => {
+        hydrateCount += 1;
+        return 'should-not-be-used';
+      },
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(true);
+    expect(hydrateCount).toBe(0);
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body.showId).toBe('ws-sniffed-show-id');
+  });
+
+  it('v0.1.20: fetchShowId hook errors are swallowed, send proceeds without showId', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      fetchShowId: async () => {
+        throw new Error('network down');
+      },
+      parentWindow: null,
+      getSession: () => fakeSession([{ name: 'accessXsrfToken', value: 'x' }]),
+      skipColdStart: true,
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(true);
+    const body = JSON.parse(String(calls[0].init.body));
+    expect('showId' in body).toBe(false);
   });
 
   it('returns no-session-cookies when partition has no chat cookies', async () => {
