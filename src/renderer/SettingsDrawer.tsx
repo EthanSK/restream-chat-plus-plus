@@ -57,6 +57,36 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
   function patchTts(patch: Partial<Settings['tts']>) {
     onChange({ ...settings, tts: { ...settings.tts, ...patch } });
   }
+
+  // Shared "preview on release" wiring for the Rate / Pitch / Volume sliders.
+  // Firing previewVoice on every onChange tick would queue overlapping previews
+  // mid-drag; instead we wait for pointer/mouse/touch release (or arrow-key
+  // release for a11y) and replay the sample once at the final value. The TTS
+  // engine reads rate/pitch/volume from its own settings — which updateSettings()
+  // has already propagated by the time the release handler runs — so we just
+  // re-preview the current voice. Established v0.1.11 for Volume; v0.1.27
+  // extended to Rate + Pitch so all 4 TTS controls preview consistently.
+  const NAV_KEYS = new Set([
+    'ArrowLeft',
+    'ArrowRight',
+    'ArrowUp',
+    'ArrowDown',
+    'Home',
+    'End',
+    'PageUp',
+    'PageDown',
+  ]);
+  const previewOnRelease = {
+    onPointerUp: () => onPreviewVoice?.(settings.tts.voiceURI),
+    onMouseUp: () => onPreviewVoice?.(settings.tts.voiceURI),
+    onTouchEnd: () => onPreviewVoice?.(settings.tts.voiceURI),
+    onKeyUp: (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (NAV_KEYS.has(e.key)) {
+        onPreviewVoice?.(settings.tts.voiceURI);
+      }
+    },
+  };
+
   function patchNotif(patch: Partial<Settings['notifications']>) {
     onChange({ ...settings, notifications: { ...settings.notifications, ...patch } });
   }
@@ -135,6 +165,7 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 step="0.05"
                 value={settings.tts.rate}
                 onChange={(e) => patchTts({ rate: Number(e.target.value) })}
+                {...previewOnRelease}
               />
             </div>
             <div className="row">
@@ -146,6 +177,7 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 step="0.05"
                 value={settings.tts.pitch}
                 onChange={(e) => patchTts({ pitch: Number(e.target.value) })}
+                {...previewOnRelease}
               />
             </div>
             <div className="row">
@@ -157,31 +189,7 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
                 step="0.01"
                 value={settings.tts.volume}
                 onChange={(e) => patchTts({ volume: Number(e.target.value) })}
-                // Preview the current voice at the new volume AFTER the user
-                // releases the slider (not during drag) so we don't fire a
-                // preview on every micro-step. The engine reads volume from
-                // its own settings, which updateSettings() has already
-                // propagated by the time the release handler runs.
-                onPointerUp={() => onPreviewVoice?.(settings.tts.voiceURI)}
-                onMouseUp={() => onPreviewVoice?.(settings.tts.voiceURI)}
-                onTouchEnd={() => onPreviewVoice?.(settings.tts.voiceURI)}
-                onKeyUp={(e) => {
-                  // Keyboard-driven volume changes (arrow keys, Home/End,
-                  // PageUp/PageDown) should also preview on key release so
-                  // a11y users get the same audible feedback.
-                  if (
-                    e.key === 'ArrowLeft' ||
-                    e.key === 'ArrowRight' ||
-                    e.key === 'ArrowUp' ||
-                    e.key === 'ArrowDown' ||
-                    e.key === 'Home' ||
-                    e.key === 'End' ||
-                    e.key === 'PageUp' ||
-                    e.key === 'PageDown'
-                  ) {
-                    onPreviewVoice?.(settings.tts.voiceURI);
-                  }
-                }}
+                {...previewOnRelease}
               />
             </div>
             <div className="row">
