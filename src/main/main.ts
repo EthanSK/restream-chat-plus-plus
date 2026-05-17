@@ -1,9 +1,11 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   Notification,
+  screen,
   session,
   shell,
 } from 'electron';
@@ -12,12 +14,19 @@ import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
-import { createStore } from './store';
+import { createStore, type ComposeWindowBounds } from './store';
 import { sendChatText, type ChatSendLogRecord } from './chat-send';
+import {
+  clampComposeBounds,
+  COMPOSE_MIN_WIDTH,
+  COMPOSE_MIN_HEIGHT,
+} from './compose-bounds';
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
   quitAndInstallStagedUpdate,
+  triggerSquirrelDownload,
+  type StartDownloadResult,
 } from './updater';
 import {
   getLastUpdateInfo,
@@ -738,10 +747,9 @@ app.on('ready', async () => {
   });
 
   // ----- IPC: open arbitrary URL in default browser -----
-  // Used by the UpdateBanner's Download button to navigate to the GH release
-  // page. We intentionally don't try to apply the update in-place because
-  // unsigned macOS builds can't auto-install — opening the release page in
-  // the browser is the only viable path until signing lands.
+  // Retained for general use (About link in the help menu, future
+  // settings deep-links, etc.). The UpdateBanner no longer routes
+  // through this — see UPDATE_DOWNLOAD_START below. v0.1.32.
   //
   // Sanity-check that the URL is http(s) before forwarding to
   // `shell.openExternal` so a malicious renderer (XSS in a future feature)
@@ -753,6 +761,76 @@ app.on('ready', async () => {
   // `update-downloaded` can't crash the app — see
   // `quitAndInstallStagedUpdate()`.
   ipcMain.handle(IPC.UPDATE_QUIT_AND_INSTALL, () => quitAndInstallStagedUpdate());
+
+  // ----- IPC: kick Squirrel's in-app download (v0.1.32) -----
+  // Bound to the renderer's UpdateBanner "Download" button. Pre-v0.1.32
+  // that button opened the GitHub release page in the user's default
+  // browser via `shell.openExternal`, which side-stepped the entire
+  // in-app pipeline (progress bar → restart-to-install) we'd already
+  // wired in v0.1.25. v0.1.32 wires the button to
+  // `autoUpdater.checkForUpdates()` so Squirrel's download events drive
+  // the banner state machine through `downloading` → `ready-to-install`
+  // → Restart click → `quitAndInstall()`.
+  //
+  // On failure (unsigned build, dev mode, Linux, transient error) we
+  // pop a NATIVE info dialog explaining the situation rather than
+  // silently bouncing the user to a browser tab. The dialog offers a
+  // "Reveal Release Page" button as an explicit escape hatch — that
+  // click IS allowed to open the browser because the user asked for it.
+  ipcMain.handle(IPC.UPDATE_DOWNLOAD_START, async (): Promise<StartDownloadResult> => {
+    const result = triggerSquirrelDownload();
+    if (!result.ok) {
+      const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+      let message = 'In-app update is unavailable for this build.';
+      let detail = '';
+      switch (result.reason) {
+        case 'not-packaged':
+          message = 'Auto-update is only available in installed builds.';
+          detail = `You're running a development build of Restream Chat++ ${app.getVersion()}.`;
+          break;
+        case 'unsupported-platform':
+          message = 'Linux updates are delivered via .deb / .rpm packages.';
+          detail =
+            'Grab the latest release from https://github.com/EthanSK/restream-chat-plus-plus/releases';
+          break;
+        case 'feed-unavailable':
+          message = 'Update service unavailable.';
+          detail =
+            `This build of Restream Chat++ ${app.getVersion()} is not connected to the update feed ` +
+            `(typically an unsigned build — Squirrel.Mac refuses to apply unsigned updates). ` +
+            `You can still reach the release page manually if you want to install by hand.`;
+          break;
+        case 'error':
+          message = 'Update download failed to start.';
+          detail = result.error ?? 'Unknown error.';
+          break;
+      }
+      try {
+        const opts: Electron.MessageBoxOptions = {
+          type: 'info',
+          message,
+          detail,
+          buttons: ['Reveal Release Page', 'OK'],
+          defaultId: 1,
+          cancelId: 1,
+        };
+        const choice = owner
+          ? await dialog.showMessageBox(owner, opts)
+          : await dialog.showMessageBox(opts);
+        if (choice.response === 0) {
+          // The user explicitly asked for the release page; that's a
+          // deliberate click on a secondary action, not the silent
+          // browser-bounce we removed in v0.1.32.
+          await shell.openExternal(
+            'https://github.com/EthanSK/restream-chat-plus-plus/releases',
+          );
+        }
+      } catch (err) {
+        console.error('[main] update-download-start dialog failed', err);
+      }
+    }
+    return result;
+  });
 
   ipcMain.handle(IPC.OPEN_EXTERNAL, async (_evt, url: string): Promise<boolean> => {
     try {
@@ -785,29 +863,210 @@ app.on('ready', async () => {
   // ----- IPC: connections (channels panel pull-fetch) -----
   ipcMain.handle(IPC.CONNECTIONS_GET, () => chat.getConnections());
 
-  // ----- IPC: open Restream's official webchat compose window -----
-  // Restream's public Chat API is RECEIVE-ONLY for third-party clients —
-  // see https://developers.restream.io/chat/getting-started: "This API
-  // works one way — from the server to the client. The server will ignore
-  // any incoming messages." So to actually let the user TYPE a reply we
-  // delegate to Restream's first-party webchat URL (the same one used by
-  // the official Restream Chat app), which uses an internal API. The
-  // reply ends up echoed back to us as a `reply_created` WS frame, and
-  // we surface it as a `self: true` ChatMessage in our feed — closing the
-  // round-trip so Ethan sees his own messages here too.
+  // ----- IPC: open the native Compose window (v0.1.32+) -----
+  //
+  // The Compose button next to the inline send arrow opens this window. Pre-
+  // v0.1.32 it loaded chat.restream.io at 720×720 because Restream's embed
+  // had intrinsic min-widths that broke at smaller sizes. v0.1.32 replaces
+  // that with a small native React UI (~520×280) that posts through the
+  // same CHAT_SEND_TEXT IPC as the inline input bar — so we reuse the same
+  // /client/reply path, showId refresh, and 404 retry logic from v0.1.30.
+  //
+  // Window properties:
+  //   - 520×280 default content size (Messages/Slack-thread-reply scale)
+  //   - 360×200 minimums, no maximize, resizable
+  //   - parent: mainWindow so it groups in the macOS window switcher
+  //   - bounds persisted to electron-store `composeWindow`; clamped to the
+  //     work area on restore via `clampComposeBounds`
+  //   - alwaysOnTop persisted; toggle exposed in the Compose UI
+  //   - loads the same renderer bundle with `?compose=1` query param
+  //
+  // Singleton: clicking Compose while one is open focuses the existing
+  // window instead of spawning a duplicate.
+  let composeWindow: BrowserWindow | null = null;
+  let composeBoundsSaveTimer: NodeJS.Timeout | undefined;
+
+  /**
+   * Persist the Compose window's current bounds (size + position). The
+   * alwaysOnTop flag is preserved unchanged — it's mutated separately
+   * via the COMPOSE_SET_ALWAYS_ON_TOP handler. Called on resize/move
+   * (debounced via composeBoundsSaveTimer) and on window close.
+   */
+  const saveComposeBounds = (win: BrowserWindow): void => {
+    try {
+      if (win.isDestroyed()) return;
+      const b = win.getBounds();
+      const prev = store.get('composeWindow') as ComposeWindowBounds | undefined;
+      const next: ComposeWindowBounds = {
+        width: b.width,
+        height: b.height,
+        x: b.x,
+        y: b.y,
+        alwaysOnTop: prev?.alwaysOnTop ?? false,
+      };
+      store.set('composeWindow', next);
+    } catch (err) {
+      console.error('[main] save compose bounds failed', err);
+    }
+  };
+
+  const scheduleSaveComposeBounds = (win: BrowserWindow): void => {
+    if (composeBoundsSaveTimer) clearTimeout(composeBoundsSaveTimer);
+    composeBoundsSaveTimer = setTimeout(() => saveComposeBounds(win), 400);
+  };
+
   ipcMain.handle(IPC.CHAT_OPEN_COMPOSE, async () => {
+    try {
+      if (!oauth.isAuthenticated()) {
+        return { ok: false as const, reason: 'not-authenticated' as const };
+      }
+      // Singleton: focus the existing window if one is already open.
+      if (composeWindow && !composeWindow.isDestroyed()) {
+        if (composeWindow.isMinimized()) composeWindow.restore();
+        composeWindow.focus();
+        return { ok: true as const };
+      }
+
+      // Resolve work area for the display the parent window lives on so
+      // bounds clamping is multi-monitor-aware.
+      let workArea: Electron.Rectangle = { x: 0, y: 0, width: 1440, height: 900 };
+      try {
+        const display = mainWindow
+          ? screen.getDisplayMatching(mainWindow.getBounds())
+          : screen.getPrimaryDisplay();
+        workArea = display.workArea;
+      } catch (err) {
+        console.warn('[main] compose: failed to resolve display work area', err);
+      }
+      const saved = store.get('composeWindow') as ComposeWindowBounds | undefined;
+      const clamped = clampComposeBounds(saved, workArea);
+      const alwaysOnTop = saved?.alwaysOnTop === true;
+
+      composeWindow = new BrowserWindow({
+        width: clamped.width,
+        height: clamped.height,
+        ...(clamped.x !== undefined && clamped.y !== undefined
+          ? { x: clamped.x, y: clamped.y }
+          : {}),
+        minWidth: COMPOSE_MIN_WIDTH,
+        minHeight: COMPOSE_MIN_HEIGHT,
+        useContentSize: true,
+        resizable: true,
+        maximizable: false,
+        minimizable: true,
+        fullscreenable: false,
+        title: 'Compose',
+        backgroundColor: '#0d1117',
+        parent: mainWindow ?? undefined,
+        // Centre on parent on first ever open (no saved position). After
+        // that the saved x/y wins.
+        ...(clamped.x === undefined ? { center: true } : {}),
+        alwaysOnTop,
+        webPreferences: {
+          preload: path.join(__dirname, 'preload.js'),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: false,
+          zoomFactor: 1.0,
+        },
+      });
+
+      // Re-arm zoom guard — same rationale as the v0.1.17 webchat path.
+      composeWindow.webContents.on('did-finish-load', () => {
+        try {
+          composeWindow?.webContents.setZoomFactor(1.0);
+          composeWindow?.webContents.setVisualZoomLevelLimits(1, 1);
+        } catch (err) {
+          console.error('[main] compose zoom reset failed', err);
+        }
+      });
+
+      // Persist bounds on resize / move. Debounced.
+      composeWindow.on('resize', () => {
+        if (composeWindow) scheduleSaveComposeBounds(composeWindow);
+      });
+      composeWindow.on('move', () => {
+        if (composeWindow) scheduleSaveComposeBounds(composeWindow);
+      });
+      composeWindow.on('close', () => {
+        if (composeWindow) {
+          if (composeBoundsSaveTimer) {
+            clearTimeout(composeBoundsSaveTimer);
+            composeBoundsSaveTimer = undefined;
+          }
+          saveComposeBounds(composeWindow);
+        }
+      });
+      composeWindow.on('closed', () => {
+        composeWindow = null;
+      });
+
+      // Load the SAME renderer bundle as the main window, but with
+      // `?compose=1` so `src/renderer/main.tsx` routes to `<ComposeApp>`
+      // instead of the full `<App>`. This sidesteps a separate Vite
+      // renderer entry while keeping all the React + preload wiring.
+      if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+        void composeWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}?compose=1`);
+      } else {
+        void composeWindow.loadFile(
+          path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
+          { query: { compose: '1' } },
+        );
+      }
+
+      if (process.env.RC_DEVTOOLS === '1') composeWindow.webContents.openDevTools();
+
+      return { ok: true as const };
+    } catch (err) {
+      console.error('[main] open compose failed', err);
+      return {
+        ok: false as const,
+        reason: 'error' as const,
+        error: String((err as Error)?.message ?? err),
+      };
+    }
+  });
+
+  // ----- IPC: COMPOSE_GET_INIT — initial state for the Compose renderer -----
+  ipcMain.handle(IPC.COMPOSE_GET_INIT, () => {
+    const saved = store.get('composeWindow') as ComposeWindowBounds | undefined;
+    return {
+      alwaysOnTop: saved?.alwaysOnTop === true,
+      connected: chat.getState().status === 'connected',
+      authenticated: oauth.isAuthenticated(),
+    };
+  });
+
+  // ----- IPC: COMPOSE_SET_ALWAYS_ON_TOP -----
+  ipcMain.handle(IPC.COMPOSE_SET_ALWAYS_ON_TOP, (_evt, alwaysOnTop: boolean) => {
+    const flag = alwaysOnTop === true;
+    try {
+      if (composeWindow && !composeWindow.isDestroyed()) {
+        composeWindow.setAlwaysOnTop(flag);
+      }
+      const prev = store.get('composeWindow') as ComposeWindowBounds | undefined;
+      const next: ComposeWindowBounds = prev
+        ? { ...prev, alwaysOnTop: flag }
+        : { width: 520, height: 280, alwaysOnTop: flag };
+      store.set('composeWindow', next);
+    } catch (err) {
+      console.error('[main] compose set-always-on-top failed', err);
+    }
+    return { alwaysOnTop: flag };
+  });
+
+  // ----- IPC: open Restream's official webchat (escape hatch) -----
+  //
+  // Pre-v0.1.32 this was the default Compose window. As of v0.1.32 the
+  // Compose button opens the native React UI above; this handler stays as
+  // the escape hatch for: (a) users who need Restream's full reply UI
+  // (emoji picker, per-platform channel targeting), (b) recovering from
+  // an expired session cookie. Exposed via a button INSIDE the Compose
+  // window now.
+  ipcMain.handle(IPC.CHAT_OPEN_RESTREAM_WEBCHAT, async () => {
     try {
       const token = oauth.getToken();
       if (!token) return { ok: false as const, reason: 'not-authenticated' as const };
-      // The official documented endpoint for fetching a one-shot webchat
-      // URL: GET /v2/user/webchat/url. This has been intermittently
-      // returning 4xx/5xx for Ethan's account (v0.1.13 — "could not fetch
-      // web chat URL"). Per v0.1.14 the failure path is no longer a
-      // hard error: we fall back to opening https://chat.restream.io
-      // directly. The same persistent partition still carries the
-      // user's session cookies, so the webchat trips on the existing
-      // login. If the partition is cold the webchat will redirect to
-      // login → user signs in once → cookies provisioned for next time.
       let url = '';
       try {
         const res = await fetch('https://api.restream.io/v2/user/webchat/url', {
@@ -824,98 +1083,44 @@ app.on('ready', async () => {
       } catch (err) {
         console.warn('[main] webchat-url fetch threw, falling back to chat.restream.io', err);
       }
-      if (!url) {
-        // Fall back to the canonical chat URL; user's session cookies in
-        // `persist:restream-oauth` will be sent automatically.
-        url = 'https://chat.restream.io';
-      }
-      // Open in a dedicated BrowserWindow rather than the system browser so
-      // Ethan can leave it docked next to our app and the OAuth session
-      // stays separate from his daily-driver browser.
-      //
-      // Sized as a narrow chat-input pane (content size, not window chrome),
-      // resizable so the user can stretch it if Restream's webchat layout
-      // wants more room. Minimums prevent the user from accidentally
-      // collapsing it to unusable.
+      if (!url) url = 'https://chat.restream.io';
       const win = new BrowserWindow({
-        // v0.1.17: the previous 380x320 default was too small for Restream's
-        // /embed webchat — at that size the chat layout's min-widths kick in
-        // and the page renders at what looks like 200%+ zoom (clipped text,
-        // huge buttons). 720x720 with a more permissive minWidth gives the
-        // embed enough room to render at its natural size. `useContentSize`
-        // ensures the dimensions are the WEB content area, not including the
-        // titlebar / chrome.
+        // Restream's /embed needs the bigger frame to render without
+        // min-width clipping — keep the pre-v0.1.32 dimensions for this
+        // escape hatch only.
         width: 720,
         height: 720,
         minWidth: 480,
         minHeight: 420,
         useContentSize: true,
         resizable: true,
-        title: 'Restream Compose',
+        title: 'Restream Webchat',
         backgroundColor: '#0d1117',
         parent: mainWindow ?? undefined,
         webPreferences: {
           contextIsolation: true,
           nodeIntegration: false,
-          // Re-use the same persistent partition the OAuth flow uses
-          // (`persist:restream-oauth`) so the webchat URL trips on the
-          // already-authenticated session and skips the sign-in redirect.
           session: session.fromPartition('persist:restream-oauth'),
-          // Disable Chromium's per-origin zoom-factor persistence. Without
-          // this, a zoom level applied in a previous Compose session (or a
-          // mis-tuned default from Restream's site CSS) is restored across
-          // BrowserWindow lifetimes — Ethan saw the Compose window pop up at
-          // ~150% zoom after each restart. v0.1.17 fix.
           zoomFactor: 1.0,
         },
       });
-
-      // Force-reset zoom on load AND when the user accidentally triggers a
-      // zoom shortcut. `webPreferences.zoomFactor` is the INITIAL value but
-      // Chromium can drift if Restream's page or a pinch-zoom event fires.
-      // We hard-reset on did-finish-load to neutralise any per-origin
-      // persisted zoom and prevent the "tiny window + huge text" symptom.
       win.webContents.on('did-finish-load', () => {
         try {
           win.webContents.setZoomFactor(1.0);
           win.webContents.setVisualZoomLevelLimits(1, 1);
         } catch (err) {
-          console.error('[main] compose zoom reset failed', err);
+          console.error('[main] webchat zoom reset failed', err);
         }
       });
-
-      // ----------------------------------------------------------------
-      // v0.1.12 reverse-engineering hook
-      // ----------------------------------------------------------------
-      // Restream's webchat is a black box: it POSTs the user's typed
-      // message to some endpoint, the WS then broadcasts back a
-      // `reply_created` frame which we already render as a `self`
-      // message in the feed. We don't yet KNOW the endpoint shape —
-      // public docs don't document one ("This API works one way" —
-      // https://developers.restream.io/chat/getting-started).
-      //
-      // We have strong leads from the chat-frontend bundle though:
-      //   POST https://backend.chat.restream.io/api/v2/client/reply
-      //   body: { connectionIdentifiers, clientReplyUuid, text,
-      //           showId? | eventId? | instant? }
-      //   auth: cookies (.restream.io session) + header
-      //         x-axsrf-token = value of cookie "accessXsrfToken"
-      //
-      // To confirm and capture the exact request shape, instrument the
-      // Compose webContents' session-level webRequest listeners. Every
-      // outbound HTTP request gets its URL + method + headers + body
-      // appended to a JSONL debug log next to raw-frames.jsonl. Ethan
-      // opens Compose, sends a message, and the log contains the truth.
-      // No GUI launches needed on the dev side.
       try {
         attachComposeRequestLogger(win, chat.getRawLogPath());
       } catch (err) {
-        console.error('[main] failed to attach compose request logger', err);
+        console.error('[main] failed to attach webchat request logger', err);
       }
       void win.loadURL(url);
       return { ok: true as const };
     } catch (err) {
-      console.error('[main] open compose failed', err);
+      console.error('[main] open restream webchat failed', err);
       return {
         ok: false as const,
         reason: 'error' as const,

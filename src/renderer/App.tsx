@@ -271,7 +271,9 @@ export function App(): React.ReactElement {
         info={updateInfo}
         dismissed={updateDismissed}
         onDismiss={() => setUpdateDismissed(true)}
-        onDownload={(url) => void rcpp.openExternal(url)}
+        // v0.1.32: in-app download via Squirrel `checkForUpdates()`.
+        // No more `rcpp.openExternal(releaseUrl)` browser bounce.
+        onStartDownload={() => void rcpp.startUpdateDownload()}
         onRestart={() => void rcpp.quitAndInstall()}
       />
       <div className="toolbar">

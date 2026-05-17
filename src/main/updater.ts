@@ -148,6 +148,89 @@ export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
   }
 }
 
+/**
+ * Result of triggering Squirrel's in-app download from the renderer's
+ * "Download" button. v0.1.32+.
+ *
+ *   - 'started'              → autoUpdater.checkForUpdates() was kicked.
+ *                              Squirrel will emit `download-progress` and
+ *                              `update-downloaded` events which the
+ *                              progress forwarders broadcast as
+ *                              `IPC.UPDATE_STATUS` payloads — the banner
+ *                              transitions through 'downloading' →
+ *                              'ready-to-install' automatically.
+ *   - 'not-packaged'         → dev mode; nothing to do.
+ *   - 'unsupported-platform' → Linux; no Squirrel support compiled in.
+ *   - 'feed-unavailable'     → `updateElectronApp({...})` never settled
+ *                              (unsigned build, network problem at boot,
+ *                              etc.). User is told in-app rather than
+ *                              being silently bounced to the browser.
+ *   - 'error'                → `autoUpdater.checkForUpdates()` threw.
+ */
+export type StartDownloadResult =
+  | { ok: true; reason: 'started' }
+  | {
+      ok: false;
+      reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
+      error?: string;
+    };
+
+/**
+ * Renderer-triggered in-app download. Bound to
+ * `IPC.UPDATE_DOWNLOAD_START` in `main.ts`. Click handler for the
+ * `UpdateBanner`'s "Download" button when the banner is in `available`
+ * state.
+ *
+ * Pre-v0.1.32 this button opened the GitHub release page in the user's
+ * default browser via `shell.openExternal`. That side-stepped the entire
+ * Squirrel pipeline we'd already wired in v0.1.25 (Squirrel emits
+ * download-progress → renderer shows progress bar → Squirrel emits
+ * update-downloaded → renderer shows Restart button → user clicks →
+ * quitAndInstall swaps the bundle). v0.1.32 wires the button to fire
+ * `autoUpdater.checkForUpdates()` instead so the in-app pipeline
+ * actually runs.
+ *
+ * `autoUpdater.checkForUpdates()` is idempotent — calling it while
+ * a download is already in flight is a no-op. We guard against a stray
+ * call before the feed URL is configured because the native autoUpdater
+ * throws synchronously in that case (same root cause as
+ * `checkForUpdatesInteractive`).
+ */
+export function triggerSquirrelDownload(): StartDownloadResult {
+  if (!app.isPackaged) {
+    log.info('[updater] download requested in dev/unpackaged build — no-op');
+    return { ok: false, reason: 'not-packaged' };
+  }
+  if (process.platform === 'linux') {
+    // Squirrel.Mac handles macOS, Squirrel.Windows handles win32; Linux
+    // updates ship as .deb / .rpm packages outside the Electron auto-
+    // update pipeline. We surface this distinctly so the renderer (or
+    // a main-process dialog) can route the user to the right path.
+    log.info('[updater] download requested on linux — no in-app updater');
+    return { ok: false, reason: 'unsupported-platform' };
+  }
+  if (!feedURLReady) {
+    // `configureAutoUpdater()` never settled — common on unsigned builds
+    // where `updateElectronApp({...})` throws because Squirrel.Mac refuses
+    // an unsigned feed. Without this guard, calling checkForUpdates()
+    // would throw synchronously ("Update feed URL is not set"). v0.1.32.
+    log.warn('[updater] download requested but feed URL not ready');
+    return { ok: false, reason: 'feed-unavailable' };
+  }
+  try {
+    log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
+    autoUpdater.checkForUpdates();
+    return { ok: true, reason: 'started' };
+  } catch (err) {
+    log.error('[updater] checkForUpdates() threw', err);
+    return {
+      ok: false,
+      reason: 'error',
+      error: String((err as Error)?.message ?? err),
+    };
+  }
+}
+
 export function configureAutoUpdater(): void {
   if (configured) return;
   configured = true;

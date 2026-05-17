@@ -22,6 +22,16 @@
 import type { Settings } from '../shared/types';
 import type { TokenSet } from './oauth';
 
+export interface ComposeWindowBounds {
+  width: number;
+  height: number;
+  /** Screen-coordinate position. Undefined on first ever open. */
+  x?: number;
+  y?: number;
+  /** User preference to keep the compose window above other apps. */
+  alwaysOnTop?: boolean;
+}
+
 export interface StoreSchema {
   /**
    * Legacy plain-JSON token storage. Read-only path from v0.1.15 onwards —
@@ -38,6 +48,13 @@ export interface StoreSchema {
    */
   tokenEnc?: string;
   settings?: Settings;
+  /**
+   * v0.1.32: persisted Compose-window bounds + always-on-top preference.
+   * Restored on next open so the user's preferred size/position survives
+   * across sessions. Sanitised through `clampComposeBounds` before reuse
+   * to defend against off-screen restores and pathological dimensions.
+   */
+  composeWindow?: ComposeWindowBounds;
 }
 
 export interface Store {

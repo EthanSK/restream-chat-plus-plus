@@ -186,14 +186,11 @@ function prettyReason(result: SendTextResult): string {
 }
 
 function prettyComposeReason(
-  reason: 'not-authenticated' | 'webchat-fetch-failed' | 'no-webchat-url' | 'error',
+  reason: 'not-authenticated' | 'error',
 ): string {
   switch (reason) {
     case 'not-authenticated':
       return 'Sign in to Restream first.';
-    case 'webchat-fetch-failed':
-    case 'no-webchat-url':
-      return 'Couldn’t fetch webchat URL — opened chat.restream.io as fallback.';
     case 'error':
     default:
       return 'Failed to open compose window.';

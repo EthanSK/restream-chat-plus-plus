@@ -16,11 +16,16 @@
 //   2. "What's the release page URL?"
 // Both are public-API queries — no auth required, no signing involved. When
 // a newer version exists we broadcast an UPDATE_STATUS to the renderer which
-// surfaces a "Download" banner. The banner's button opens the release page
-// in the system browser via `shell.openExternal`. Until signing lands, that
-// download-from-web step replaces auto-install; the moment signing is in
-// place, `update-electron-app` will take over and the banner becomes a
-// belt-and-braces fallback rather than the primary path.
+// surfaces a "Download" banner.
+//
+// v0.1.32: the banner's Download button no longer opens the release page
+// in the system browser. It fires `IPC.UPDATE_DOWNLOAD_START` in main →
+// Squirrel `autoUpdater.checkForUpdates()` → the in-app pipeline takes
+// over (progress bar → Restart to install). On builds where Squirrel
+// can't run (unsigned / dev / Linux) the main-process handler pops a
+// native info dialog with an explicit "Reveal Release Page" button —
+// the user can still get to the release page, just not via a silent
+// browser bounce from the primary banner click.
 //
 // Polling cadence:
 //   - First check fires ~3s after the app is `ready` (so we don't compete

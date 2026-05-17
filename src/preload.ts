@@ -67,13 +67,30 @@ const api = {
     return () => ipcRenderer.removeListener(IPC.CONNECTIONS, h);
   },
   /**
-   * Pop the official Restream webchat in a separate BrowserWindow so the
-   * user can compose + send a chat reply. Restream's public WS Chat API is
-   * read-only (see Chat docs); the webchat uses an internal API to send
-   * and the reply comes back as a `reply_created` WS frame which our
-   * normaliser surfaces as a `self: true` ChatMessage in the feed.
+   * Open the native React Compose window (v0.1.32+). A small BrowserWindow
+   * (~520×280, resizable, persisted bounds) loads the same renderer bundle
+   * with `?compose=1`, which renders a compose-only UI that POSTs through
+   * the same `CHAT_SEND_TEXT` path the inline input bar uses. The reply
+   * round-trips through Restream's `/client/reply` endpoint and surfaces
+   * back as a `self: true` ChatMessage. Pre-v0.1.32 this opened
+   * Restream's official webchat at 720×720 — that path lives behind the
+   * `openRestreamWebchat` escape hatch below.
    */
   openCompose: (): Promise<
+    | { ok: true }
+    | {
+        ok: false;
+        reason: 'not-authenticated' | 'error';
+        error?: string;
+      }
+  > => ipcRenderer.invoke(IPC.CHAT_OPEN_COMPOSE),
+  /**
+   * Open Restream's official webchat (chat.restream.io) in a dedicated
+   * BrowserWindow. This is the escape hatch for users who need Restream's
+   * full reply UI (emoji picker, per-platform channel targeting) or to
+   * refresh expired session cookies. Identical to pre-v0.1.32 Compose.
+   */
+  openRestreamWebchat: (): Promise<
     | { ok: true }
     | {
         ok: false;
@@ -81,7 +98,21 @@ const api = {
         status?: number;
         error?: string;
       }
-  > => ipcRenderer.invoke(IPC.CHAT_OPEN_COMPOSE),
+  > => ipcRenderer.invoke(IPC.CHAT_OPEN_RESTREAM_WEBCHAT),
+  /**
+   * Compose renderer → main: fetch the initial state for the Compose UI
+   * (persisted `alwaysOnTop` flag + current WS-connected flag so the send
+   * button can disable when offline). v0.1.32.
+   */
+  composeGetInit: (): Promise<{ alwaysOnTop: boolean; connected: boolean; authenticated: boolean }> =>
+    ipcRenderer.invoke(IPC.COMPOSE_GET_INIT),
+  /**
+   * Compose renderer → main: toggle the Compose window's always-on-top
+   * behaviour. Main updates the BrowserWindow flag AND persists the new
+   * value to the store so the next launch restores it. v0.1.32.
+   */
+  composeSetAlwaysOnTop: (alwaysOnTop: boolean): Promise<{ alwaysOnTop: boolean }> =>
+    ipcRenderer.invoke(IPC.COMPOSE_SET_ALWAYS_ON_TOP, alwaysOnTop),
   /**
    * Send a chat reply inline via Restream's internal
    * `POST /api/v2/client/reply` endpoint. The reply gets broadcast back as
@@ -160,11 +191,31 @@ const api = {
     ipcRenderer.invoke(IPC.UPDATE_CHECK_NOW),
   /**
    * Open the given http(s) URL in the user's default browser via
-   * `shell.openExternal`. Non-http(s) URLs are refused in main. Used by
-   * the UpdateBanner's Download button to navigate to the release page.
+   * `shell.openExternal`. Non-http(s) URLs are refused in main. Used for
+   * general external links (the help-menu About link, future settings
+   * deep-links, etc.). The UpdateBanner no longer routes through this —
+   * see `startUpdateDownload`. v0.1.32.
    */
   openExternal: (url: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.OPEN_EXTERNAL, url),
+  /**
+   * Kick Squirrel's in-app download from the renderer. Bound to the
+   * `UpdateBanner` "Download" button in the `available` state. Main-
+   * process handler fires `autoUpdater.checkForUpdates()` which drives
+   * the banner through `downloading` → `ready-to-install` via the
+   * existing Squirrel progress forwarders. On failure (unsigned build,
+   * dev mode, Linux, transient error) the handler pops a native info
+   * dialog and returns a failure payload — the renderer doesn't need
+   * to render anything itself, the dialog IS the user-facing message. v0.1.32.
+   */
+  startUpdateDownload: (): Promise<
+    | { ok: true; reason: 'started' }
+    | {
+        ok: false;
+        reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
+        error?: string;
+      }
+  > => ipcRenderer.invoke(IPC.UPDATE_DOWNLOAD_START),
   /**
    * Trigger Squirrel's `autoUpdater.quitAndInstall()` from the renderer.
    * Bound to the `UpdateBanner` "Restart" button in the `ready-to-install`

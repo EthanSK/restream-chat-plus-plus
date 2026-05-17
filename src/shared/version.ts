@@ -5,9 +5,12 @@
 // app is unsigned — Squirrel.Mac silently refuses unsigned updates, which is
 // why the original auto-update path doesn't fire today. The GH path only
 // needs to ANSWER "is there a newer version?" and "where is it?" — actually
-// installing the update still requires the signed Squirrel feed; until then
-// the banner offers a Download button that opens the release page in the
-// system browser.
+// installing the update still requires the signed Squirrel feed. v0.1.32:
+// the banner's Download button now triggers Squirrel's in-app
+// `checkForUpdates()` pipeline (progress bar → Restart to install); on
+// builds where Squirrel can't run, a native dialog explains the situation
+// with an explicit "Reveal Release Page" escape hatch — the silent
+// browser bounce we used pre-v0.1.32 is gone.
 //
 // We deliberately don't pull in a full semver library (`semver` is 50 KB +
 // dependencies) — Restream Chat++ versions are always strict

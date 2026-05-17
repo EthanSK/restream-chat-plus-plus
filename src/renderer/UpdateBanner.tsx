@@ -1,4 +1,4 @@
-// Update banner — v0.1.25.
+// Update banner — v0.1.25, Download button rewired in v0.1.32.
 //
 // Renders a thin strip below the titlebar that surfaces the current
 // state of the auto-update flow. v0.1.24 had a single "Update available"
@@ -9,7 +9,14 @@
 //                        Fired by the GH-Releases poller AND by the
 //                        manual "Check for Updates Now…" path.
 //   `available`        → "Update available {version}" + Download +
-//                        Later buttons. Same as v0.1.24.
+//                        Later buttons. v0.1.32: clicking Download now
+//                        kicks Squirrel's in-app `checkForUpdates()`
+//                        pipeline (via `IPC.UPDATE_DOWNLOAD_START`)
+//                        instead of opening the GitHub release page in
+//                        the user's default browser. The banner state
+//                        machine transitions to `downloading` once
+//                        Squirrel emits its first `download-progress`
+//                        event — no extra renderer wiring needed.
 //   `downloading`      → "Downloading update… NN%" + progress bar.
 //                        Driven by Squirrel's `download-progress` event;
 //                        on signed builds only. NO Dismiss button — once
@@ -76,11 +83,14 @@ interface Props {
   dismissed: boolean;
   onDismiss: () => void;
   /**
-   * Opens the release URL in the user's default browser via the preload
-   * `rcpp.openExternal` API. The component is dumb — it doesn't know
-   * about IPC — so this is injected from App.tsx for test-friendliness.
+   * Kicks Squirrel's in-app download pipeline via the preload
+   * `rcpp.startUpdateDownload` API. v0.1.32 replaces the previous
+   * `onDownload(url)` signature — the renderer no longer cares about
+   * the release URL because the click stays in-app (no browser).
+   * Injected from App.tsx for test-friendliness so the banner stays
+   * pure / side-effect-free.
    */
-  onDownload: (url: string) => void;
+  onStartDownload: () => void;
   /**
    * Triggers Squirrel's `quitAndInstall()` via the preload
    * `rcpp.quitAndInstall` API. Injected for test-friendliness. v0.1.25.
@@ -92,7 +102,7 @@ export function UpdateBanner({
   info,
   dismissed,
   onDismiss,
-  onDownload,
+  onStartDownload,
   onRestart,
 }: Props): React.ReactElement | null {
   const state = updateBannerState(info, dismissed);
@@ -109,7 +119,6 @@ export function UpdateBanner({
 
   if (state === 'available') {
     const version = info!.latestVersion!;
-    const url = info!.releaseUrl!;
     return (
       <div className="update-banner" role="status" aria-live="polite">
         <span className="update-banner-text">
@@ -119,8 +128,18 @@ export function UpdateBanner({
           <button
             className="btn primary"
             onClick={() => {
-              onDownload(url);
-              onDismiss();
+              // v0.1.32: triggers IPC.UPDATE_DOWNLOAD_START in main →
+              // Squirrel `checkForUpdates()` → in-app download pipeline.
+              // We DO NOT dismiss here — Squirrel's `download-progress`
+              // event flips `info.kind` to 'downloading' which transitions
+              // the banner to its progress-bar state automatically. If
+              // Squirrel can't run (unsigned build / dev / Linux) the
+              // main-process handler pops a native info dialog with an
+              // explicit "Reveal Release Page" escape hatch — see
+              // `IPC.UPDATE_DOWNLOAD_START`. Pre-v0.1.32 this called
+              // `onDownload(url)` which opened the release page in the
+              // user's browser; that behaviour is gone.
+              onStartDownload();
             }}
           >
             Download

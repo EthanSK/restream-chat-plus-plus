@@ -248,17 +248,45 @@ export const IPC = {
   /** Pull-fetch counterpart so the renderer can sync on mount. */
   CONNECTIONS_GET: 'connections:get',
   /**
-   * Open Restream's official webchat compose window in a separate
-   * BrowserWindow. Restream's Chat API is RECEIVE-ONLY for third-party
-   * clients (https://developers.restream.io/chat/getting-started: "This
-   * API works one way — from the server to the client. The server will
-   * ignore any incoming messages.") so to actually send a message we
-   * delegate to Restream's first-party webchat URL, which uses the
-   * private API internally. The reply we send through that window comes
-   * BACK to us as a normal `reply_created` WS frame, which we now render
-   * as a `self: true` ChatMessage in the feed.
+   * Open the native React Compose window (v0.1.32+). Spawns a small
+   * BrowserWindow that loads the same renderer bundle with `?compose=1`,
+   * which renders a compose-only UI (multi-line textarea + send button +
+   * always-on-top toggle + an escape-hatch "Open Restream webchat" link).
+   * The send button posts via the same `CHAT_SEND_TEXT` IPC the inline
+   * input uses, so the reply round-trips through Restream's normal
+   * `/client/reply` endpoint and surfaces back as a `self: true`
+   * ChatMessage in the feed.
+   *
+   * Pre-v0.1.32 this opened Restream's official webchat (chat.restream.io)
+   * in a 720x720 BrowserWindow — that page's intrinsic min-widths forced
+   * the window to be much larger than a compose UI needs. The escape
+   * hatch (still useful for emoji-picker / per-platform targeting / cookie
+   * refresh) lives behind a button INSIDE the new compose window now —
+   * see `CHAT_OPEN_RESTREAM_WEBCHAT`.
    */
   CHAT_OPEN_COMPOSE: 'chat:open-compose',
+  /**
+   * v0.1.32: escape-hatch IPC fired from inside the native Compose window
+   * (and reusable from anywhere) to open Restream's official webchat at
+   * https://chat.restream.io in a separate BrowserWindow. This is the path
+   * for users who need Restream's full reply UI (emoji picker, per-platform
+   * channel targeting) or to refresh expired session cookies. Identical
+   * window setup to the pre-v0.1.32 Compose handler.
+   */
+  CHAT_OPEN_RESTREAM_WEBCHAT: 'chat:open-restream-webchat',
+  /**
+   * v0.1.32: the Compose renderer (loaded with `?compose=1`) asks the main
+   * process for its initial state (the persisted `alwaysOnTop` preference)
+   * + whether the parent app is currently connected so it can disable the
+   * send button when offline. Resolves immediately.
+   */
+  COMPOSE_GET_INIT: 'compose:get-init',
+  /**
+   * v0.1.32: renderer → main toggle for the Compose window's always-on-top
+   * behaviour. Main updates the BrowserWindow's `alwaysOnTop` flag AND
+   * persists the new value to the store so the next launch restores it.
+   */
+  COMPOSE_SET_ALWAYS_ON_TOP: 'compose:set-always-on-top',
   /**
    * Send a chat reply text directly via Restream's internal
    * `POST /api/v2/client/reply` endpoint. The renderer's inline chat-input
@@ -317,12 +345,27 @@ export const IPC = {
   UPDATE_CHECK_NOW: 'update:check-now',
   /**
    * Renderer → main. Open an arbitrary URL in the user's default browser
-   * via `shell.openExternal`. Used by the UpdateBanner's Download button
-   * to navigate to the GitHub release page — we intentionally don't try
-   * to apply the update in-place because unsigned builds can't auto-
-   * install on macOS.
+   * via `shell.openExternal`. Retained for general use (the About link in
+   * the help menu, future settings deep-links, etc.). The UpdateBanner's
+   * "Download" button no longer uses this — see UPDATE_DOWNLOAD_START.
    */
   OPEN_EXTERNAL: 'shell:open-external',
+  /**
+   * Renderer → main. Triggered by the "Download" button on the
+   * `available` banner state. Kicks Squirrel's in-app download pipeline
+   * via `autoUpdater.checkForUpdates()` so the user gets the staged-and-
+   * restart flow (progress bar → "Restart to install") instead of being
+   * dumped into their default browser on the GitHub release page. v0.1.32.
+   *
+   * Resolves with a `StartDownloadResult`. The renderer ignores the
+   * payload on success because Squirrel's own download-progress events
+   * drive the banner state machine from here on. On failure (unsigned
+   * build, dev mode, Linux, transient error) the main-process handler
+   * pops a native info dialog explaining the situation — we deliberately
+   * do NOT fall back to opening the release page in the browser, because
+   * the whole point of this banner action is "stay in-app".
+   */
+  UPDATE_DOWNLOAD_START: 'update:download-start',
   /**
    * Renderer → main. Triggered by the "Restart" button on the
    * `ready-to-install` banner state. Calls `autoUpdater.quitAndInstall()`
@@ -345,7 +388,10 @@ export const IPC = {
  *                          path so the renderer can show progress while
  *                          the network round-trip is in flight. v0.1.25.
  *   - `available`        → "Update available" banner with Download button
- *                          (opens release page) + Later (dismiss).
+ *                          (kicks Squirrel's in-app download pipeline via
+ *                          `IPC.UPDATE_DOWNLOAD_START`) + Later (dismiss).
+ *                          v0.1.32: no longer opens the release page in
+ *                          the browser — the click stays in-app.
  *   - `downloading`      → progress bar with percent. Driven by the
  *                          Squirrel `download-progress` event in
  *                          `src/main/updater.ts` (v0.1.25). Only fires on
