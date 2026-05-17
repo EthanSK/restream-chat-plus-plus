@@ -7,12 +7,52 @@ import type { ChatMessage, Settings } from '../shared/types';
  * - Honors max-per-minute rate limit (drop oldest if over the cap to keep TTS
  *   from spiraling during a chat raid)
  * - Allows the user to pick a system voice by URI
+ *
+ * v0.1.21 regression-fix notes
+ * ============================
+ *
+ * Both the preview path (voice-picker change, volume-slider release) and the
+ * incoming-message path went silent in <=v0.1.18. Three Chromium / Web Speech
+ * quirks compounded:
+ *
+ *   1. `speechSynthesis.cancel()` is asynchronous in the engine's internal
+ *      state machine. Calling `speak()` synchronously after `cancel()` can
+ *      cause Chromium to silently drop the new utterance. This was the
+ *      preview-silence root cause — `previewVoice()` did exactly that. Fix:
+ *      defer the `speak()` to the next microtask (queueMicrotask) so the
+ *      cancel state settles before we enqueue the new utterance.
+ *
+ *   2. `speechSynthesis.paused` can latch to `true` and stick there after
+ *      certain transitions (window blur, system audio device change, the
+ *      cancel-speak race in #1). Once paused, every subsequent `speak()`
+ *      is silently queued into the paused queue — utterances stack up but
+ *      none ever speak. This was the incoming-message silence root cause:
+ *      a misfired preview earlier in the session left the engine paused,
+ *      and every chat message after that went into the paused queue. Fix:
+ *      always `speechSynthesis.resume()` before `speak()` and re-arm the
+ *      paused state if it latches mid-utterance.
+ *
+ *   3. Chromium has a long-standing bug where `speechSynthesis` stops
+ *      responding entirely if a single utterance runs longer than ~15s OR
+ *      if the renderer is left idle for several minutes. The standard
+ *      workaround is a periodic `pause(); resume();` keep-alive ping while
+ *      a speak is in flight. Fix: arm an interval ping when an utterance
+ *      starts, clear it on end/error.
+ *
+ * The three fixes are independent and each pins a separate observed
+ * symptom; tests in tts-regression.test.ts exercise each one.
  */
 export class TTSEngine {
   private queue: ChatMessage[] = [];
   private speaking = false;
   private timestamps: number[] = []; // ms of recent spoken utterances
   private settings: Settings['tts'];
+  /**
+   * Chromium keep-alive interval handle (see note #3 above). Armed in
+   * `speak()` / `previewVoice()` on `onstart`, cleared on `onend` / `onerror`.
+   * Stored on the instance so tests can assert it's cleared cleanly.
+   */
+  private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(settings: Settings['tts']) {
     this.settings = settings;
@@ -38,6 +78,7 @@ export class TTSEngine {
       window.speechSynthesis.cancel();
     }
     this.speaking = false;
+    this.clearKeepAlive();
   }
 
   voices(): SpeechSynthesisVoice[] {
@@ -74,10 +115,21 @@ export class TTSEngine {
     this.speaking = true;
     this.timestamps.push(Date.now());
 
+    utter.onstart = () => {
+      // Arm the keep-alive ping (see note #3 above).
+      this.armKeepAlive();
+    };
     utter.onend = utter.onerror = () => {
       this.speaking = false;
+      this.clearKeepAlive();
       setTimeout(() => this.tick(), 50);
     };
+    // Always lift any latched paused state before speaking (note #2 above).
+    // This is a no-op when the engine isn't paused, so it's safe to call
+    // unconditionally on every speak.
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
     window.speechSynthesis.speak(utter);
   }
 
@@ -87,12 +139,18 @@ export class TTSEngine {
    * changes don't pile up. Bypasses the queue + rate-limit because preview
    * is a UI affordance, not chat playback. Returns the utterance text that
    * was spoken (for tests / debugging).
+   *
+   * v0.1.21 fix: the cancel() then speak() pair runs across a microtask
+   * boundary now — calling them synchronously in Chromium causes the new
+   * utterance to be silently dropped (the cancel hasn't yet flushed the
+   * engine's internal state machine).
    */
   previewVoice(voiceURI: string | undefined): string {
     if (typeof window === 'undefined' || !window.speechSynthesis) return '';
     // Cancel everything in flight so rapid switching doesn't queue overlaps.
     this.queue = [];
     this.speaking = false;
+    this.clearKeepAlive();
     window.speechSynthesis.cancel();
 
     const voice = this.voices().find((v) => v.voiceURI === voiceURI);
@@ -103,8 +161,59 @@ export class TTSEngine {
     utter.pitch = this.settings.pitch;
     utter.volume = this.settings.volume;
     if (voice) utter.voice = voice;
-    window.speechSynthesis.speak(utter);
+    utter.onstart = () => this.armKeepAlive();
+    utter.onend = utter.onerror = () => this.clearKeepAlive();
+
+    // Defer the speak() to a microtask so the cancel() above has a chance to
+    // settle. Calling speak() synchronously after cancel() in Chromium can
+    // cause the new utterance to be silently dropped — this is the
+    // observable preview-silence regression that shipped pre-v0.1.21.
+    // `queueMicrotask` is preferred over `setTimeout(0)` because it runs
+    // BEFORE the next render frame, keeping the UX snappy.
+    queueMicrotask(() => {
+      if (typeof window === 'undefined' || !window.speechSynthesis) return;
+      // Always lift any latched paused state before speaking (note #2 above).
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+      window.speechSynthesis.speak(utter);
+    });
+
     return text;
+  }
+
+  /**
+   * Arm a periodic `pause(); resume();` ping while an utterance is speaking.
+   * Workaround for Chromium's long-utterance stall bug (note #3 in the
+   * class header). The ping is a no-op acoustically but keeps the engine
+   * responsive for utterances >15s and after long idle periods. Idempotent
+   * — calling this twice in a row clears the previous timer first.
+   */
+  private armKeepAlive(): void {
+    this.clearKeepAlive();
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+    this.keepAliveTimer = setInterval(() => {
+      if (typeof window === 'undefined' || !window.speechSynthesis) return;
+      if (!window.speechSynthesis.speaking) {
+        // Defensive: end event might have been swallowed; clear ourselves.
+        this.clearKeepAlive();
+        return;
+      }
+      try {
+        window.speechSynthesis.pause();
+        window.speechSynthesis.resume();
+      } catch {
+        // Some Chromium builds throw on pause() when nothing is speaking;
+        // swallow because there's nothing to recover.
+      }
+    }, 10_000);
+  }
+
+  private clearKeepAlive(): void {
+    if (this.keepAliveTimer !== null) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
   }
 
   private pruneTimestamps() {
