@@ -145,6 +145,84 @@ body {
   border-bottom-color: #1f5933;
 }
 
+/* v0.1.39 — in-banner toast that appears after the user clicks Install
+ * Update so they always see SOMETHING happen (Voice 3369). Positioned
+ * absolute in the top-right of the banner strip; auto-dismisses after
+ * TOAST_AUTO_DISMISS_MS (3s) via the renderer's useEffect timer, or
+ * manually via the × button. CSS-only fade-in animation keyed off mount
+ * (no exit animation — toast removal is driven by React state).
+ *
+ * The parent .update-banner needs `position: relative` so the absolute
+ * toast positions relative to the banner rather than the document.
+ */
+.update-banner {
+  position: relative;
+}
+.update-banner-toast {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.3;
+  max-width: 320px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  animation: update-banner-toast-fade-in 180ms ease-out;
+}
+.update-banner-toast-info {
+  background: #1e3a5f;
+  color: #dbeafe;
+  border: 1px solid #2c5282;
+}
+.update-banner-toast-error {
+  background: #5f1e1e;
+  color: #fed7d7;
+  border: 1px solid #822c2c;
+}
+.update-banner-toast-text {
+  flex: 1 1 auto;
+}
+.update-banner-toast-dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0.7;
+}
+.update-banner-toast-dismiss:hover {
+  opacity: 1;
+}
+@keyframes update-banner-toast-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Spinner that lives inside the Install Update button while the IPC
+ * round-trip is in flight. Smaller than the standalone banner spinner so
+ * it sits comfortably next to the "Installing…" label. */
+.update-banner-button-spinner {
+  width: 10px;
+  height: 10px;
+  border-width: 1.5px;
+  margin-right: 6px;
+  vertical-align: middle;
+  display: inline-block;
+}
+
 .toolbar .status-dot {
   width: 10px;
   height: 10px;

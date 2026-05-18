@@ -801,32 +801,41 @@ app.on('ready', async () => {
   // release page makes the click always produce a visible next step.
   ipcMain.handle(IPC.UPDATE_DOWNLOAD_START, async (): Promise<StartDownloadResult> => {
     const result = triggerSquirrelDownload();
-    if (!result.ok) {
-      // v0.1.37: when Squirrel is unavailable (unsigned build / dev /
-      // Linux / transient error) we now open the GitHub release page
-      // DIRECTLY in the user's default browser rather than popping a
-      // dialog with a "Reveal Release Page" button. Voice 3351:
-      //   "clicking it does nothing. It should just do the same thing
-      //    as what check for updates does."
-      // The pre-v0.1.32 silent-browser-bounce is back as the
-      // explicit fallback path because the dialog hop was confusing
-      // — the user clicks the Install Update button and the natural
-      // next step is "show me where to install it from", not "answer
-      // a yes/no dialog first". On signed builds the in-app pipeline
-      // still wins (Squirrel kicks first, this branch never runs).
-      const releaseUrl =
-        'https://github.com/EthanSK/restream-chat-plus-plus/releases';
-      try {
-        await shell.openExternal(releaseUrl);
-        console.info(
-          '[main] update-download fallback opened release page',
-          result.reason,
-        );
-      } catch (err) {
-        console.error('[main] update-download fallback openExternal failed', err);
-      }
+    if (result.ok) {
+      // Signed packaged build: Squirrel pipeline kicked. The renderer
+      // shows a "Starting download…" toast; the existing download-
+      // progress forwarders then drive the banner.
+      return result;
     }
-    return result;
+    // v0.1.37 fallback: on unsigned / dev / Linux / transient errors,
+    // open the GitHub release page in the user's default browser.
+    // v0.1.39: surface the OUTCOME of that fallback to the renderer
+    // (was silent before — voice 3369 "I clicked install update and I
+    // don't see anything happening"). If openExternal succeeds, return
+    // mode='browser' so the renderer toasts "Opening release page in
+    // browser…". If openExternal throws too, return ok:false so the
+    // renderer shows an error toast with a manual-fallback link.
+    try {
+      await shell.openExternal(result.releaseUrl);
+      console.info(
+        '[main] update-download fallback opened release page',
+        result.reason,
+      );
+      return {
+        ok: true,
+        reason: 'opened-release-page',
+        mode: 'browser',
+        fallbackReason: result.reason,
+      };
+    } catch (err) {
+      console.error('[main] update-download fallback openExternal failed', err);
+      return {
+        ok: false,
+        reason: 'error',
+        error: `Couldn't open browser: ${String((err as Error)?.message ?? err)}`,
+        releaseUrl: result.releaseUrl,
+      };
+    }
   });
 
   ipcMain.handle(IPC.OPEN_EXTERNAL, async (_evt, url: string): Promise<boolean> => {

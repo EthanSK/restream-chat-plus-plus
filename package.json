@@ -1,7 +1,7 @@
 {
   "name": "restream-chat-plus-plus",
   "productName": "Restream Chat Plus Plus",
-  "version": "0.1.38",
+  "version": "0.1.39",
   "description": "Native cross-platform replacement for Restream's broken Apple-Silicon Chat desktop app.",
   "homepage": "https://github.com/EthanSK/restream-chat-plus-plus",
   "repository": {
@@ -49,6 +49,7 @@
     "@types/electron-squirrel-startup": "^1.0.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "@types/react-test-renderer": "^19.1.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^5.62.0",
     "@typescript-eslint/parser": "^5.62.0",
@@ -56,6 +57,7 @@
     "electron": "42.1.0",
     "eslint": "^8.57.1",
     "eslint-plugin-import": "^2.32.0",
+    "react-test-renderer": "^19.2.6",
     "typescript": "^5.9.3",
     "vite": "^5.4.21",
     "vitest": "^4.1.6"

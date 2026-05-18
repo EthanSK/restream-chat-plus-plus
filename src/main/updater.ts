@@ -168,12 +168,28 @@ export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
  *                              being silently bounced to the browser.
  *   - 'error'                → `autoUpdater.checkForUpdates()` threw.
  */
+/**
+ * v0.1.39: `mode` discriminator added so the renderer can pick the
+ * right user-facing toast. `squirrel` = in-app pipeline kicked
+ * (banner will transition through `downloading` automatically);
+ * `browser` = main-process fallback successfully bounced the user to
+ * the GitHub release page in their default browser. On failure
+ * (`ok: false`) the renderer renders an error toast with the
+ * release-page URL as a manual-fallback link.
+ */
 export type StartDownloadResult =
-  | { ok: true; reason: 'started' }
+  | { ok: true; reason: 'started'; mode: 'squirrel' }
+  | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
   | {
       ok: false;
       reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
       error?: string;
+      /**
+       * Always populated on failure so the renderer can offer a manual
+       * "click here" link as last-resort fallback (e.g. shell.openExternal
+       * threw too — extremely rare but possible on locked-down systems).
+       */
+      releaseUrl: string;
     };
 
 /**
@@ -197,10 +213,13 @@ export type StartDownloadResult =
  * throws synchronously in that case (same root cause as
  * `checkForUpdatesInteractive`).
  */
+export const UPDATE_RELEASE_PAGE_URL =
+  'https://github.com/EthanSK/restream-chat-plus-plus/releases';
+
 export function triggerSquirrelDownload(): StartDownloadResult {
   if (!app.isPackaged) {
     log.info('[updater] download requested in dev/unpackaged build — no-op');
-    return { ok: false, reason: 'not-packaged' };
+    return { ok: false, reason: 'not-packaged', releaseUrl: UPDATE_RELEASE_PAGE_URL };
   }
   if (process.platform === 'linux') {
     // Squirrel.Mac handles macOS, Squirrel.Windows handles win32; Linux
@@ -208,7 +227,11 @@ export function triggerSquirrelDownload(): StartDownloadResult {
     // update pipeline. We surface this distinctly so the renderer (or
     // a main-process dialog) can route the user to the right path.
     log.info('[updater] download requested on linux — no in-app updater');
-    return { ok: false, reason: 'unsupported-platform' };
+    return {
+      ok: false,
+      reason: 'unsupported-platform',
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
+    };
   }
   if (!feedURLReady) {
     // `configureAutoUpdater()` never settled — common on unsigned builds
@@ -216,18 +239,23 @@ export function triggerSquirrelDownload(): StartDownloadResult {
     // an unsigned feed. Without this guard, calling checkForUpdates()
     // would throw synchronously ("Update feed URL is not set"). v0.1.32.
     log.warn('[updater] download requested but feed URL not ready');
-    return { ok: false, reason: 'feed-unavailable' };
+    return {
+      ok: false,
+      reason: 'feed-unavailable',
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
+    };
   }
   try {
     log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
     autoUpdater.checkForUpdates();
-    return { ok: true, reason: 'started' };
+    return { ok: true, reason: 'started', mode: 'squirrel' };
   } catch (err) {
     log.error('[updater] checkForUpdates() threw', err);
     return {
       ok: false,
       reason: 'error',
       error: String((err as Error)?.message ?? err),
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
     };
   }
 }

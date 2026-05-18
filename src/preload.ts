@@ -200,11 +200,13 @@ const api = {
    * to render anything itself, the dialog IS the user-facing message. v0.1.32.
    */
   startUpdateDownload: (): Promise<
-    | { ok: true; reason: 'started' }
+    | { ok: true; reason: 'started'; mode: 'squirrel' }
+    | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
     | {
         ok: false;
         reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
         error?: string;
+        releaseUrl: string;
       }
   > => ipcRenderer.invoke(IPC.UPDATE_DOWNLOAD_START),
   /**
