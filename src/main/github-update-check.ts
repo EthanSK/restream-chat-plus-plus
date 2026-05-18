@@ -108,11 +108,31 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
   // network round-trip is in flight. We DON'T cache this in `lastInfo`
   // because it would overwrite the most recent terminal state (e.g.
   // `available`), making a fresh renderer mount lose the banner. v0.1.25.
+  //
+  // v0.1.35: track `checking` as the most recent broadcast in `lastBroadcast`
+  // so the subsequent terminal payload (`up-to-date` / `available` / `error`)
+  // ALWAYS differs from the cached "last sent" and is therefore broadcast.
+  //
+  // Pre-v0.1.35 bug: if two consecutive polls both resolved to `up-to-date`,
+  // the second resolution was suppressed by the "skip unchanged" guard in
+  // `broadcast()` — but the renderer had already seen `checking` from the
+  // raw send below. Result: banner stuck on "Checking for updates…" forever.
+  // Repro path: app boots → 3s poll → `up-to-date` (cached). User clicks
+  // "Check for Updates" menu → raw `checking` push → fetch resolves to
+  // `up-to-date` again → broadcast() compares `up-to-date === up-to-date` →
+  // skips → renderer never gets the terminal state → spinner forever.
+  //
+  // Mutating `lastBroadcast` here means the post-fetch `broadcast()` call
+  // sees `lastBroadcast.kind === 'checking'` and ALWAYS pushes the terminal
+  // payload. We do NOT touch `lastInfo` — the on-mount pull-fetch
+  // (`getLastUpdateInfo`) should still return the most recent TERMINAL
+  // state, not the transient checking state.
   const checkingInfo: UpdateInfo = {
     kind: 'checking',
     currentVersion,
     checkedAt: now,
   };
+  lastBroadcast = checkingInfo;
   for (const win of BrowserWindow.getAllWindows()) {
     try {
       win.webContents.send(IPC.UPDATE_STATUS, checkingInfo);

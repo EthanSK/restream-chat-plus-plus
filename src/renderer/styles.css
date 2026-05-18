@@ -727,21 +727,31 @@ body {
 }
 
 /* ----- v0.1.26 Regex-ignored message badge ----------------------------- */
+/*
+ * v0.1.35: bumped visibility — Ethan reported the muted chip was easy to
+ * miss while streaming, and his explicit ask (voice 3326) was "a little
+ * badge on the message saying it's being ignored for speech-to-text so I
+ * don't get confused" when a regex match suppressed TTS. The pre-v0.1.35
+ * styling had opacity 0.85 + muted --text-2 on --bg-2 with a 1px hairline
+ * border, which against the chat-row background blended into the
+ * timestamp/platform-label tier. v0.1.35 swaps in a warm amber-tinted chip
+ * with full opacity, bold weight, and a slightly larger font so the badge
+ * reads as a deliberate annotation rather than disabled metadata.
+ */
 .regex-ignored-badge {
   display: inline-block;
   margin-left: 8px;
-  font-size: 10px;
-  font-weight: 500;
+  font-size: 11px;
+  font-weight: 600;
   letter-spacing: 0.02em;
-  color: var(--text-2);
-  background: var(--bg-2);
-  border: 1px solid var(--border);
+  color: #f0b24a;
+  background: rgba(240, 178, 74, 0.12);
+  border: 1px solid rgba(240, 178, 74, 0.4);
   border-radius: 4px;
   padding: 1px 6px;
   vertical-align: 1px;
   white-space: nowrap;
   user-select: none;
-  opacity: 0.85;
 }
 
 .switch {
