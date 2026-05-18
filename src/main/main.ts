@@ -5,7 +5,6 @@ import {
   ipcMain,
   Menu,
   Notification,
-  screen,
   session,
   shell,
 } from 'electron';
@@ -14,13 +13,12 @@ import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
-import { createStore, type ComposeWindowBounds } from './store';
-import { sendChatText, type ChatSendLogRecord } from './chat-send';
+import { createStore } from './store';
 import {
-  clampComposeBounds,
-  COMPOSE_MIN_WIDTH,
-  COMPOSE_MIN_HEIGHT,
-} from './compose-bounds';
+  sendChatText,
+  type ChatSendLogRecord,
+  type ChatContext,
+} from './chat-send';
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
@@ -863,206 +861,15 @@ app.on('ready', async () => {
   // ----- IPC: connections (channels panel pull-fetch) -----
   ipcMain.handle(IPC.CONNECTIONS_GET, () => chat.getConnections());
 
-  // ----- IPC: open the native Compose window (v0.1.32+) -----
-  //
-  // The Compose button next to the inline send arrow opens this window. Pre-
-  // v0.1.32 it loaded chat.restream.io at 720×720 because Restream's embed
-  // had intrinsic min-widths that broke at smaller sizes. v0.1.32 replaces
-  // that with a small native React UI (~520×280) that posts through the
-  // same CHAT_SEND_TEXT IPC as the inline input bar — so we reuse the same
-  // /client/reply path, showId refresh, and 404 retry logic from v0.1.30.
-  //
-  // Window properties:
-  //   - 520×280 default content size (Messages/Slack-thread-reply scale)
-  //   - 360×200 minimums, no maximize, resizable
-  //   - parent: mainWindow so it groups in the macOS window switcher
-  //   - bounds persisted to electron-store `composeWindow`; clamped to the
-  //     work area on restore via `clampComposeBounds`
-  //   - alwaysOnTop persisted; toggle exposed in the Compose UI
-  //   - loads the same renderer bundle with `?compose=1` query param
-  //
-  // Singleton: clicking Compose while one is open focuses the existing
-  // window instead of spawning a duplicate.
-  let composeWindow: BrowserWindow | null = null;
-  let composeBoundsSaveTimer: NodeJS.Timeout | undefined;
-
-  /**
-   * Persist the Compose window's current bounds (size + position). The
-   * alwaysOnTop flag is preserved unchanged — it's mutated separately
-   * via the COMPOSE_SET_ALWAYS_ON_TOP handler. Called on resize/move
-   * (debounced via composeBoundsSaveTimer) and on window close.
-   */
-  const saveComposeBounds = (win: BrowserWindow): void => {
-    try {
-      if (win.isDestroyed()) return;
-      const b = win.getBounds();
-      const prev = store.get('composeWindow') as ComposeWindowBounds | undefined;
-      const next: ComposeWindowBounds = {
-        width: b.width,
-        height: b.height,
-        x: b.x,
-        y: b.y,
-        alwaysOnTop: prev?.alwaysOnTop ?? false,
-      };
-      store.set('composeWindow', next);
-    } catch (err) {
-      console.error('[main] save compose bounds failed', err);
-    }
-  };
-
-  const scheduleSaveComposeBounds = (win: BrowserWindow): void => {
-    if (composeBoundsSaveTimer) clearTimeout(composeBoundsSaveTimer);
-    composeBoundsSaveTimer = setTimeout(() => saveComposeBounds(win), 400);
-  };
-
-  ipcMain.handle(IPC.CHAT_OPEN_COMPOSE, async () => {
-    try {
-      if (!oauth.isAuthenticated()) {
-        return { ok: false as const, reason: 'not-authenticated' as const };
-      }
-      // Singleton: focus the existing window if one is already open.
-      if (composeWindow && !composeWindow.isDestroyed()) {
-        if (composeWindow.isMinimized()) composeWindow.restore();
-        composeWindow.focus();
-        return { ok: true as const };
-      }
-
-      // Resolve work area for the display the parent window lives on so
-      // bounds clamping is multi-monitor-aware.
-      let workArea: Electron.Rectangle = { x: 0, y: 0, width: 1440, height: 900 };
-      try {
-        const display = mainWindow
-          ? screen.getDisplayMatching(mainWindow.getBounds())
-          : screen.getPrimaryDisplay();
-        workArea = display.workArea;
-      } catch (err) {
-        console.warn('[main] compose: failed to resolve display work area', err);
-      }
-      const saved = store.get('composeWindow') as ComposeWindowBounds | undefined;
-      const clamped = clampComposeBounds(saved, workArea);
-      const alwaysOnTop = saved?.alwaysOnTop === true;
-
-      composeWindow = new BrowserWindow({
-        width: clamped.width,
-        height: clamped.height,
-        ...(clamped.x !== undefined && clamped.y !== undefined
-          ? { x: clamped.x, y: clamped.y }
-          : {}),
-        minWidth: COMPOSE_MIN_WIDTH,
-        minHeight: COMPOSE_MIN_HEIGHT,
-        useContentSize: true,
-        resizable: true,
-        maximizable: false,
-        minimizable: true,
-        fullscreenable: false,
-        title: 'Compose',
-        backgroundColor: '#0d1117',
-        parent: mainWindow ?? undefined,
-        // Centre on parent on first ever open (no saved position). After
-        // that the saved x/y wins.
-        ...(clamped.x === undefined ? { center: true } : {}),
-        alwaysOnTop,
-        webPreferences: {
-          preload: path.join(__dirname, 'preload.js'),
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: false,
-          zoomFactor: 1.0,
-        },
-      });
-
-      // Re-arm zoom guard — same rationale as the v0.1.17 webchat path.
-      composeWindow.webContents.on('did-finish-load', () => {
-        try {
-          composeWindow?.webContents.setZoomFactor(1.0);
-          composeWindow?.webContents.setVisualZoomLevelLimits(1, 1);
-        } catch (err) {
-          console.error('[main] compose zoom reset failed', err);
-        }
-      });
-
-      // Persist bounds on resize / move. Debounced.
-      composeWindow.on('resize', () => {
-        if (composeWindow) scheduleSaveComposeBounds(composeWindow);
-      });
-      composeWindow.on('move', () => {
-        if (composeWindow) scheduleSaveComposeBounds(composeWindow);
-      });
-      composeWindow.on('close', () => {
-        if (composeWindow) {
-          if (composeBoundsSaveTimer) {
-            clearTimeout(composeBoundsSaveTimer);
-            composeBoundsSaveTimer = undefined;
-          }
-          saveComposeBounds(composeWindow);
-        }
-      });
-      composeWindow.on('closed', () => {
-        composeWindow = null;
-      });
-
-      // Load the SAME renderer bundle as the main window, but with
-      // `?compose=1` so `src/renderer/main.tsx` routes to `<ComposeApp>`
-      // instead of the full `<App>`. This sidesteps a separate Vite
-      // renderer entry while keeping all the React + preload wiring.
-      if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-        void composeWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}?compose=1`);
-      } else {
-        void composeWindow.loadFile(
-          path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-          { query: { compose: '1' } },
-        );
-      }
-
-      if (process.env.RC_DEVTOOLS === '1') composeWindow.webContents.openDevTools();
-
-      return { ok: true as const };
-    } catch (err) {
-      console.error('[main] open compose failed', err);
-      return {
-        ok: false as const,
-        reason: 'error' as const,
-        error: String((err as Error)?.message ?? err),
-      };
-    }
-  });
-
-  // ----- IPC: COMPOSE_GET_INIT — initial state for the Compose renderer -----
-  ipcMain.handle(IPC.COMPOSE_GET_INIT, () => {
-    const saved = store.get('composeWindow') as ComposeWindowBounds | undefined;
-    return {
-      alwaysOnTop: saved?.alwaysOnTop === true,
-      connected: chat.getState().status === 'connected',
-      authenticated: oauth.isAuthenticated(),
-    };
-  });
-
-  // ----- IPC: COMPOSE_SET_ALWAYS_ON_TOP -----
-  ipcMain.handle(IPC.COMPOSE_SET_ALWAYS_ON_TOP, (_evt, alwaysOnTop: boolean) => {
-    const flag = alwaysOnTop === true;
-    try {
-      if (composeWindow && !composeWindow.isDestroyed()) {
-        composeWindow.setAlwaysOnTop(flag);
-      }
-      const prev = store.get('composeWindow') as ComposeWindowBounds | undefined;
-      const next: ComposeWindowBounds = prev
-        ? { ...prev, alwaysOnTop: flag }
-        : { width: 520, height: 280, alwaysOnTop: flag };
-      store.set('composeWindow', next);
-    } catch (err) {
-      console.error('[main] compose set-always-on-top failed', err);
-    }
-    return { alwaysOnTop: flag };
-  });
-
   // ----- IPC: open Restream's official webchat (escape hatch) -----
   //
-  // Pre-v0.1.32 this was the default Compose window. As of v0.1.32 the
-  // Compose button opens the native React UI above; this handler stays as
-  // the escape hatch for: (a) users who need Restream's full reply UI
-  // (emoji picker, per-platform channel targeting), (b) recovering from
-  // an expired session cookie. Exposed via a button INSIDE the Compose
-  // window now.
+  // v0.1.34: the native React Compose window (v0.1.32-v0.1.33) was removed
+  // — it duplicated the inline send path with no functional value beyond
+  // what inline + this webchat escape-hatch provide together. This handler
+  // remains as the single button for: (a) users who need Restream's full
+  // reply UI (emoji picker, per-platform channel targeting), (b)
+  // recovering from an expired session cookie. Exposed via the "Webchat"
+  // ghost button next to the inline send arrow.
   ipcMain.handle(IPC.CHAT_OPEN_RESTREAM_WEBCHAT, async () => {
     try {
       const token = oauth.getToken();
@@ -1135,28 +942,49 @@ app.on('ready', async () => {
   // v0.1.14. 1 msg/sec rate-limited so accidental rapid-fire (e.g. holding
   // Enter on a stuck key) can't hammer Restream's edge.
   //
-  // showId hydration (v0.1.20): the WS sniffs showId from `event` /
-  // `reply_created` frames, but those only flow when chat is active.
-  // If the user opens the app cold and tries to send before any frame
-  // arrives, we hit Restream's public REST API for in-progress events
-  // and use that event id as a candidate showId. The result is cached
-  // per session (showIdRestCache) — Restream's event id changes per
-  // stream session, so a stale cache is acceptable until the user
-  // reconnects the WS.
+  // v0.1.34: rewired from showId-only to the full chat context union
+  // (`{showId, eventId, instant}`) matching what Restream's chat backend
+  // actually accepts. The WS sniffs `eventId` (and any incidental showId
+  // / instant) from `event` / `reply_created` frames, but those only flow
+  // when chat is active. If the user opens the app cold and tries to send
+  // before any frame arrives, we hit Restream's public REST API for
+  // in-progress events and derive a context from there. The result is
+  // cached per session — Restream's event id changes per stream session,
+  // so a stale cache is acceptable until the user reconnects the WS.
   //
-  // v0.1.28: stale-but-present invalidation. The cache could ALSO hold a
-  // showId from a show that ended hours ago — Restream returns 404 on
-  // /client/reply for both "never had a show" AND "show ended" with the
-  // same status code and body, so we can't tell pre-send. Two layers
-  // defend against this:
-  //   1. On a POST 404 the inline send path calls `refreshShowIdForce()`
+  // Stale-but-present invalidation: the cache could hold an event from a
+  // show that ended hours ago — Restream returns 404 on /client/reply for
+  // both "never had a show" AND "show ended" with the same status and
+  // body, so we can't tell pre-send. Two layers defend against this:
+  //   1. On a POST 404 the inline send path calls `refreshChatContextForce()`
   //      which clears both the REST cache + the WS sniff, re-hits the
   //      REST API, and feeds the result into a single retry POST.
   //   2. A 10-minute periodic poller (while WS connected) re-hydrates
-  //      the cache so a stale show id can't linger across multiple sends.
+  //      the cache so a stale context can't linger across multiple sends.
   let lastSendAt = 0;
-  let showIdRestCache: string | undefined;
-  const hydrateShowIdViaRest = async (): Promise<string | undefined> => {
+  let chatContextRestCache: ChatContext | undefined;
+  /**
+   * Derive a ChatContext from one entry of `/v2/user/events/in-progress`.
+   * Restream's docs document the response as:
+   *   [{id, status, title, description, coverUrl, isRecordOnly,
+   *     scheduledFor, startedAt, finishedAt, destinations:[...]}, ...]
+   * `id` is the EVENT id (NOT a showId, despite v0.1.20-v0.1.33 naming).
+   * For instant streams (RTMP/instant) the id is often the string
+   * `"rtmp/instant"` or a UUID with no schedule — in either case
+   * `{eventId: id}` is the right shape for the chat-send body.
+   *
+   * v0.1.34 split this off from `hydrateShowIdViaRest` so the chat-send
+   * path can reason about the full context, not just a single string.
+   */
+  const buildChatContextFromInProgress = (
+    entry: unknown,
+  ): ChatContext | undefined => {
+    if (!entry || typeof entry !== 'object') return undefined;
+    const e = entry as { id?: unknown };
+    if (typeof e.id !== 'string' || !e.id) return undefined;
+    return { eventId: e.id };
+  };
+  const hydrateChatContextViaRest = async (): Promise<ChatContext | undefined> => {
     const token = oauth.getToken();
     if (!token) return undefined;
     try {
@@ -1172,10 +1000,7 @@ app.on('ready', async () => {
       }
       const json: unknown = await res.json();
       if (Array.isArray(json) && json.length > 0) {
-        const first = json[0] as { id?: unknown };
-        if (typeof first?.id === 'string' && first.id) {
-          return first.id;
-        }
+        return buildChatContextFromInProgress(json[0]);
       }
       return undefined;
     } catch (err) {
@@ -1184,88 +1009,92 @@ app.on('ready', async () => {
     }
   };
   /**
-   * Cache-coherent hydration used as `fetchShowId` on the FIRST POST.
-   * Returns the cached value if present; otherwise hits the REST API and
-   * caches the result for subsequent sends within this WS session.
+   * Cache-coherent hydration used as `fetchContext` on the FIRST POST.
+   * Returns the cached context if present; otherwise hits the REST API
+   * and caches the result for subsequent sends within this WS session.
+   *
+   * v0.1.34: renamed from `fetchActiveShowIdFromApi`.
    */
-  const fetchActiveShowIdFromApi = async (): Promise<string | undefined> => {
-    if (showIdRestCache) return showIdRestCache;
-    const fresh = await hydrateShowIdViaRest();
-    if (fresh) showIdRestCache = fresh;
+  const fetchActiveChatContextFromApi = async (): Promise<ChatContext | undefined> => {
+    if (chatContextRestCache) return chatContextRestCache;
+    const fresh = await hydrateChatContextViaRest();
+    if (fresh) chatContextRestCache = fresh;
     return fresh;
   };
   /**
-   * v0.1.28: force-refresh used as `refreshShowId` on the retry path AFTER
-   * a 404. Invalidates BOTH the REST cache AND the WS-sniffed value (so
-   * `chat.getShowId()` returns undefined until a new frame lands), then
-   * re-hits the REST API. The returned value is cached as the new
+   * Force-refresh used as `refreshContext` on the retry path AFTER a 404.
+   * Invalidates BOTH the REST cache AND the WS-sniffed context (so
+   * `chat.getChatContext()` returns `{}` until a new frame lands), then
+   * re-hits the REST API. The returned context is cached as the new
    * authority. If the REST API also returns nothing (no active in-progress
-   * event), we return undefined and the retry POSTs without showId —
-   * Restream will 404 again and the user sees the "no active show" error.
+   * event), we return undefined and the retry POSTs with an empty context
+   * — Restream will 404 again and the user sees the "no active show" error.
+   *
+   * v0.1.34: renamed from `refreshShowIdForce`.
    */
-  const refreshShowIdForce = async (): Promise<string | undefined> => {
-    showIdRestCache = undefined;
+  const refreshChatContextForce = async (): Promise<ChatContext | undefined> => {
+    chatContextRestCache = undefined;
     try {
-      chat.invalidateShowId();
+      chat.invalidateChatContext();
     } catch (err) {
-      console.error('[main] chat.invalidateShowId failed', err);
+      console.error('[main] chat.invalidateChatContext failed', err);
     }
-    const fresh = await hydrateShowIdViaRest();
-    if (fresh) showIdRestCache = fresh;
+    const fresh = await hydrateChatContextViaRest();
+    if (fresh) chatContextRestCache = fresh;
     return fresh;
   };
 
   // Reset the REST cache whenever the WS reconnects — that value is
   // authoritative once seen, and a stale REST cache could smuggle the
-  // wrong show across an account switch / reconnect.
+  // wrong context across an account switch / reconnect.
   chat.on('state', (s) => {
     if (s.status === 'connecting' || s.status === 'reconnecting') {
-      showIdRestCache = undefined;
+      chatContextRestCache = undefined;
     }
   });
 
-  // ---- v0.1.28: periodic showId refresh (10-minute interval) ----------
+  // ---- Periodic chat-context refresh (10-minute interval) ------------
   // While the WS is connected, re-hit the REST API every 10 minutes and
   // overwrite the cache. Catches the "stream ended hours ago but the app
   // kept running" case before the user hits send and gets a 404. Only
   // armed while connected; torn down on disconnect / reconnect / app quit
   // so we don't waste API calls when the WS is down.
-  const SHOW_ID_REFRESH_INTERVAL_MS = 10 * 60_000; // 10 minutes
-  let showIdRefreshTimer: NodeJS.Timeout | undefined;
-  const stopShowIdRefresh = (): void => {
-    if (showIdRefreshTimer) {
-      clearInterval(showIdRefreshTimer);
-      showIdRefreshTimer = undefined;
+  const CHAT_CTX_REFRESH_INTERVAL_MS = 10 * 60_000; // 10 minutes
+  let chatContextRefreshTimer: NodeJS.Timeout | undefined;
+  const stopChatContextRefresh = (): void => {
+    if (chatContextRefreshTimer) {
+      clearInterval(chatContextRefreshTimer);
+      chatContextRefreshTimer = undefined;
     }
   };
-  const startShowIdRefresh = (): void => {
-    stopShowIdRefresh();
-    showIdRefreshTimer = setInterval(() => {
+  const startChatContextRefresh = (): void => {
+    stopChatContextRefresh();
+    chatContextRefreshTimer = setInterval(() => {
       void (async () => {
         try {
-          const fresh = await hydrateShowIdViaRest();
+          const fresh = await hydrateChatContextViaRest();
           if (fresh) {
             // Overwrite cache unconditionally — the REST endpoint is the
             // authoritative "currently in-progress" signal for the user's
             // primary event. The WS-sniffed value stays untouched (it's
             // still the canonical "what arrived on the wire") but the
             // cache used by the send path is now fresh.
-            showIdRestCache = fresh;
+            chatContextRestCache = fresh;
           } else {
             // No in-progress event — invalidate cache so the next send
             // falls through to the 404 → no-show-id error rather than
-            // POSTing with a stale id.
-            showIdRestCache = undefined;
+            // POSTing with a stale context.
+            chatContextRestCache = undefined;
           }
         } catch (err) {
-          console.warn('[main] periodic showId refresh threw', err);
+          console.warn('[main] periodic chat-context refresh threw', err);
         }
       })();
-    }, SHOW_ID_REFRESH_INTERVAL_MS);
+    }, CHAT_CTX_REFRESH_INTERVAL_MS);
   };
   chat.on('state', (s) => {
     if (s.status === 'connected') {
-      startShowIdRefresh();
+      startChatContextRefresh();
     } else if (
       s.status === 'connecting' ||
       s.status === 'reconnecting' ||
@@ -1273,10 +1102,10 @@ app.on('ready', async () => {
       s.status === 'error'
     ) {
       // Cancel on any transition out of connected. Re-armed on next connect.
-      stopShowIdRefresh();
+      stopChatContextRefresh();
     }
   });
-  app.on('before-quit', () => stopShowIdRefresh());
+  app.on('before-quit', () => stopChatContextRefresh());
 
   // ---- v0.1.28: dedicated chat-send.jsonl log -------------------------
   // The Compose-window logger only captures requests originating from the
@@ -1336,9 +1165,12 @@ app.on('ready', async () => {
       const result = await sendChatText({
         text: rawText,
         connections: chat.getConnections(),
-        showId: chat.getShowId(),
-        fetchShowId: fetchActiveShowIdFromApi,
-        refreshShowId: refreshShowIdForce,
+        // v0.1.34: full chat-context union (showId | eventId | instant)
+        // sniffed from the WS, merged with whatever the REST hydration
+        // hook returns inside chat-send.ts.
+        context: chat.getChatContext(),
+        fetchContext: fetchActiveChatContextFromApi,
+        refreshContext: refreshChatContextForce,
         log: appendChatSendLog,
         parentWindow: mainWindow,
       });

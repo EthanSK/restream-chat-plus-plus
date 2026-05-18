@@ -9,6 +9,7 @@ import type {
   ConnectionState,
   Platform,
 } from '../shared/types';
+import type { ChatContext } from './chat-send';
 import { normalizeRestreamEventDetailed } from './normalize';
 
 /**
@@ -74,21 +75,29 @@ export class ChatClient extends EventEmitter {
   private connections = new Map<string, ChatConnection>();
 
   /**
-   * The current Restream `showId` — a per-account "show" identifier that
-   * Restream's backend requires on `POST /api/v2/client/reply` to know which
-   * show's connections the reply should fan out to. Without it the endpoint
-   * returns 404 (no show context), which is the bug the v0.1.17 inline-send
-   * fix targets.
+   * The current Restream chat context — the `{showId, eventId, instant}`
+   * triple-tagged union the chat backend uses to scope a `POST /client/reply`
+   * to the right show/event/instant stream. Exactly one field is
+   * authoritative on any given WS session.
    *
-   * We sniff it from incoming WS frames — every `event` and `reply_created`
-   * frame carries `payload.showId` set to the same value for the lifetime of
-   * the WS connection. We store the latest seen value and expose it via
-   * `getShowId()` so the inline send can include it in the POST body.
+   * v0.1.34: replaced the legacy `showId?: string` field. The previous
+   * code treated `/v2/user/events/in-progress[0].id` as a showId, but
+   * Restream's public docs make clear that `id` is an **event** id; the
+   * chat backend expects `eventId` in the body when scoping by that. The
+   * live chat.restream.io webchat reads all three identifiers from URL
+   * params and sends whichever is set, in priority `showId > eventId >
+   * instant`. We mirror that contract here.
    *
-   * Reset on every fresh WS connect so a reconnect doesn't smuggle a stale
-   * showId across an account switch.
+   * We sniff `eventId` and `showId` from incoming WS frames — every
+   * `event` and `reply_created` frame carries one or both. Frames don't
+   * carry `instant` directly; that comes from the REST hydration path
+   * (a `/v2/user/events/in-progress` entry whose `id === "rtmp/instant"`
+   * or whose scheduling fields are null).
+   *
+   * Reset on every fresh WS connect so a reconnect doesn't smuggle a
+   * stale context across an account switch.
    */
-  private showId?: string;
+  private chatContext: ChatContext = {};
 
   setToken(token: string) {
     this.accessToken = token;
@@ -157,26 +166,32 @@ export class ChatClient extends EventEmitter {
   }
 
   /**
-   * Latest `showId` sniffed from incoming WS frames, or undefined if none has
-   * been seen yet (e.g. WS just connected, no events / replies received). The
-   * inline send path threads this into the `POST /client/reply` body — see
-   * the field-level comment on `this.showId` above for the why.
+   * Snapshot the latest chat context sniffed from incoming WS frames
+   * (`{showId, eventId, instant}`). Empty `{}` if no frame has been seen
+   * yet (e.g. WS just connected, no events / replies received). The inline
+   * send path threads this into the `POST /client/reply` body — see the
+   * field-level comment on `this.chatContext` above for the why.
+   *
+   * v0.1.34: replaces `getShowId(): string | undefined`. Returns a shallow
+   * copy so callers can't mutate internal state.
    */
-  getShowId(): string | undefined {
-    return this.showId;
+  getChatContext(): ChatContext {
+    return { ...this.chatContext };
   }
 
   /**
-   * v0.1.28: drop the cached `showId` without tearing down the WS. Used by
-   * the inline-send retry path when a POST 404s — the showId we held was
+   * Drop the cached chat context without tearing down the WS. Used by the
+   * inline-send retry path when a POST 404s — the context we held was
    * stale-but-present (Restream returned the format-valid value across an
-   * `event_ended` boundary, or the user re-streamed and the show id rolled
-   * over). The next sniff on an incoming frame will re-populate it; until
-   * then `getShowId()` returns undefined so the send path falls back to a
-   * REST hydration.
+   * `event_ended` boundary, or the user re-streamed and the event id
+   * rolled over). The next sniff on an incoming frame will re-populate
+   * it; until then `getChatContext()` returns `{}` so the send path falls
+   * back to a REST hydration.
+   *
+   * v0.1.34: replaces `invalidateShowId()`.
    */
-  invalidateShowId(): void {
-    this.showId = undefined;
+  invalidateChatContext(): void {
+    this.chatContext = {};
   }
 
   /**
@@ -205,9 +220,10 @@ export class ChatClient extends EventEmitter {
       this.connections.clear();
       this.emit('connections', this.getConnections());
     }
-    // Drop any cached showId — a reconnect may be onto a different account /
-    // show. We'll re-sniff it from the first event / reply frame we see.
-    this.showId = undefined;
+    // Drop any cached chat context — a reconnect may be onto a different
+    // account / event / show. We'll re-sniff it from the first event /
+    // reply frame we see. v0.1.34.
+    this.chatContext = {};
     this.setState({
       status: this.attempt === 0 ? 'connecting' : 'reconnecting',
       attempt: this.attempt,
@@ -234,16 +250,32 @@ export class ChatClient extends EventEmitter {
       this.appendRawLog({ kind: 'frame', frame: parsed });
       this.emit('raw', parsed);
 
-      // Sniff `showId` from any frame that carries one (`event`,
-      // `reply_created`, etc). Restream's `POST /client/reply` requires
-      // showId in the body or it 404s — v0.1.17 inline-send fix. Cache the
-      // latest non-empty value; subsequent frames with the same value are
-      // idempotent. We don't gate on action type because the show context
-      // is the same across all frames in a given WS session.
+      // v0.1.34: sniff the full chat context (`showId`, `eventId`,
+      // `instant`) from any frame that carries one (`event`,
+      // `reply_created`, etc). Restream's `POST /client/reply` accepts
+      // exactly one of these as the scope identifier — see chat-send.ts
+      // for the priority order. Cache the latest non-empty values;
+      // subsequent frames with the same values are idempotent. We don't
+      // gate on action type because the chat context is the same across
+      // all frames in a given WS session.
       try {
-        const pid = (parsed as any)?.payload?.showId;
-        if (typeof pid === 'string' && pid && pid !== this.showId) {
-          this.showId = pid;
+        const payload = (parsed as any)?.payload;
+        if (payload && typeof payload === 'object') {
+          const sid = payload.showId;
+          if (typeof sid === 'string' && sid && sid !== this.chatContext.showId) {
+            this.chatContext.showId = sid;
+          }
+          const eid = payload.eventId;
+          if (typeof eid === 'string' && eid && eid !== this.chatContext.eventId) {
+            this.chatContext.eventId = eid;
+          }
+          // Restream's payloads occasionally include a boolean `instant`
+          // flag (true on RTMP/instant streams). We mirror it so the
+          // chat-send body can carry `instant: true` for streams that
+          // have no scheduled-event id.
+          if (payload.instant === true && !this.chatContext.instant) {
+            this.chatContext.instant = true;
+          }
         }
       } catch {
         // never break delivery on a sniff failure

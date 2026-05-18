@@ -22,13 +22,17 @@
 import type { Settings } from '../shared/types';
 import type { TokenSet } from './oauth';
 
+/**
+ * @deprecated v0.1.34: the native Compose window was removed. The
+ * `composeWindow` key may still exist on disk from v0.1.32-v0.1.33
+ * installs — kept in the schema so reads don't break, but no code writes
+ * it any more and a future cleanup can drop the property entirely.
+ */
 export interface ComposeWindowBounds {
   width: number;
   height: number;
-  /** Screen-coordinate position. Undefined on first ever open. */
   x?: number;
   y?: number;
-  /** User preference to keep the compose window above other apps. */
   alwaysOnTop?: boolean;
 }
 
@@ -49,10 +53,10 @@ export interface StoreSchema {
   tokenEnc?: string;
   settings?: Settings;
   /**
-   * v0.1.32: persisted Compose-window bounds + always-on-top preference.
-   * Restored on next open so the user's preferred size/position survives
-   * across sessions. Sanitised through `clampComposeBounds` before reuse
-   * to defend against off-screen restores and pathological dimensions.
+   * @deprecated v0.1.34: persisted Compose-window bounds from v0.1.32-v0.1.33.
+   * The Compose window was removed in v0.1.34 — the field stays in the
+   * schema so that loading old store JSON doesn't error, but no code
+   * reads or writes it any more.
    */
   composeWindow?: ComposeWindowBounds;
 }

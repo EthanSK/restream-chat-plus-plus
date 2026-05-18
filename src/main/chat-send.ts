@@ -23,15 +23,48 @@ function getElectron(): {
 }
 
 /**
- * Inline chat send for v0.1.14 — POSTs a reply to Restream's internal
- * `POST /api/v2/client/reply` endpoint using the chat-session cookies
- * provisioned in the `persist:restream-oauth` Electron partition (the
- * same partition that hosts the Compose window).
+ * Inline chat send — POSTs a reply to Restream's internal `/client/reply`
+ * endpoint using the chat-session cookies provisioned in the
+ * `persist:restream-oauth` Electron partition.
  *
- * Reverse-engineering notes (lifted from the v0.1.12 chat-frontend
- * bundle and the v0.1.13 compose-requests.jsonl capture):
+ * v0.1.34 — endpoint + body-shape rewrite. The previous reverse-engineering
+ * (v0.1.12 → v0.1.33) had two errors that compounded into the
+ * "no active Restream show" send failure Ethan saw while actively streaming:
  *
- *   URL:     https://backend.chat.restream.io/api/v2/client/reply
+ *   1. WRONG ENDPOINT. We were POSTing to `/api/v2/client/reply` — that
+ *      route does not exist on Restream's backend. A live probe returns
+ *      "404 page not found" (plain text) regardless of body. The correct
+ *      path the live `chat.restream.io` webchat uses TODAY is
+ *      `/api/client/reply` (no `/v2/` prefix). Confirmed by inspecting
+ *      https://chat.restream.io/static/js/main.5700cb99.js and probing
+ *      both routes directly (v1 returns 401 unauthorized — i.e. route
+ *      exists, just needs auth — while v2 returns 404 plain text).
+ *
+ *   2. NARROW BODY SHAPE. The live webchat sends ONE of three identifiers
+ *      depending on the chat context, in priority order:
+ *        showId  > eventId  > instant
+ *      The webchat reads them from URL query params (`?show-id=`,
+ *      `?event-id=`, `?instant=true`) on the chat embed. Restream's own
+ *      bundle priority order (lifted verbatim from main.5700cb99.js):
+ *        postClientReplyMessage({connectionIdentifiers, clientReplyUuid,
+ *                                text, showId, eventId, instant}) =>
+ *          showId  ? {...base, showId}  :
+ *          eventId ? {...base, eventId} :
+ *          instant ? {...base, instant} :
+ *          base
+ *      RC++ only ever sent `showId` (with the wrong VALUE — see (3)). When
+ *      the user has an instant stream (RTMP/instant), the chat needs
+ *      `eventId: <event-id>` OR `instant: true` — the showId branch never
+ *      matches.
+ *
+ *   3. WRONG IDENTIFIER NAME. The `/v2/user/events/in-progress` REST
+ *      endpoint returns objects whose `id` is the **event ID**, per
+ *      Restream's public docs. v0.1.20-v0.1.33 fed that id into the body
+ *      as `showId`. Even on the (hypothetical) correct endpoint that
+ *      would still fail validation because the chat backend would expect
+ *      a real showId, not an event id.
+ *
+ *   URL:     https://backend.chat.restream.io/api/client/reply
  *   Method:  POST
  *   Headers:
  *     content-type:   application/json
@@ -41,33 +74,33 @@ function getElectron(): {
  *     accept:         application/json, text/plain, * / *
  *     cookie:         <serialized .restream.io session cookies>
  *   Body (JSON):
- *     { connectionIdentifiers: string[], clientReplyUuid: string,
- *       text: string, showId: string }
- *
- *   v0.1.17 fix: previously we omitted `showId` and the endpoint returned
- *   404 ("send failed (HTTP 404)"). The Restream backend uses showId to
- *   resolve the active show whose connections the reply should fan out to
- *   — without it there is no show context and the request 404s. The
- *   `ws-client` sniffs the showId from every incoming `event` /
- *   `reply_created` frame and exposes it via `chat.getShowId()`; the IPC
- *   handler in `main.ts` threads that into `sendChatText`.
+ *     base = { connectionIdentifiers: string[], clientReplyUuid: string,
+ *              text: string }
+ *     // exactly one of these, in priority order showId > eventId > instant:
+ *     + { showId: string }   OR
+ *     + { eventId: string }  OR
+ *     + { instant: true }    OR
+ *     + (none — backend may still accept and resolve from session)
  *
  * The successful send is echoed back via the WebSocket as a `reply_created`
  * frame — our `normalize.ts` already surfaces those as `self: true`
  * ChatMessages, so the renderer does NOT optimistically render anything.
  *
  * Cold-start path: when the partition has no chat-session cookies yet,
- * we spawn an invisible Compose window (`show: false`) pointing at
- * `https://chat.restream.io` and wait up to 8 seconds for cookies to
- * appear. Once they do, we close the helper window and retry the send.
- * If the cold-start probe times out (e.g. user isn't logged into chat
- * yet) we surface `no-session-cookies` so the renderer can prompt the
- * user to click Compose manually.
+ * we spawn an invisible helper window pointing at `https://chat.restream.io`
+ * and wait up to 8 seconds for cookies to appear. The helper window is
+ * destroyed before the function returns.
  */
 
 const PARTITION = 'persist:restream-oauth';
 const RESTREAM_DOMAIN = '.restream.io';
-const SEND_URL = 'https://backend.chat.restream.io/api/v2/client/reply';
+/**
+ * v0.1.34: corrected from `/api/v2/client/reply` (404 ghost route) to
+ * `/api/client/reply` (the real path on Restream's chat backend, matching
+ * what the live chat.restream.io webchat bundle posts to). Keep in sync
+ * with `src/__tests__/chat-send.test.ts` if you change this.
+ */
+const SEND_URL = 'https://backend.chat.restream.io/api/client/reply';
 const COLD_START_TIMEOUT_MS = 8000;
 const COLD_START_POLL_MS = 250;
 
@@ -194,51 +227,79 @@ function buildHeaders(cookieHeader: string, xsrf: string): Record<string, string
   };
 }
 
+/**
+ * The triple-tagged union Restream's chat backend accepts as the
+ * authoritative "which show / event / instant stream is this reply
+ * for" identifier. Exactly ONE field is sent in the POST body in the
+ * priority order showId > eventId > instant (matching the live
+ * chat.restream.io webchat). All three may be undefined — in which
+ * case the body omits the identifier entirely and lets Restream try to
+ * resolve from session state.
+ *
+ * v0.1.34: replaced the showId-only contract from v0.1.20-v0.1.33. The
+ * /v2/user/events/in-progress REST endpoint returns objects whose `id`
+ * is the EVENT id, not a showId — so the old code was sending an event
+ * id under the `showId` key, which Restream's validator rejects.
+ */
+export interface ChatContext {
+  /** Scheduled-event "show" identifier. Rarely populated for RC++ users today. */
+  showId?: string;
+  /** Event identifier — what `/v2/user/events/in-progress[0].id` actually is. */
+  eventId?: string;
+  /** True when the current stream is an instant (RTMP/instant) stream. */
+  instant?: boolean;
+}
+
 export interface ChatSendOptions {
   text: string;
   connections: ChatConnection[];
   /**
-   * The current Restream `showId` — included in the POST body when known.
+   * v0.1.34: the full chat context — exactly one of `showId`, `eventId`,
+   * `instant` is appended to the POST body in priority order. Any field
+   * may be undefined; if ALL are absent the POST is still attempted (the
+   * body omits the identifier entirely) and Restream may resolve from
+   * session state. Previously this was a single `showId?: string` field
+   * that conflated event-ids and show-ids.
    *
-   * The WS client sniffs it from any incoming `event` / `reply_created`
-   * frame (those carry `payload.showId`). Heartbeat + `connection_info` +
-   * `connection_closed` frames do NOT, so a freshly-connected session
-   * with no chat activity has `showId === undefined`.
-   *
-   * v0.1.20 fix: previously this was a hard gate — undefined → instant
-   * `no-show-id` reject so the user could never send before the first
-   * event flowed. Now we try the POST anyway; Restream's backend can
-   * sometimes resolve the show implicitly. Only after a 404 do we
-   * surface `no-show-id` with a clearer error message.
+   * The WS client sniffs `eventId` from incoming frames; for now `showId`
+   * and `instant` come only from the REST hydration path
+   * (`/v2/user/events/in-progress` → `{id, status, ...}` — the `id` is
+   * an event id, and `status==="in-progress"` with no scheduling info
+   * implies an instant stream).
    */
-  showId?: string;
+  context?: ChatContext;
   parentWindow: BrowserWindow | null;
   /**
-   * Optional async hook called when `showId` is undefined, BEFORE the POST.
-   * Lets the main process try to hydrate the showId from the public REST
-   * API (`/v2/user/events/in-progress`). Returns a string to use as the
-   * showId for this send, or undefined to proceed without one. Called at
-   * most once per send. Injected by main.ts; unit tests pass a stub.
+   * Optional async hook called when `context` is missing all three fields,
+   * BEFORE the POST. Lets the main process try to hydrate the context from
+   * the public REST API (`/v2/user/events/in-progress`). Returns a context
+   * object to merge for this send, or undefined to proceed with the empty
+   * context. Called at most once per send. Injected by main.ts; unit tests
+   * pass a stub.
+   *
+   * v0.1.34: renamed from `fetchShowId` and now returns the full
+   * ChatContext union (eventId / showId / instant) instead of a bare string.
    */
-  fetchShowId?: () => Promise<string | undefined>;
+  fetchContext?: () => Promise<ChatContext | undefined>;
   /**
-   * v0.1.28: optional async hook called AFTER a 404 on the first POST. The
-   * cached showId (whether from `opts.showId` or `fetchShowId`) is treated
-   * as stale-but-present and invalidated; this hook is then called to force
-   * a fresh hydration (bypassing any in-process cache and re-hitting the
-   * REST API). The returned showId is used for a single retry POST. If the
+   * Optional async hook called AFTER a 404 on the first POST whose body
+   * already included a context. The cached context is treated as
+   * stale-but-present and invalidated; this hook is then called to force a
+   * fresh hydration (bypassing any in-process cache and re-hitting the REST
+   * API). The returned context is used for a single retry POST. If the
    * retry also 404s, we surface `no-show-id` to the user with the "No
-   * active show — start streaming" message.
+   * active show" message.
    *
    * Implementation in main.ts:
-   *   1. Clear `showIdRestCache` so the next REST hit isn't served stale.
-   *   2. Invalidate the WS-sniffed showId via `chat.invalidateShowId()`.
-   *   3. Re-hit `/v2/user/events/in-progress` and return the fresh value.
+   *   1. Clear `chatContextRestCache` so the next REST hit isn't served stale.
+   *   2. Invalidate the WS-sniffed eventId via `chat.invalidateChatContext()`.
+   *   3. Re-hit `/v2/user/events/in-progress` and return the fresh context.
    *
-   * Tests can pass a stub. When omitted, no retry is attempted (v0.1.20
-   * behaviour preserved).
+   * Tests can pass a stub. When omitted, no retry is attempted.
+   *
+   * v0.1.34: renamed from `refreshShowId`.
    */
-  refreshShowId?: () => Promise<string | undefined>;
+  refreshContext?: () => Promise<ChatContext | undefined>;
   /**
    * v0.1.28: optional callback fired with the full request/response record
    * for EVERY POST attempt (including retries). Main.ts wires this to a
@@ -398,14 +459,37 @@ async function performSend(args: {
 }
 
 /**
+ * v0.1.34: detect "404 page not found" — Restream's backend returns this
+ * plain-text body when the URL ROUTE is missing (e.g. the old
+ * `/api/v2/client/reply` path that doesn't exist). The "no active show"
+ * 404 path returns a JSON body instead. We use this to distinguish a
+ * route-misconfiguration 404 (treat as `send-failed` so the user sees an
+ * actionable HTTP error code, not the misleading "no active show" copy)
+ * from a real chat-backend 404 (the show genuinely isn't resolvable).
+ */
+function isRouteNotFound(bodyText: string | undefined): boolean {
+  if (!bodyText) return false;
+  // Restream's Go/Fiber gateway returns this exact string on unknown routes.
+  return /^404 page not found/i.test(bodyText.trim());
+}
+
+/**
  * Send a chat reply via Restream's internal endpoint. Pure with respect
  * to the WebSocket client — the reply will come back as a `reply_created`
  * frame which the existing normaliser surfaces as a self message.
  *
- * v0.1.28: on a 404 response we now treat the cached showId as STALE-but-
- * present, invalidate it via `refreshShowId`, and retry the POST once with
- * the fresh value. If the retry also 404s, return `no-show-id` with the
- * actionable "no active show" error.
+ * v0.1.34: corrects the endpoint URL (`/api/client/reply`, no `/v2/`),
+ * broadens the body shape to support the full `showId | eventId | instant`
+ * triple-tagged union the live chat.restream.io webchat sends, and
+ * tightens 404 handling so a route-misconfiguration 404 ("404 page not
+ * found" plain-text body) surfaces as `send-failed` instead of being
+ * misdiagnosed as `no-show-id`.
+ *
+ * Retry semantics: on a chat-backend 404 (i.e. NOT a route-not-found
+ * 404) we treat the cached context as STALE-but-present, invalidate it
+ * via `refreshContext`, and retry the POST once with the fresh value.
+ * If the retry also 404s, return `no-show-id` with the actionable
+ * "no active show" error.
  */
 export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResult> {
   const text = (opts.text ?? '').trim();
@@ -416,16 +500,19 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     return { ok: false, reason: 'no-active-connections' };
   }
 
-  // v0.1.20: showId is no longer a hard gate. If the WS hasn't sniffed
-  // one yet (just-connected, no event/reply frames received), give the
-  // REST API a chance to hydrate it from `/v2/user/events/in-progress`,
-  // then POST regardless. The backend may still 404 if there's no
-  // active show — we translate that into a friendlier `no-show-id`
-  // error AFTER the attempt rather than blocking pre-send.
-  let resolvedShowId: string | undefined = opts.showId;
-  if (!resolvedShowId && opts.fetchShowId) {
+  // Context is no longer a hard gate. If the WS hasn't sniffed an eventId
+  // yet (just-connected, no event/reply frames received), give the REST
+  // API a chance to hydrate via `/v2/user/events/in-progress`, then POST
+  // regardless. The backend may still 404 if there's no active show — we
+  // translate that into a friendlier `no-show-id` error AFTER the attempt
+  // rather than blocking pre-send.
+  let context: ChatContext = { ...(opts.context ?? {}) };
+  const contextIsEmpty = (c: ChatContext): boolean =>
+    !c.showId && !c.eventId && !c.instant;
+  if (contextIsEmpty(context) && opts.fetchContext) {
     try {
-      resolvedShowId = await opts.fetchShowId();
+      const hydrated = await opts.fetchContext();
+      if (hydrated) context = { ...context, ...hydrated };
     } catch {
       // Fall through — try-send-anyway is the fallback.
     }
@@ -448,17 +535,23 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
   // sees one outbound message regardless of attempt count.
   const clientReplyUuid = (opts.uuid ?? randomUUID)();
 
-  // Only include showId in the body when we actually have one. Restream's
-  // backend tolerates the field being absent (it then attempts to resolve
-  // the show from session state); omitting it is preferable to sending
-  // an explicit `null` or empty string, both of which can fail validation.
-  const buildBody = (showId: string | undefined): Record<string, unknown> => {
+  // Build the body per the live chat.restream.io webchat priority order:
+  //   showId  > eventId  > instant  > none
+  // Exactly one identifier (or zero) is emitted into the body. `instant`
+  // is serialised as a boolean (the webchat sends `instant: true`).
+  const buildBody = (ctx: ChatContext): Record<string, unknown> => {
     const obj: Record<string, unknown> = {
       connectionIdentifiers: ids,
       clientReplyUuid,
       text,
     };
-    if (showId) obj.showId = showId;
+    if (ctx.showId) {
+      obj.showId = ctx.showId;
+    } else if (ctx.eventId) {
+      obj.eventId = ctx.eventId;
+    } else if (ctx.instant) {
+      obj.instant = true;
+    }
     return obj;
   };
 
@@ -468,7 +561,7 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
   // ---- Attempt #1 -------------------------------------------------------
   const first = await performSend({
     url: SEND_URL,
-    bodyObj: buildBody(resolvedShowId),
+    bodyObj: buildBody(context),
     headers,
     fetchImpl,
     attempt: 1,
@@ -485,24 +578,39 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
   const firstRes = first.res!;
   if (firstRes.ok) return { ok: true };
 
-  // ---- Retry-on-404 with refreshed showId -------------------------------
-  // v0.1.28: if the first attempt 404'd, treat the showId we used as
-  // stale-but-present (Restream returns 404 both when there's NO show and
-  // when the show has ended — same status code, same body shape). Force a
-  // fresh REST hydration via opts.refreshShowId, then retry ONCE. If the
-  // fresh value differs from what we just sent, this recovers cleanly. If
-  // the fresh value is also missing or matches the stale one, the retry
-  // will 404 again and we surface `no-show-id` with the actionable error.
-  if (firstRes.status === 404 && opts.refreshShowId) {
-    let refreshedShowId: string | undefined;
+  // v0.1.34: route-not-found 404s ("404 page not found" plain text) are
+  // a deployment / version-skew failure — NOT a missing show. Surface
+  // them as `send-failed` so the user sees the HTTP code + body excerpt
+  // rather than the misleading "no active show" copy. The retry path
+  // below would also 404 against the same dead route, so short-circuit.
+  if (firstRes.status === 404 && isRouteNotFound(first.bodyText)) {
+    return {
+      ok: false,
+      reason: 'send-failed',
+      status: 404,
+      error: first.bodyText ? first.bodyText.slice(0, 240) : undefined,
+    };
+  }
+
+  // ---- Retry-on-404 with refreshed context -----------------------------
+  // If the first attempt 404'd at the chat backend (i.e. not a
+  // route-not-found 404), treat the context we used as stale-but-present
+  // (Restream returns 404 both when there's NO show and when the show has
+  // ended — same status, same body shape). Force a fresh REST hydration
+  // via opts.refreshContext, then retry ONCE. If the fresh context differs
+  // from what we just sent, this recovers cleanly. If the fresh context
+  // is also missing or matches the stale one, the retry will 404 again
+  // and we surface `no-show-id` with the actionable error.
+  if (firstRes.status === 404 && opts.refreshContext) {
+    let refreshedContext: ChatContext | undefined;
     try {
-      refreshedShowId = await opts.refreshShowId();
+      refreshedContext = await opts.refreshContext();
     } catch {
-      refreshedShowId = undefined;
+      refreshedContext = undefined;
     }
     const second = await performSend({
       url: SEND_URL,
-      bodyObj: buildBody(refreshedShowId),
+      bodyObj: buildBody(refreshedContext ?? {}),
       headers,
       fetchImpl,
       attempt: 2,
@@ -518,9 +626,18 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     }
     const secondRes = second.res!;
     if (secondRes.ok) return { ok: true };
-    // Retry failed too. If it's another 404, the user genuinely has no
-    // active show — surface the actionable error. Anything else falls
-    // through to send-failed using the SECOND response.
+    // Route-not-found on the retry is also `send-failed`.
+    if (secondRes.status === 404 && isRouteNotFound(second.bodyText)) {
+      return {
+        ok: false,
+        reason: 'send-failed',
+        status: 404,
+        error: second.bodyText ? second.bodyText.slice(0, 240) : undefined,
+      };
+    }
+    // Retry failed too. If it's another (chat-backend) 404, the user
+    // genuinely has no active show — surface the actionable error.
+    // Anything else falls through to send-failed using the SECOND response.
     if (secondRes.status === 404) {
       return {
         ok: false,
@@ -539,9 +656,10 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
   }
 
   // ---- No retry available (or non-404 first response) -------------------
-  // v0.1.20 compatibility: a 404 with no showId AND no refresh hook still
-  // surfaces as `no-show-id` so the v0.1.20 contract isn't regressed.
-  if (firstRes.status === 404 && !resolvedShowId) {
+  // Back-compat: a chat-backend 404 with no context AND no refresh hook
+  // still surfaces as `no-show-id` so the v0.1.20 contract isn't
+  // regressed for code paths that don't wire a refresh hook.
+  if (firstRes.status === 404 && contextIsEmpty(context)) {
     return {
       ok: false,
       reason: 'no-show-id',

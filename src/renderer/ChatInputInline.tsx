@@ -8,10 +8,10 @@ interface Props {
 }
 
 /**
- * Inline chat input bar (v0.1.14).
+ * Inline chat input bar.
  *
  * Sits at the bottom of the main feed and POSTs directly to Restream's
- * internal `/api/v2/client/reply` endpoint via the main-process handler
+ * internal `/client/reply` endpoint via the main-process handler
  * (`CHAT_SEND_TEXT`). Successful sends DO NOT optimistically render —
  * Restream's WS rebroadcasts the message as a `reply_created` frame
  * which our normaliser already surfaces as a `self: true` ChatMessage
@@ -22,14 +22,17 @@ interface Props {
  *   - Shift+Enter     — newline
  *   - Cmd/Ctrl+Enter  — also sends (matches Slack/Discord muscle memory)
  *
- * Fallback: a small "Compose" button next to the input opens Restream's
- * official webchat in a separate BrowserWindow. This is the recovery path
- * for "Cookie expired — click Compose to refresh session" + for anyone
- * who wants Restream's full reply UI (emoji, per-platform targeting, etc).
+ * v0.1.34: the separate "Compose" window (v0.1.32-v0.1.33) was a wash —
+ * it called the SAME `rcpp.sendChatText` IPC as this inline input, so
+ * any send bug here also broke Compose. Removing it kept the surface
+ * area honest. The "Open Restream webchat" escape-hatch button remains
+ * (next to send) for users who need Restream's full reply UI
+ * (emoji picker, per-platform channel targeting) or to refresh expired
+ * session cookies.
  *
  * The cold-start cookie provisioning is handled transparently in the
  * main process — first send may take a beat while it spawns an invisible
- * Compose window to populate `persist:restream-oauth`'s cookie jar.
+ * helper window to populate `persist:restream-oauth`'s cookie jar.
  */
 export function ChatInputInline({
   authenticated,
@@ -37,11 +40,13 @@ export function ChatInputInline({
 }: Props): React.ReactElement | null {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
-  const [composing, setComposing] = useState(false);
+  const [openingWebchat, setOpeningWebchat] = useState(false);
   const [err, setErr] = useState<string | undefined>();
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Auto-grow the textarea height as the user types (max 4 visible lines).
+  // Auto-grow the textarea height as the user types (cap at 6 visible lines
+  // ~= 144px). v0.1.34: bumped from 4 lines (96px) since the separate
+  // Compose window was removed — multi-line composition now happens here.
   //
   // IMPORTANT: This hook MUST sit ABOVE the `if (!authenticated) return null`
   // early-return below. Hooks must run in the same order on every render —
@@ -59,7 +64,7 @@ export function ChatInputInline({
     const el = taRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = Math.min(96, el.scrollHeight) + 'px';
+    el.style.height = Math.min(144, el.scrollHeight) + 'px';
   }, [text, authenticated]);
 
   // Hide entirely until the user is signed in. MUST stay below ALL hooks.
@@ -86,18 +91,18 @@ export function ChatInputInline({
     }
   };
 
-  const onCompose = async () => {
-    setComposing(true);
+  const onOpenWebchat = async () => {
+    setOpeningWebchat(true);
     setErr(undefined);
     try {
-      const result = await rcpp.openCompose();
+      const result = await rcpp.openRestreamWebchat();
       if (!result.ok) {
-        setErr(prettyComposeReason(result.reason));
+        setErr(prettyWebchatReason(result.reason));
       }
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
     } finally {
-      setTimeout(() => setComposing(false), 250);
+      setTimeout(() => setOpeningWebchat(false), 250);
     }
   };
 
@@ -154,12 +159,12 @@ export function ChatInputInline({
       <button
         type="button"
         className="btn ghost chat-input-compose-fallback"
-        onClick={() => void onCompose()}
-        disabled={composing}
-        title="Open Restream's official webchat compose window"
-        aria-label="Open Compose window"
+        onClick={() => void onOpenWebchat()}
+        disabled={openingWebchat}
+        title="Open Restream's official webchat (emoji picker, per-platform targeting, cookie refresh)"
+        aria-label="Open Restream webchat"
       >
-        {composing ? 'Opening…' : 'Compose'}
+        {openingWebchat ? 'Opening…' : 'Webchat'}
       </button>
       {err && <span className="chat-input-err">{err}</span>}
     </div>
@@ -171,13 +176,13 @@ function prettyReason(result: SendTextResult): string {
     case 'not-authenticated':
       return 'Sign in to Restream first.';
     case 'no-session-cookies':
-      return 'Chat session not provisioned — click Compose once to sign in to chat.';
+      return 'Chat session not provisioned — open Webchat once to sign in to chat.';
     case 'no-active-connections':
       return 'No connected channels to reply to.';
     case 'no-show-id':
-      return 'No active Restream show — start streaming (or send one message from Restream’s website) so we can pick up the show.';
+      return 'No active Restream show — start streaming (or send one message from Restream’s website) so we can pick up the event.';
     case 'send-failed':
-      return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}. Click Compose to refresh session.`;
+      return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}. Open Webchat to refresh session.`;
     case 'error':
       return result.error ?? 'Send failed.';
     default:
@@ -185,14 +190,17 @@ function prettyReason(result: SendTextResult): string {
   }
 }
 
-function prettyComposeReason(
-  reason: 'not-authenticated' | 'error',
+function prettyWebchatReason(
+  reason: 'not-authenticated' | 'webchat-fetch-failed' | 'no-webchat-url' | 'error',
 ): string {
   switch (reason) {
     case 'not-authenticated':
       return 'Sign in to Restream first.';
+    case 'webchat-fetch-failed':
+    case 'no-webchat-url':
+      return 'Could not fetch the webchat URL from Restream.';
     case 'error':
     default:
-      return 'Failed to open compose window.';
+      return 'Failed to open Restream webchat.';
   }
 }

@@ -248,56 +248,33 @@ export const IPC = {
   /** Pull-fetch counterpart so the renderer can sync on mount. */
   CONNECTIONS_GET: 'connections:get',
   /**
-   * Open the native React Compose window (v0.1.32+). Spawns a small
-   * BrowserWindow that loads the same renderer bundle with `?compose=1`,
-   * which renders a compose-only UI (multi-line textarea + send button +
-   * always-on-top toggle + an escape-hatch "Open Restream webchat" link).
-   * The send button posts via the same `CHAT_SEND_TEXT` IPC the inline
-   * input uses, so the reply round-trips through Restream's normal
-   * `/client/reply` endpoint and surfaces back as a `self: true`
-   * ChatMessage in the feed.
+   * Open Restream's official webchat at https://chat.restream.io in a
+   * dedicated BrowserWindow. Escape hatch for users who need Restream's
+   * full reply UI (emoji picker, per-platform channel targeting) or to
+   * refresh expired session cookies. Bound to the "Webchat" ghost button
+   * next to the inline send arrow.
    *
-   * Pre-v0.1.32 this opened Restream's official webchat (chat.restream.io)
-   * in a 720x720 BrowserWindow — that page's intrinsic min-widths forced
-   * the window to be much larger than a compose UI needs. The escape
-   * hatch (still useful for emoji-picker / per-platform targeting / cookie
-   * refresh) lives behind a button INSIDE the new compose window now —
-   * see `CHAT_OPEN_RESTREAM_WEBCHAT`.
-   */
-  CHAT_OPEN_COMPOSE: 'chat:open-compose',
-  /**
-   * v0.1.32: escape-hatch IPC fired from inside the native Compose window
-   * (and reusable from anywhere) to open Restream's official webchat at
-   * https://chat.restream.io in a separate BrowserWindow. This is the path
-   * for users who need Restream's full reply UI (emoji picker, per-platform
-   * channel targeting) or to refresh expired session cookies. Identical
-   * window setup to the pre-v0.1.32 Compose handler.
+   * v0.1.34: the native React Compose window that previously wrapped this
+   * (v0.1.32-v0.1.33) was removed — it duplicated the inline send path
+   * with no functional differentiation. See preload.ts `openRestreamWebchat`.
    */
   CHAT_OPEN_RESTREAM_WEBCHAT: 'chat:open-restream-webchat',
   /**
-   * v0.1.32: the Compose renderer (loaded with `?compose=1`) asks the main
-   * process for its initial state (the persisted `alwaysOnTop` preference)
-   * + whether the parent app is currently connected so it can disable the
-   * send button when offline. Resolves immediately.
-   */
-  COMPOSE_GET_INIT: 'compose:get-init',
-  /**
-   * v0.1.32: renderer → main toggle for the Compose window's always-on-top
-   * behaviour. Main updates the BrowserWindow's `alwaysOnTop` flag AND
-   * persists the new value to the store so the next launch restores it.
-   */
-  COMPOSE_SET_ALWAYS_ON_TOP: 'compose:set-always-on-top',
-  /**
    * Send a chat reply text directly via Restream's internal
-   * `POST /api/v2/client/reply` endpoint. The renderer's inline chat-input
-   * bar invokes this — no Compose window needed for the common case.
+   * `POST /api/client/reply` endpoint. The renderer's inline chat-input
+   * bar invokes this.
    *
    * Main process pulls the chat-session cookies from the
    * `persist:restream-oauth` Electron partition (provisioned when the user
-   * signed in / Compose was opened at least once), grabs the
+   * signed in or via the Webchat escape hatch), grabs the
    * `accessXsrfToken` cookie as the `x-axsrf-token` header, and POSTs the
    * body. The successful send is echoed back as a `reply_created` WS frame
    * which our normaliser already surfaces as a `self: true` ChatMessage.
+   *
+   * v0.1.34: endpoint corrected from `/api/v2/client/reply` (404 ghost
+   * route) to `/api/client/reply` (the real path the live chat.restream.io
+   * webchat posts to today). See `src/main/chat-send.ts` for the
+   * showId | eventId | instant body-shape union.
    */
   CHAT_SEND_TEXT: 'chat:send-text',
   /**

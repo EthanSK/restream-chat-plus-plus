@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Same fake-ws shape as ws-reconnect.test.ts so we can drive `message`
-// events synchronously and assert the showId-sniff path. v0.1.20.
+// events synchronously and assert the chat-context-sniff path. v0.1.20.
 vi.mock('ws', () => {
   const { EventEmitter } = require('node:events');
   class FakeWS extends EventEmitter {
@@ -36,7 +36,14 @@ function sendFrame(client: ChatClient, frame: unknown) {
   ws.emit('message', Buffer.from(JSON.stringify(frame)));
 }
 
-describe('ChatClient — showId sniff (v0.1.20)', () => {
+/**
+ * v0.1.34: tests renamed from "showId sniff" → "chatContext sniff" since
+ * the sniffer now picks up the full `{showId, eventId, instant}` union
+ * (was showId-only in v0.1.20-v0.1.33). The corresponding ws-client API
+ * also moved from `getShowId() / invalidateShowId()` →
+ * `getChatContext() / invalidateChatContext()`.
+ */
+describe('ChatClient — chat-context sniff', () => {
   beforeEach(() => {
     WS.instances = [];
     vi.useFakeTimers();
@@ -45,31 +52,31 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
     vi.useRealTimers();
   });
 
-  it('is undefined before any frame has arrived', () => {
+  it('is empty before any frame has arrived', () => {
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
     WS.instances[0].emit('open');
-    expect(client.getShowId()).toBeUndefined();
+    expect(client.getChatContext()).toEqual({});
     client.stop();
   });
 
-  it('stays undefined after only heartbeats — heartbeats carry no showId', () => {
+  it('stays empty after only heartbeats — heartbeats carry no context', () => {
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
     WS.instances[0].emit('open');
     sendFrame(client, { action: 'heartbeat', timestamp: 1 });
     sendFrame(client, { action: 'heartbeat', timestamp: 2 });
-    expect(client.getShowId()).toBeUndefined();
+    expect(client.getChatContext()).toEqual({});
     client.stop();
   });
 
-  it('stays undefined after only connection_info frames — those have no showId either', () => {
-    // This is the live-fire bug v0.1.20 fixes: connection_info frames flow
-    // on every WS connect even when the user isn't streaming, but they
-    // carry no showId. Pre-v0.1.20 the inline send was gated on showId,
-    // so users got "waiting for first chat frame" forever.
+  it('stays empty after only connection_info frames — those have no showId / eventId', () => {
+    // The live-fire bug v0.1.20 fixed: connection_info frames flow on
+    // every WS connect even when the user isn't streaming, but they
+    // carry no chat context. Pre-v0.1.20 the inline send was gated on
+    // showId, so users got "waiting for first chat frame" forever.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
@@ -85,11 +92,15 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
         userId: 5849342,
       },
     });
-    expect(client.getShowId()).toBeUndefined();
+    expect(client.getChatContext()).toEqual({});
     client.stop();
   });
 
-  it('sniffs showId from an incoming `event` frame', () => {
+  it('sniffs eventId from an incoming `event` frame', () => {
+    // v0.1.34: `event` frames carry an `eventId`, not a `showId`. The
+    // old test asserted `showId: "show-from-event"` but the live payload
+    // actually emits `eventId`. The chat backend wants eventId on the
+    // reply body anyway.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
@@ -98,17 +109,20 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
       action: 'event',
       payload: {
         connectionIdentifier: '1-twitch-x',
-        eventId: 'evt-1',
+        eventId: 'evt-from-event',
         eventIdentifier: 'ident-1',
         eventPayload: { author: { name: 'alice' }, text: 'hi' },
-        showId: 'show-from-event',
       },
     });
-    expect(client.getShowId()).toBe('show-from-event');
+    expect(client.getChatContext()).toEqual({ eventId: 'evt-from-event' });
     client.stop();
   });
 
-  it('sniffs showId from a `reply_created` frame', () => {
+  it('sniffs both showId AND eventId from a frame that carries both', () => {
+    // Defensive: some Restream frames may include both identifiers
+    // (e.g. a scheduled show with a backing event). The send-body builder
+    // applies the priority order showId > eventId; here we just verify
+    // both are captured by the sniffer.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
@@ -121,10 +135,34 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
         eventSourceId: 1,
         replyUuid: 'ruuid-1',
         showId: 'show-from-reply',
+        eventId: 'evt-from-reply',
         text: 'hi back',
       },
     });
-    expect(client.getShowId()).toBe('show-from-reply');
+    expect(client.getChatContext()).toEqual({
+      showId: 'show-from-reply',
+      eventId: 'evt-from-reply',
+    });
+    client.stop();
+  });
+
+  it('sniffs `instant: true` when a frame includes it', () => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    WS.instances[0].emit('open');
+    sendFrame(client, {
+      action: 'event',
+      payload: {
+        connectionIdentifier: '1-twitch-x',
+        eventId: 'rtmp/instant',
+        instant: true,
+      },
+    });
+    expect(client.getChatContext()).toEqual({
+      eventId: 'rtmp/instant',
+      instant: true,
+    });
     client.stop();
   });
 
@@ -133,9 +171,9 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
     // if Restream's backend ever starts emitting `payload.showId` on
     // connection_info frames (which would make the "no first chat frame"
     // problem fully self-healing without the REST fallback), we'll pick
-    // it up automatically without code changes. This test pins the
-    // behaviour so a future "only sniff event/reply frames" refactor
-    // doesn't silently regress it.
+    // it up automatically without code changes. Pins the behaviour so
+    // a future "only sniff event/reply frames" refactor doesn't silently
+    // regress it.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
@@ -149,38 +187,59 @@ describe('ChatClient — showId sniff (v0.1.20)', () => {
         status: 'connected',
         target: {},
         userId: 1,
-        // Hypothetical future field. Today Restream does NOT include this
-        // (verified against raw-frames.jsonl 2026-05-17) but if they
-        // do, we want zero-touch upgrades.
+        // Hypothetical future field.
         showId: 'hypothetical-show-id',
       },
     });
-    expect(client.getShowId()).toBe('hypothetical-show-id');
+    expect(client.getChatContext()).toEqual({ showId: 'hypothetical-show-id' });
     client.stop();
   });
 
-  it('resets showId on reconnect so a stale value cannot leak across account switches', () => {
+  it('resets chat context on reconnect so stale values cannot leak across account switches', () => {
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
     WS.instances[0].emit('open');
     sendFrame(client, {
       action: 'event',
-      payload: { showId: 'show-1' },
+      payload: { eventId: 'evt-1' },
     });
-    expect(client.getShowId()).toBe('show-1');
+    expect(client.getChatContext()).toEqual({ eventId: 'evt-1' });
 
-    // Force a reconnect. The new socket must start with showId undefined
+    // Force a reconnect. The new socket must start with empty context
     // — different stream / different account could be involved.
     client.reconnect();
     WS.instances[1].emit('open');
-    expect(client.getShowId()).toBeUndefined();
+    expect(client.getChatContext()).toEqual({});
 
     sendFrame(client, {
       action: 'event',
-      payload: { showId: 'show-2' },
+      payload: { eventId: 'evt-2' },
     });
-    expect(client.getShowId()).toBe('show-2');
+    expect(client.getChatContext()).toEqual({ eventId: 'evt-2' });
+    client.stop();
+  });
+
+  it('invalidateChatContext() clears the cached context without tearing down WS', () => {
+    // Used by the inline-send retry path on 404 — the context we held
+    // was stale-but-present, so we drop it and let the next REST hit
+    // re-hydrate. Verifies the new (v0.1.34) name doesn't drift from
+    // chat-send.ts's `refreshContext` hook.
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    WS.instances[0].emit('open');
+    sendFrame(client, {
+      action: 'event',
+      payload: { eventId: 'evt-stale', showId: 'show-stale' },
+    });
+    expect(client.getChatContext()).toEqual({
+      eventId: 'evt-stale',
+      showId: 'show-stale',
+    });
+
+    client.invalidateChatContext();
+    expect(client.getChatContext()).toEqual({});
     client.stop();
   });
 });
