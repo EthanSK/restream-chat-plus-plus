@@ -19,6 +19,7 @@ import { app, autoUpdater, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
 import { updateElectronApp, UpdateSourceType } from 'update-electron-app';
 import { IPC, UpdateInfo } from '../shared/types';
+import { performGithubUpdateCheck } from './github-update-check';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
 
@@ -303,72 +304,38 @@ async function safeMessageBox(
 }
 
 /**
- * Triggered by the "Check for Updates…" menu item. `update-electron-app`
- * doesn't expose a programmatic "check now" hook, so we rely on the
- * underlying `electron.autoUpdater` (Squirrel.Mac / NSIS) directly.
+ * Triggered by the "Check for Updates Now…" menu item.
  *
- * In dev / unsigned builds this just opens a friendly dialog explaining
- * that auto-update is unavailable and pointing at the releases page.
+ * v0.1.37 rewrite: this is now backed by the **GH-Releases pipeline**
+ * (`performGithubUpdateCheck`) so the user-facing dialog ALWAYS agrees
+ * with the in-app banner. Pre-v0.1.37 the menu used Squirrel's
+ * `autoUpdater.checkForUpdates()`, which on unsigned macOS builds
+ * resolves to `update-not-available` and shows "you're on the latest
+ * version" — even when GH Releases is reporting a newer release that
+ * the banner is already advertising. Voice 3351 flagged this two-
+ * sources-of-truth mismatch directly: "Your dialogue says you're on
+ * the latest version, but then the top banner says update available
+ * 0.1.36. Is it looking at a different source? Maybe that's the
+ * problem."
  *
- * IMPORTANT: this function must never throw synchronously. The Electron
- * menu-click dispatcher treats a synchronous throw from a click handler
- * as a failed action invocation, and macOS surfaces that to the user as
- * the cryptic system alert "this command is disabled and cannot be
- * executed". All known throw sites (native `autoUpdater.checkForUpdates()`
- * without a feed URL, `dialog.showMessageBox(null, ...)`) are caught and
- * converted into user-visible dialogs.
+ * After producing the authoritative GH-Releases verdict, this function
+ * ALSO kicks Squirrel's `autoUpdater.checkForUpdates()` in the
+ * background when the feed is ready (signed packaged builds) so the
+ * in-app download → restart-to-install flow still runs without the
+ * user needing to click Install on the banner. On unsigned / dev /
+ * Linux Squirrel is skipped entirely and the dialog offers an "Open
+ * Releases" button that drops the user on the GitHub release page.
+ *
+ * IMPORTANT: this function must never throw synchronously. The
+ * Electron menu-click dispatcher treats a sync throw as a failed
+ * action invocation and macOS surfaces it as the cryptic alert "this
+ * command is disabled and cannot be executed". All known throw sites
+ * are caught and converted into user-visible dialogs.
  */
 export async function checkForUpdatesInteractive(
   parent: BrowserWindow | null,
 ): Promise<void> {
   const owner = resolveParent(parent);
-
-  if (!app.isPackaged) {
-    const { response } = await safeMessageBox(owner, {
-      type: 'info',
-      message: 'Auto-update is only available in installed builds.',
-      detail:
-        'You are running a development build. Download a release from ' +
-        `https://github.com/${REPO}/releases`,
-      buttons: ['Open Releases', 'OK'],
-      defaultId: 1,
-      cancelId: 1,
-    });
-    if (response === 0) await shell.openExternal(`https://github.com/${REPO}/releases`);
-    return;
-  }
-
-  if (process.platform === 'linux') {
-    // Squirrel doesn't ship Linux updates; route Linux users to the
-    // releases page rather than throw.
-    const { response } = await safeMessageBox(owner, {
-      type: 'info',
-      message: 'Linux updates are delivered via .deb / .rpm packages.',
-      detail: `Grab the latest from https://github.com/${REPO}/releases`,
-      buttons: ['Open Releases', 'OK'],
-      defaultId: 1,
-      cancelId: 1,
-    });
-    if (response === 0) await shell.openExternal(`https://github.com/${REPO}/releases`);
-    return;
-  }
-
-  if (!feedURLReady) {
-    // configureAutoUpdater() never completed (e.g. unsigned packaged build
-    // where `updateElectronApp` threw because Squirrel.Mac refused the feed).
-    // Calling autoUpdater.checkForUpdates() here would throw "Update feed URL
-    // is not set" synchronously and trip the macOS "disabled" alert. Bail
-    // out gracefully instead.
-    await safeMessageBox(owner, {
-      type: 'warning',
-      message: 'Update service unavailable.',
-      detail:
-        `This build of Restream Chat++ ${app.getVersion()} is not connected to the update feed. ` +
-        `Download the latest release from https://github.com/${REPO}/releases instead.`,
-      buttons: ['OK'],
-    });
-    return;
-  }
 
   if (checkInFlight) {
     log.info('[updater] check already in flight, ignoring duplicate click');
@@ -377,74 +344,69 @@ export async function checkForUpdatesInteractive(
   checkInFlight = true;
 
   try {
-    // `autoUpdater` is imported at module scope (we need it for the
-    // Squirrel download-progress / update-downloaded forwarders); no need
-    // to lazy-require it inside this handler. v0.1.25.
+    // 1. Hit GH Releases — authoritative source. `performGithubUpdateCheck`
+    //    broadcasts `UPDATE_STATUS` so the banner state syncs to the
+    //    dialog automatically (no two-sources-of-truth window).
+    const info = await performGithubUpdateCheck(true);
 
-    // Settle the flow via the next emitted event. `update-not-available`,
-    // `update-downloaded`, or `error` are guaranteed to fire after a
-    // `checkForUpdates()` call on a configured autoUpdater.
-    let settled = false;
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      checkInFlight = false;
-      autoUpdater.removeListener('update-not-available', onNotAvailable);
-      autoUpdater.removeListener('update-available', onAvailable);
-      autoUpdater.removeListener('error', onError);
-    };
-
-    const onNotAvailable = () => {
-      settle();
-      void safeMessageBox(owner, {
+    // 2. Render dialog based on the GH-Releases verdict.
+    if (info.kind === 'available') {
+      const latest = info.latestVersion ?? '(unknown)';
+      const releaseUrl = info.releaseUrl ?? `https://github.com/${REPO}/releases`;
+      const detail =
+        `You're running ${info.currentVersion}. Latest is ${latest}.\n\n` +
+        (app.isPackaged && process.platform !== 'linux' && feedURLReady
+          ? "The update is downloading in the background — you'll be prompted to restart once it's ready."
+          : 'Open the release page to install manually (this build is not connected to the in-app update feed).');
+      const buttons = ['Open Release Page', 'OK'];
+      const { response } = await safeMessageBox(owner, {
         type: 'info',
-        message: `You're on the latest version (${app.getVersion()}).`,
+        message: `Update available (${latest}).`,
+        detail,
+        buttons,
+        defaultId: 1,
+        cancelId: 1,
+      });
+      if (response === 0) await shell.openExternal(releaseUrl);
+
+      // 3. Kick Squirrel in the background if it can actually run.
+      //    Wrapped in a try/catch because the native autoUpdater
+      //    throws synchronously if anything is misconfigured — we
+      //    don't want that to leak into the menu-click dispatcher.
+      if (app.isPackaged && process.platform !== 'linux' && feedURLReady) {
+        try {
+          log.info('[updater] kicking Squirrel checkForUpdates() from menu');
+          autoUpdater.checkForUpdates();
+        } catch (err) {
+          log.error('[updater] background Squirrel kick threw', err);
+        }
+      }
+    } else if (info.kind === 'up-to-date') {
+      await safeMessageBox(owner, {
+        type: 'info',
+        message: `You're on the latest version (${info.currentVersion}).`,
         buttons: ['OK'],
       });
-    };
-    const onAvailable = () => {
-      // `update-electron-app`'s `notifyUser: true` already wires the
-      // restart-to-update dialog on `update-downloaded`. We just need to
-      // tell the user the download has started.
-      settle();
-      void safeMessageBox(owner, {
-        type: 'info',
-        message: 'An update is available and is downloading in the background.',
-        detail: "You'll be prompted to restart once the download completes.",
-        buttons: ['OK'],
-      });
-    };
-    const onError = (err: Error) => {
-      settle();
-      log.error('[updater] check-now error', err);
-      void safeMessageBox(owner, {
+    } else if (info.kind === 'error') {
+      await safeMessageBox(owner, {
         type: 'warning',
         message: 'Update check failed.',
-        detail: String(err?.message ?? err),
+        detail: info.error ?? 'Unknown error.',
         buttons: ['OK'],
       });
-    };
-
-    autoUpdater.once('update-not-available', onNotAvailable);
-    autoUpdater.once('update-available', onAvailable);
-    autoUpdater.once('error', onError);
-
-    // Time out after 30s so the menu doesn't stay "in flight" forever on a
-    // silently-stalled network request.
-    setTimeout(() => {
-      if (settled) return;
-      settle();
-      void safeMessageBox(owner, {
-        type: 'warning',
-        message: 'Update check timed out.',
-        detail: 'The update service did not respond in time. Try again later.',
+    } else if (info.kind === 'disabled') {
+      // Forcing through performGithubUpdateCheck(true) should never
+      // resolve to `disabled` — `force=true` bypasses the autoCheck
+      // gate. Guard defensively anyway.
+      await safeMessageBox(owner, {
+        type: 'info',
+        message: 'Update checks are currently disabled in Settings.',
         buttons: ['OK'],
       });
-    }, 30_000);
-
-    autoUpdater.checkForUpdates();
+    }
+    // `checking` is transient — `performGithubUpdateCheck` resolves
+    // with a terminal kind, never `checking`, so we don't handle it.
   } catch (err) {
-    checkInFlight = false;
     log.error('[updater] interactive check failed', err);
     await safeMessageBox(owner, {
       type: 'warning',
@@ -452,5 +414,7 @@ export async function checkForUpdatesInteractive(
       detail: String((err as Error)?.message ?? err),
       buttons: ['OK'],
     });
+  } finally {
+    checkInFlight = false;
   }
 }

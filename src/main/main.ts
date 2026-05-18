@@ -1,7 +1,6 @@
 import {
   app,
   BrowserWindow,
-  dialog,
   ipcMain,
   Menu,
   Notification,
@@ -369,26 +368,25 @@ function buildMenu(onRevealLogs: () => void) {
                 id: 'check-for-updates-now',
                 label: 'Check for Updates Now…',
                 enabled: true,
-                // Two checks fire on click:
-                //   1. The GH-Releases poller — always works because no
-                //      signature check is involved. Surfaces the banner if
-                //      a newer release is published. This is the primary
-                //      signal for unsigned builds where Squirrel can't
-                //      auto-install.
-                //   2. The Squirrel/update-electron-app path — only useful
-                //      on signed builds; in dev / unsigned it shows an
-                //      info dialog pointing at the releases page. We keep
-                //      it because once signing lands it'll surface the
-                //      restart-to-update dialog.
+                // v0.1.37: `checkForUpdatesInteractive` now uses the
+                // GH-Releases pipeline as the authoritative source for
+                // the user-facing dialog (instead of Squirrel's
+                // `autoUpdater.checkForUpdates()`). Pre-v0.1.37 the
+                // dialog and the banner could disagree — on unsigned
+                // builds Squirrel reported "you're on the latest
+                // version" while GH-Releases said `available`. Voice
+                // 3351 called this out explicitly. The menu click
+                // therefore only needs ONE call now; the function
+                // internally also kicks Squirrel in the background on
+                // signed builds so the in-app pipeline still gets a
+                // chance to run.
                 //
-                // The click handler MUST NOT throw synchronously — Electron
-                // surfaces a sync throw as the macOS system alert "this
-                // command is disabled and cannot be executed". Wrap defensively.
+                // The click handler MUST NOT throw synchronously —
+                // Electron surfaces a sync throw as the macOS system
+                // alert "this command is disabled and cannot be
+                // executed". Wrap defensively.
                 click: () => {
                   try {
-                    void performGithubUpdateCheck(true).catch((err) =>
-                      console.error('[menu] gh-check-for-updates failed', err),
-                    );
                     void checkForUpdatesInteractive(mainWindow).catch((err) =>
                       console.error('[menu] check-for-updates failed', err),
                     );
@@ -484,11 +482,13 @@ function buildMenu(onRevealLogs: () => void) {
                 id: 'check-for-updates-help',
                 label: 'Check for Updates Now…',
                 enabled: true,
+                // v0.1.37: see Mac App-menu equivalent for the
+                // reconciliation rationale. Single GH-Releases-backed
+                // call; Squirrel kick is internal to
+                // `checkForUpdatesInteractive` so the dialog and the
+                // banner agree.
                 click: () => {
                   try {
-                    void performGithubUpdateCheck(true).catch((err) =>
-                      console.error('[menu] gh-check-for-updates failed', err),
-                    );
                     void checkForUpdatesInteractive(mainWindow).catch((err) =>
                       console.error('[menu] check-for-updates failed', err),
                     );
@@ -776,71 +776,43 @@ app.on('ready', async () => {
   // `quitAndInstallStagedUpdate()`.
   ipcMain.handle(IPC.UPDATE_QUIT_AND_INSTALL, () => quitAndInstallStagedUpdate());
 
-  // ----- IPC: kick Squirrel's in-app download (v0.1.32) -----
-  // Bound to the renderer's UpdateBanner "Download" button. Pre-v0.1.32
-  // that button opened the GitHub release page in the user's default
-  // browser via `shell.openExternal`, which side-stepped the entire
-  // in-app pipeline (progress bar → restart-to-install) we'd already
-  // wired in v0.1.25. v0.1.32 wires the button to
-  // `autoUpdater.checkForUpdates()` so Squirrel's download events drive
-  // the banner state machine through `downloading` → `ready-to-install`
-  // → Restart click → `quitAndInstall()`.
+  // ----- IPC: kick Squirrel's in-app download (v0.1.32, fallback rewired v0.1.37) -----
+  // Bound to the renderer's UpdateBanner "Install Update" button.
+  // v0.1.32: button fires `autoUpdater.checkForUpdates()` so Squirrel's
+  // download events drive the banner state machine through `downloading`
+  // → `ready-to-install` → Restart click → `quitAndInstall()`.
   //
-  // On failure (unsigned build, dev mode, Linux, transient error) we
-  // pop a NATIVE info dialog explaining the situation rather than
-  // silently bouncing the user to a browser tab. The dialog offers a
-  // "Reveal Release Page" button as an explicit escape hatch — that
-  // click IS allowed to open the browser because the user asked for it.
+  // v0.1.37: on failure (unsigned build, dev mode, Linux, transient
+  // error) we open the GitHub release page DIRECTLY in the user's
+  // default browser. The v0.1.32 "info dialog with Reveal Release Page
+  // button" added a confusing extra click (voice 3351 reported the
+  // banner Download button as "does nothing"); jumping straight to the
+  // release page makes the click always produce a visible next step.
   ipcMain.handle(IPC.UPDATE_DOWNLOAD_START, async (): Promise<StartDownloadResult> => {
     const result = triggerSquirrelDownload();
     if (!result.ok) {
-      const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-      let message = 'In-app update is unavailable for this build.';
-      let detail = '';
-      switch (result.reason) {
-        case 'not-packaged':
-          message = 'Auto-update is only available in installed builds.';
-          detail = `You're running a development build of Restream Chat++ ${app.getVersion()}.`;
-          break;
-        case 'unsupported-platform':
-          message = 'Linux updates are delivered via .deb / .rpm packages.';
-          detail =
-            'Grab the latest release from https://github.com/EthanSK/restream-chat-plus-plus/releases';
-          break;
-        case 'feed-unavailable':
-          message = 'Update service unavailable.';
-          detail =
-            `This build of Restream Chat++ ${app.getVersion()} is not connected to the update feed ` +
-            `(typically an unsigned build — Squirrel.Mac refuses to apply unsigned updates). ` +
-            `You can still reach the release page manually if you want to install by hand.`;
-          break;
-        case 'error':
-          message = 'Update download failed to start.';
-          detail = result.error ?? 'Unknown error.';
-          break;
-      }
+      // v0.1.37: when Squirrel is unavailable (unsigned build / dev /
+      // Linux / transient error) we now open the GitHub release page
+      // DIRECTLY in the user's default browser rather than popping a
+      // dialog with a "Reveal Release Page" button. Voice 3351:
+      //   "clicking it does nothing. It should just do the same thing
+      //    as what check for updates does."
+      // The pre-v0.1.32 silent-browser-bounce is back as the
+      // explicit fallback path because the dialog hop was confusing
+      // — the user clicks the Install Update button and the natural
+      // next step is "show me where to install it from", not "answer
+      // a yes/no dialog first". On signed builds the in-app pipeline
+      // still wins (Squirrel kicks first, this branch never runs).
+      const releaseUrl =
+        'https://github.com/EthanSK/restream-chat-plus-plus/releases';
       try {
-        const opts: Electron.MessageBoxOptions = {
-          type: 'info',
-          message,
-          detail,
-          buttons: ['Reveal Release Page', 'OK'],
-          defaultId: 1,
-          cancelId: 1,
-        };
-        const choice = owner
-          ? await dialog.showMessageBox(owner, opts)
-          : await dialog.showMessageBox(opts);
-        if (choice.response === 0) {
-          // The user explicitly asked for the release page; that's a
-          // deliberate click on a secondary action, not the silent
-          // browser-bounce we removed in v0.1.32.
-          await shell.openExternal(
-            'https://github.com/EthanSK/restream-chat-plus-plus/releases',
-          );
-        }
+        await shell.openExternal(releaseUrl);
+        console.info(
+          '[main] update-download fallback opened release page',
+          result.reason,
+        );
       } catch (err) {
-        console.error('[main] update-download-start dialog failed', err);
+        console.error('[main] update-download fallback openExternal failed', err);
       }
     }
     return result;

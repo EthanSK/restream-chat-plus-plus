@@ -1,4 +1,5 @@
-// Update banner — v0.1.25, Download button rewired in v0.1.32.
+// Update banner — v0.1.25, Download button rewired in v0.1.32, button
+// relabelled to "Install Update" + fallback-to-release-page added in v0.1.37.
 //
 // Renders a thin strip below the titlebar that surfaces the current
 // state of the auto-update flow. v0.1.24 had a single "Update available"
@@ -8,15 +9,19 @@
 //   `checking`         → small spinner + "Checking for updates…".
 //                        Fired by the GH-Releases poller AND by the
 //                        manual "Check for Updates Now…" path.
-//   `available`        → "Update available {version}" + Download +
-//                        Later buttons. v0.1.32: clicking Download now
-//                        kicks Squirrel's in-app `checkForUpdates()`
+//   `available`        → "Update available {version}" + Install Update +
+//                        Later buttons. v0.1.32: clicking the primary
+//                        button kicks Squirrel's in-app `checkForUpdates()`
 //                        pipeline (via `IPC.UPDATE_DOWNLOAD_START`)
 //                        instead of opening the GitHub release page in
 //                        the user's default browser. The banner state
 //                        machine transitions to `downloading` once
 //                        Squirrel emits its first `download-progress`
 //                        event — no extra renderer wiring needed.
+//                        v0.1.37: button label changed from "Download" to
+//                        "Install Update"; on unsigned / dev / Linux the
+//                        main-process handler opens the release page
+//                        directly so the click is never a no-op.
 //   `downloading`      → "Downloading update… NN%" + progress bar.
 //                        Driven by Squirrel's `download-progress` event;
 //                        on signed builds only. NO Dismiss button — once
@@ -128,21 +133,21 @@ export function UpdateBanner({
           <button
             className="btn primary"
             onClick={() => {
-              // v0.1.32: triggers IPC.UPDATE_DOWNLOAD_START in main →
-              // Squirrel `checkForUpdates()` → in-app download pipeline.
-              // We DO NOT dismiss here — Squirrel's `download-progress`
-              // event flips `info.kind` to 'downloading' which transitions
-              // the banner to its progress-bar state automatically. If
-              // Squirrel can't run (unsigned build / dev / Linux) the
-              // main-process handler pops a native info dialog with an
-              // explicit "Reveal Release Page" escape hatch — see
-              // `IPC.UPDATE_DOWNLOAD_START`. Pre-v0.1.32 this called
-              // `onDownload(url)` which opened the release page in the
-              // user's browser; that behaviour is gone.
+              // v0.1.37: button label is now "Install Update" — the v0.1.32
+              // wording "Download" was ambiguous (Ethan: "It should just do
+              // the same thing as what check for updates does"). Behaviour:
+              // fire IPC.UPDATE_DOWNLOAD_START in main → if Squirrel feed is
+              // ready (signed packaged build) it kicks the in-app pipeline
+              // and the banner transitions through 'downloading' →
+              // 'ready-to-install' automatically via Squirrel progress
+              // events. On unsigned / dev / Linux the main-process handler
+              // opens the GitHub release page directly (no extra dialog
+              // click) so a click on this button always results in a
+              // visible next step rather than silently failing.
               onStartDownload();
             }}
           >
-            Download
+            Install Update
           </button>
           <button className="btn ghost" onClick={onDismiss}>
             Later

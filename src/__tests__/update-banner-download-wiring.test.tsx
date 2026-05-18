@@ -73,8 +73,8 @@ function availableInfo(): UpdateInfo {
   };
 }
 
-describe('UpdateBanner — Download button wiring (v0.1.32)', () => {
-  it('clicking Download fires onStartDownload (in-app pipeline), NOT a URL opener', () => {
+describe('UpdateBanner — Install Update button wiring (v0.1.32, relabelled v0.1.37)', () => {
+  it('clicking Install Update fires onStartDownload (in-app pipeline), NOT a URL opener', () => {
     const onStartDownload = vi.fn();
     const onDismiss = vi.fn();
     const onRestart = vi.fn();
@@ -89,8 +89,13 @@ describe('UpdateBanner — Download button wiring (v0.1.32)', () => {
 
     expect(tree).not.toBeNull();
     const buttons = collectButtons(tree);
-    const download = buttons.find((b) => flattenText(b.props.children) === 'Download');
-    expect(download, 'Download button must be present in `available` state').toBeDefined();
+    const download = buttons.find(
+      (b) => flattenText(b.props.children) === 'Install Update',
+    );
+    expect(
+      download,
+      'Install Update button must be present in `available` state',
+    ).toBeDefined();
 
     // Invoke the actual onClick — must call onStartDownload, must not
     // invoke any other callback (no auto-dismiss on click in v0.1.32:
