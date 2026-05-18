@@ -139,6 +139,18 @@ const api = {
   getSettings: (): Promise<Settings> => ipcRenderer.invoke(IPC.SETTINGS_GET),
   setSettings: (s: Settings): Promise<Settings> =>
     ipcRenderer.invoke(IPC.SETTINGS_SET, s),
+  /**
+   * Subscribe to push-broadcasts of Settings changes coming from the
+   * in-process HTTP MCP server (v0.1.36+). The renderer re-applies the
+   * pushed Settings to its TTS / notification / filter state so MCP
+   * mutations (e.g. `set_voice` called by Claude Code) reflect in the
+   * UI immediately, no restart needed.
+   */
+  onSettingsPush: (cb: (s: Settings) => void): Unsub => {
+    const h = (_: unknown, s: Settings) => cb(s);
+    ipcRenderer.on(IPC.SETTINGS_PUSH, h);
+    return () => ipcRenderer.removeListener(IPC.SETTINGS_PUSH, h);
+  },
   notify: (title: string, body: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.NOTIFY, { title, body }),
   /**

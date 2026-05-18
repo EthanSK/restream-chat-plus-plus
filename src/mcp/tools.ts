@@ -76,11 +76,73 @@ export interface ToolDefinition {
   ) => Promise<unknown>;
 }
 
+/**
+ * Optional in-process bridge for the HTTP MCP transport. When the MCP
+ * server is hosted INSIDE the running Electron main process (v0.1.36+
+ * `--mcp-http` architecture), the context can provide:
+ *
+ *   - `readSettings()`   — read the LIVE in-memory Settings (so MCP
+ *                          reads see the current renderer state, not
+ *                          just whatever was persisted to disk).
+ *   - `writeSettings(s)` — replace the LIVE in-memory Settings AND
+ *                          persist to disk AND broadcast to the
+ *                          renderer via IPC. The main process wires
+ *                          this through the same store + IPC the
+ *                          Settings drawer uses, so MCP mutations
+ *                          show up immediately in the running UI.
+ *
+ * When ABSENT (the path Vitest tests and the legacy `--mcp-stdio`
+ * deprecated entry exercise), tools fall back to direct file I/O via
+ * `store-io.ts` — same behaviour as v0.1.29-v0.1.35.
+ */
+export interface LiveSettingsBridge {
+  readSettings: () => Settings;
+  writeSettings: (next: Settings) => Settings;
+  /**
+   * Optional: drop the OAuth token from the running app + persisted
+   * store. Wired by `mcp-server.ts` to the same logout flow the
+   * renderer's Sign-Out menu uses. When absent, the `sign_out` tool
+   * falls back to its file-only path (works whether or not the GUI is
+   * running, but the in-memory OAuth state remains until restart).
+   */
+  signOut?: () => Promise<void> | void;
+  /**
+   * Optional: live connection-state snapshot for `get_status`. When the
+   * MCP runs in-process this surfaces the WS connection state + last
+   * update info so the response isn't full of `null` placeholders.
+   */
+  getRuntimeStatus?: () => {
+    connectionStatus?: unknown;
+    latestUpdateInfo?: unknown;
+    connections?: unknown;
+    voices?: unknown;
+  };
+  /**
+   * Optional: tell the renderer to clear its in-memory chat-message
+   * buffer (Cmd+K equivalent). When absent, `clear_chat` returns its
+   * `guiNotIntrospectable` hint as before.
+   */
+  clearChat?: () => void;
+  /**
+   * Optional: force an immediate GH-Releases update check, returning
+   * the resulting UpdateInfo. When absent, `check_for_updates_now`
+   * returns the legacy hint payload.
+   */
+  checkForUpdatesNow?: () => Promise<unknown>;
+}
+
 export interface ToolContext {
   /** Absolute path to the electron-store JSON file. */
   storePath: string;
   /** App version (`app.getVersion()` when running under Electron). */
   appVersion: string;
+  /**
+   * Live-state bridge into the running GUI's main process. When set,
+   * tools use it instead of direct file I/O so MCP changes flow through
+   * the same IPC path the renderer uses and update the live UI without
+   * a restart. v0.1.36.
+   */
+  live?: LiveSettingsBridge;
 }
 
 /**
@@ -90,11 +152,38 @@ export interface ToolContext {
 export function buildToolContext(opts: {
   storePath?: string;
   appVersion?: string;
+  live?: LiveSettingsBridge;
 } = {}): ToolContext {
   return {
     storePath: opts.storePath ?? resolveStorePath(),
     appVersion: opts.appVersion ?? tryGetAppVersion(),
+    live: opts.live,
   };
+}
+
+/**
+ * Read settings via the live bridge (if any) or fall back to the on-disk
+ * JSON. Keep tool handlers small by routing all reads through this.
+ */
+function readSettingsVia(ctx: ToolContext): Settings {
+  if (ctx.live) return ctx.live.readSettings();
+  return loadSettings(ctx.storePath);
+}
+
+/**
+ * Apply a mutator either through the live bridge (in-process MCP) or via
+ * the on-disk file (standalone / tests). Returns the resulting Settings.
+ */
+function mutateSettingsVia(
+  ctx: ToolContext,
+  mutate: (current: Settings) => Settings,
+): Settings {
+  if (ctx.live) {
+    const current = ctx.live.readSettings();
+    const next = mutate(current);
+    return ctx.live.writeSettings(next);
+  }
+  return mutateSettings(ctx.storePath, mutate);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +255,7 @@ const listSettings: ToolDefinition = {
     'ignore lists, and update-checker prefs.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
-    return loadSettings(ctx.storePath);
+    return readSettingsVia(ctx);
   },
 };
 
@@ -182,7 +271,7 @@ const getFilters: ToolDefinition = {
     'An empty list means EVERY incoming message gets the side effect.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
-    const s = loadSettings(ctx.storePath);
+    const s = readSettingsVia(ctx);
     return {
       tts: s.filters.tts.ignoreRegex,
       notifications: s.filters.notifications.ignoreRegex,
@@ -205,7 +294,7 @@ const getStatus: ToolDefinition = {
     'running GUI and an in-process IPC channel we do not yet have.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
-    const s = loadSettings(ctx.storePath);
+    const s = readSettingsVia(ctx);
     // Detect token presence without decrypting — both the legacy `token`
     // key and the v0.1.15+ `tokenEnc` key are read directly from the
     // store file. We only report presence (boolean) — never the value.
@@ -217,17 +306,20 @@ const getStatus: ToolDefinition = {
     } catch {
       // Missing / malformed → hasToken stays false. Not a hard error.
     }
+    // When running in-process (v0.1.36 HTTP MCP) the live bridge can
+    // surface the WS connection state + most-recent UpdateInfo so the
+    // status snapshot is fully populated. Outside the live bridge
+    // (legacy --mcp-stdio path / vitest) we keep these null so the
+    // schema shape stays stable.
+    const runtime = ctx.live?.getRuntimeStatus?.();
     return {
       appVersion: ctx.appVersion,
       hasPersistedAuthToken: hasToken,
       autoUpdateCheckEnabled: s.update.autoCheck,
       ttsEnabled: s.tts.enabled,
       notificationsEnabled: s.notifications.enabled,
-      // Live runtime fields the standalone MCP can't surface — included
-      // as `null` (NOT omitted) so the schema shape is stable and agents
-      // can detect "GUI not introspectable" via a single null check.
-      connectionStatus: null,
-      latestUpdateInfo: null,
+      connectionStatus: runtime?.connectionStatus ?? null,
+      latestUpdateInfo: runtime?.latestUpdateInfo ?? null,
     };
   },
 };
@@ -249,15 +341,18 @@ const getVoices: ToolDefinition = {
     'agents can confirm which one is selected.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
-    const s = loadSettings(ctx.storePath);
+    const s = readSettingsVia(ctx);
+    const runtime = ctx.live?.getRuntimeStatus?.();
     return {
       currentVoiceURI: s.tts.voiceURI ?? null,
-      voices: null,
+      voices: runtime?.voices ?? null,
       hint:
-        'Voice enumeration requires the live renderer process. Open the ' +
-        'Settings drawer in Restream Chat++ to see the full list. To ' +
-        'select a voice, call `set_voice` with the desired voiceURI ' +
-        '(e.g. "com.apple.voice.compact.en-GB.Daniel" on macOS).',
+        runtime?.voices != null
+          ? undefined
+          : 'Voice enumeration requires the live renderer process. Open the ' +
+            'Settings drawer in Restream Chat++ to see the full list. To ' +
+            'select a voice, call `set_voice` with the desired voiceURI ' +
+            '(e.g. "com.apple.voice.compact.en-GB.Daniel" on macOS).',
     };
   },
 };
@@ -285,6 +380,12 @@ const listRecentMessages: ToolDefinition = {
     additionalProperties: false,
   },
   handler: async (_args, _ctx) => {
+    // The recent-message buffer is purely a renderer artefact (we never
+    // persist it). Even with the in-process HTTP MCP transport in
+    // v0.1.36 we don't pipe the renderer buffer through to the main
+    // process yet, so this still returns the hint payload. A future
+    // change can wire `webContents.executeJavaScript()` to read the
+    // ChatFeed state.
     return {
       messages: null,
       hint:
@@ -306,7 +407,11 @@ const listConnections: ToolDefinition = {
     "Restream's `connection_info` WS frame. Requires the running GUI — " +
     'live WS state is not persisted to disk.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  handler: async (_args, _ctx) => {
+  handler: async (_args, ctx) => {
+    const runtime = ctx.live?.getRuntimeStatus?.();
+    if (runtime?.connections != null) {
+      return { connections: runtime.connections };
+    }
     return {
       connections: null,
       hint:
@@ -336,7 +441,7 @@ const setVoice: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const voiceURI = requireString(args, 'voiceURI');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       tts: { ...s.tts, voiceURI },
     }));
@@ -354,7 +459,7 @@ const setTtsVolume: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const volume = requireRange(requireNumber(args, 'volume'), 0, 1, 'volume');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       tts: { ...s.tts, volume },
     }));
@@ -372,7 +477,7 @@ const setTtsRate: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const rate = requireRange(requireNumber(args, 'rate'), 0.5, 2, 'rate');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       tts: { ...s.tts, rate },
     }));
@@ -390,7 +495,7 @@ const setTtsPitch: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const pitch = requireRange(requireNumber(args, 'pitch'), 0, 2, 'pitch');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       tts: { ...s.tts, pitch },
     }));
@@ -408,7 +513,7 @@ const setTtsEnabled: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const enabled = requireBoolean(args, 'enabled');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       tts: { ...s.tts, enabled },
     }));
@@ -426,7 +531,7 @@ const setNotificationsEnabled: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const enabled = requireBoolean(args, 'enabled');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       notifications: { ...s.notifications, enabled },
     }));
@@ -444,7 +549,7 @@ const setPlayNotificationSound: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const enabled = requireBoolean(args, 'enabled');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       notifications: { ...s.notifications, soundEnabled: enabled },
     }));
@@ -475,7 +580,7 @@ const addTtsFilter: ToolDefinition = {
   handler: async (args, ctx) => {
     const regex = requireString(args, 'regex');
     validateRegex(regex);
-    return mutateSettings(ctx.storePath, (s) => {
+    return mutateSettingsVia(ctx, (s) => {
       // Dedupe — pushing the same pattern repeatedly is a no-op rather
       // than producing a duplicate entry.
       const next = s.filters.tts.ignoreRegex.includes(regex)
@@ -502,7 +607,7 @@ const removeTtsFilter: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const regex = requireString(args, 'regex');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       filters: {
         ...s.filters,
@@ -529,7 +634,7 @@ const addNotificationFilter: ToolDefinition = {
   handler: async (args, ctx) => {
     const regex = requireString(args, 'regex');
     validateRegex(regex);
-    return mutateSettings(ctx.storePath, (s) => {
+    return mutateSettingsVia(ctx, (s) => {
       const next = s.filters.notifications.ignoreRegex.includes(regex)
         ? s.filters.notifications.ignoreRegex
         : [...s.filters.notifications.ignoreRegex, regex];
@@ -556,7 +661,7 @@ const removeNotificationFilter: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const regex = requireString(args, 'regex');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       filters: {
         ...s.filters,
@@ -584,7 +689,7 @@ const setAutoUpdateCheck: ToolDefinition = {
   },
   handler: async (args, ctx) => {
     const enabled = requireBoolean(args, 'enabled');
-    return mutateSettings(ctx.storePath, (s) => ({
+    return mutateSettingsVia(ctx, (s) => ({
       ...s,
       update: { ...s.update, autoCheck: enabled },
     }));
@@ -602,33 +707,47 @@ const clearChat: ToolDefinition = {
   name: 'clear_chat',
   description:
     'Clear the local message buffer (the chat feed in the running GUI). ' +
-    'Requires a running GUI — the standalone MCP process cannot reach the ' +
-    'renderer state. No-op + hint when no GUI loopback channel is wired.',
+    'When the in-process HTTP MCP is the host (v0.1.36+), this triggers ' +
+    'the same Cmd+K path the menu item uses. Outside the running app, ' +
+    'returns a clear hint payload.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  handler: async (_args, _ctx) => ({
-    ok: false,
-    guiNotIntrospectable: true,
-    hint:
-      'Cmd+K in the running GUI or the chat-feed context menu clears the ' +
-      'buffer. The standalone MCP cannot trigger this without a loopback ' +
-      'IPC channel.',
-  }),
+  handler: async (_args, ctx) => {
+    if (ctx.live?.clearChat) {
+      ctx.live.clearChat();
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      guiNotIntrospectable: true,
+      hint:
+        'Cmd+K in the running GUI or the chat-feed context menu clears the ' +
+        'buffer. The standalone MCP cannot trigger this without a loopback ' +
+        'IPC channel.',
+    };
+  },
 };
 
 const checkForUpdatesNow: ToolDefinition = {
   name: 'check_for_updates_now',
   description:
     'Force an immediate GH-Releases update check, bypassing the autoCheck ' +
-    'setting. Requires a running GUI — the check itself lives in main.ts.',
+    'setting. With the in-process HTTP MCP (v0.1.36+) this returns the ' +
+    'resulting UpdateInfo directly; without it, returns a clear hint.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  handler: async (_args, _ctx) => ({
-    ok: false,
-    guiNotIntrospectable: true,
-    hint:
-      'Use the "Check for Updates Now…" menu item in the running GUI. ' +
-      'The standalone MCP cannot trigger this without a loopback IPC ' +
-      'channel.',
-  }),
+  handler: async (_args, ctx) => {
+    if (ctx.live?.checkForUpdatesNow) {
+      const info = await ctx.live.checkForUpdatesNow();
+      return { ok: true, updateInfo: info };
+    }
+    return {
+      ok: false,
+      guiNotIntrospectable: true,
+      hint:
+        'Use the "Check for Updates Now…" menu item in the running GUI. ' +
+        'The standalone MCP cannot trigger this without a loopback IPC ' +
+        'channel.',
+    };
+  },
 };
 
 const signOut: ToolDefinition = {
@@ -641,9 +760,17 @@ const signOut: ToolDefinition = {
     're-authenticate next launch.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
-    // We delete both the legacy `token` and the v0.1.15+ `tokenEnc` keys
-    // so a partial-cleanup-then-relaunch can't accidentally resume on a
-    // half-stale token. `settings` and everything else passes through.
+    // In-process MCP (v0.1.36+) — route through the live OAuth
+    // coordinator so the in-memory token + WS chat client + renderer
+    // auth state all clear in lockstep. No restart needed.
+    if (ctx.live?.signOut) {
+      await ctx.live.signOut();
+      return { ok: true, viaLiveBridge: true };
+    }
+    // Fallback (legacy --mcp-stdio / vitest): delete both the legacy
+    // `token` and the v0.1.15+ `tokenEnc` keys so a partial-cleanup-
+    // then-relaunch can't accidentally resume on a half-stale token.
+    // `settings` and everything else passes through.
     let raw: string;
     try {
       raw = fs.readFileSync(ctx.storePath, 'utf8');

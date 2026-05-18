@@ -158,6 +158,24 @@ export function App(): React.ReactElement {
     //      user dismissed the earlier `available` banner, once Squirrel
     //      has started downloading we want the progress + Restart UI to
     //      surface.
+    // Live Settings push from the in-process HTTP MCP server (v0.1.36+).
+    // Fires when an MCP client (Claude Code, etc.) mutates Settings via
+    // tools like `set_voice` / `set_tts_volume`. We replace local
+    // settings state + re-init the TTS engine + rate limiter so the
+    // changes take effect immediately — no restart required.
+    const offSettingsPush = rcpp.onSettingsPush((next) => {
+      setSettings(next);
+      try {
+        ttsRef.current?.updateSettings(next.tts);
+      } catch (err) {
+        console.error('[App] TTSEngine.updateSettings on push failed', err);
+      }
+      try {
+        notifyLimiterRef.current = new RateLimiter(next.notifications.maxPerMinute);
+      } catch (err) {
+        console.error('[App] rate limiter re-init on push failed', err);
+      }
+    });
     const offUpdate = rcpp.onUpdateStatus((info) => {
       setUpdateInfo((prev) => {
         const newAvailable =
@@ -181,6 +199,7 @@ export function App(): React.ReactElement {
       offChat();
       offMenu();
       offClear();
+      offSettingsPush();
       offUpdate();
     };
   }, []);

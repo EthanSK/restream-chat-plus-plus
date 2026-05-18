@@ -296,6 +296,14 @@ export const IPC = {
   CHAT_CLEAR: 'chat:clear',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
+  /**
+   * Push channel — main → renderer — fires when the in-process HTTP MCP
+   * server mutates Settings (v0.1.36+). Payload is the fully-merged
+   * Settings object that just landed. The renderer subscribes so MCP
+   * changes (e.g. `set_voice` from Claude Code) reflect in the live
+   * Settings drawer + TTS pipeline immediately, no restart required.
+   */
+  SETTINGS_PUSH: 'settings:push',
   NOTIFY: 'notify',
   REVEAL_LOGS: 'logs:reveal',
   /**
