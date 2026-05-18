@@ -525,6 +525,11 @@ app.on('ready', async () => {
    * Centralised so every code path that mutates auth — initial resume,
    * background refresh on startup, scheduled refresh, manual sign-in / out,
    * Reconnect — pushes a consistent shape to the UI.
+   *
+   * Uses the in-memory cached value populated by the deferred decrypt
+   * (`getTokenAsync`) — does NOT trigger a Keychain prompt itself. The
+   * boot resume path calls `getTokenAsync` first so this push reflects
+   * the post-decrypt truth.
    */
   function pushAuthStatus(): AuthStatus {
     const t = oauth.getToken();
@@ -620,10 +625,14 @@ app.on('ready', async () => {
     }
   });
 
-  ipcMain.handle(IPC.AUTH_STATUS, () => {
-    const t = oauth.getToken();
+  ipcMain.handle(IPC.AUTH_STATUS, async () => {
+    // v0.1.38: await `getTokenAsync` so a renderer that pulls AUTH_STATUS
+    // before the deferred decrypt has settled gets the correct truth
+    // rather than a transient `authenticated: false`. After the first
+    // launch tick this resolves from the in-memory cache instantly.
+    const t = await oauth.getTokenAsync();
     const status: AuthStatus = {
-      authenticated: oauth.isAuthenticated(),
+      authenticated: await oauth.isAuthenticatedAsync(),
       scope: t?.scope,
       expiresAt: t?.expiresAt,
     };
@@ -648,7 +657,9 @@ app.on('ready', async () => {
   // state stream — the renderer already displays state.lastError.
   ipcMain.handle(IPC.CONN_RECONNECT, async () => {
     try {
-      let token = oauth.getToken();
+      // v0.1.38: async getter — picks up the deferred decrypt result if
+      // the reconnect button is clicked before the boot decrypt settled.
+      let token = await oauth.getTokenAsync();
       // If the token is missing or about-to-expire, refresh before reconnect.
       // This is the recovery path for a session that's been backgrounded
       // long enough for the access token to lapse — without this, the new
@@ -860,7 +871,9 @@ app.on('ready', async () => {
   // ghost button next to the inline send arrow.
   ipcMain.handle(IPC.CHAT_OPEN_RESTREAM_WEBCHAT, async () => {
     try {
-      const token = oauth.getToken();
+      // v0.1.38: async — covers the case where the user clicks "Webchat"
+      // before the boot deferred decrypt has resolved.
+      const token = await oauth.getTokenAsync();
       if (!token) return { ok: false as const, reason: 'not-authenticated' as const };
       let url = '';
       try {
@@ -973,7 +986,10 @@ app.on('ready', async () => {
     return { eventId: e.id };
   };
   const hydrateChatContextViaRest = async (): Promise<ChatContext | undefined> => {
-    const token = oauth.getToken();
+    // v0.1.38: async — chat-context hydration may run before the boot
+    // decrypt settles (periodic refresh timer, manual retry). Awaiting
+    // the deferred decrypt avoids a spurious 401 from Restream.
+    const token = await oauth.getTokenAsync();
     if (!token) return undefined;
     try {
       const res = await fetch('https://api.restream.io/v2/user/events/in-progress', {
@@ -1135,7 +1151,10 @@ app.on('ready', async () => {
 
   ipcMain.handle(IPC.CHAT_SEND_TEXT, async (_evt, rawText: string): Promise<SendTextResult> => {
     try {
-      if (!oauth.isAuthenticated()) {
+      // v0.1.38: async auth check — covers the race where the user types a
+      // message and hits Enter before the boot deferred decrypt has
+      // resolved. After the first decrypt tick this is essentially free.
+      if (!(await oauth.isAuthenticatedAsync())) {
         return { ok: false, reason: 'not-authenticated' };
       }
       const now = Date.now();
@@ -1230,43 +1249,77 @@ app.on('ready', async () => {
 
   // Resume session if a valid token already exists.
   //
-  // Resume order:
-  //   1. If stored access token is still valid → start the WS immediately.
-  //   2. Otherwise attempt `oauth.refresh()` using the stored refresh token.
-  //      On success, persist the new token + start the WS + broadcast.
-  //      On failure, leave the user signed-out so the renderer's "Sign in"
-  //      button is the next action.
+  // v0.1.38 — DEFERRED, NON-BLOCKING RESUME PATH.
   //
-  // Whichever leg runs, we ALWAYS:
-  //   - call `pushAuthStatus()` so the renderer's AUTH_STATUS reflects truth
-  //     (the auth subscription set up on `did-finish-load` consumes this);
-  //   - resolve `startupAuthDone` so the `did-finish-load` handler stops
-  //     waiting and pushes the initial AUTH_STATUS snapshot.
+  // The resume runs asynchronously via `void resumeAuth()` — the
+  // `app.on('ready')` callback returns immediately so the BrowserWindow
+  // is fully constructed and visible before we touch Keychain. This is
+  // the fundamental fix for the v0.1.36-and-earlier "fresh install over
+  // existing install blocks indefinitely on Allow Safe Storage prompt"
+  // bug.
   //
-  // This fixes the "every update logs me out" symptom: Squirrel restarts
-  // the app after replacing the bundle; the access token is usually past
-  // its 1h expiresAt by then; a synchronous check would mark the user
-  // signed-out, the refresh would silently succeed in the background, but
-  // the renderer would never hear about it.
-  try {
-    if (oauth.isAuthenticated()) {
-      const t = oauth.getToken()!;
-      chat.setToken(t.accessToken);
-      chat.start();
-    } else {
-      const refreshed = await oauth.refresh();
-      if (refreshed) {
-        chat.setToken(refreshed.accessToken);
+  // Root cause (pre-v0.1.38): the encrypted token blob's macOS Keychain
+  // ACL is bound to the binary's code signature. A newly-installed
+  // version has a different (or no) signature, so SecurityAgent prompts
+  // the user before allowing decrypt. The synchronous
+  // `safeStorage.decryptString` call blocked the entire main thread on
+  // that prompt — no window, no dock animation, no anything.
+  //
+  // The new flow:
+  //   1. `app.on('ready')` returns → window paints, menu armed, MCP
+  //      server starts, IPC handlers register.
+  //   2. `resumeAuth()` fires in the background:
+  //      a. Calls `getTokenAsync()` which yields to the event loop
+  //         twice (setImmediate × 2) so the renderer can paint, then
+  //         starts the decrypt with a 2-second timeout.
+  //      b. On success → start WS + broadcast authenticated.
+  //      c. On timeout / decrypt-failure → ACL drift assumed,
+  //         tokenEnc wiped, user sees "Sign in" screen.
+  //      d. On expired access-token → background refresh via
+  //         refresh-token (if present), start WS, broadcast.
+  //   3. Whichever leg runs, `pushAuthStatus()` + `resolveStartupAuth()`
+  //      always fire so the renderer's `did-finish-load` handler stops
+  //      waiting and pushes the initial AUTH_STATUS snapshot.
+  //
+  // This ALSO fixes the older "every update logs me out" symptom: a
+  // successful background refresh of an expired access-token now races
+  // the renderer's first paint instead of the dock-animation tick, but
+  // the `startupAuthDone` Promise still gates the initial AUTH_STATUS
+  // push so the user sees no "Sign in" flash before the refresh settles.
+  const resumeAuth = async (): Promise<void> => {
+    try {
+      // First leg: see if the (possibly deferred) decrypted token is
+      // still within its access-token validity window. After the first
+      // tick this resolves to the cached value; the very first call per
+      // launch waits up to 2s for the decrypt timeout.
+      if (await oauth.isAuthenticatedAsync()) {
+        const t = (await oauth.getTokenAsync())!;
+        chat.setToken(t.accessToken);
         chat.start();
+      } else {
+        // Either no token on disk (fresh install / post-logout) OR the
+        // access token expired OR ACL drift wiped the blob. Try a
+        // refresh-token round-trip — succeeds for the second case,
+        // returns undefined for the first/third (no refresh token to
+        // present), leaving the user on the sign-in screen.
+        const refreshed = await oauth.refresh();
+        if (refreshed) {
+          chat.setToken(refreshed.accessToken);
+          chat.start();
+        }
       }
+    } catch (err) {
+      console.error('[main] startup auth resume failed', err);
+    } finally {
+      // Broadcast the final auth state and unblock did-finish-load.
+      pushAuthStatus();
+      resolveStartupAuth();
     }
-  } catch (err) {
-    console.error('[main] startup auth resume failed', err);
-  } finally {
-    // Broadcast the final auth state and unblock did-finish-load.
-    pushAuthStatus();
-    resolveStartupAuth();
-  }
+  };
+  // Fire-and-forget — do NOT await. The `ready` callback completes
+  // immediately so Electron finishes window construction and the user
+  // sees a UI even if Keychain decides to prompt.
+  void resumeAuth();
 });
 
 app.on('window-all-closed', () => {
