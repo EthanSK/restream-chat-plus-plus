@@ -207,8 +207,8 @@ export function SettingsDrawer({
             <div className="row">
               <label
                 title={
-                  'Native (macOS): drives the OS-level `say` command directly. Reliable — bypasses Chromium speech bugs. Recommended.\n' +
-                  'Browser (Web Speech API): the legacy Chromium engine. Kept for compatibility / future Linux & Windows builds.'
+                  'Browser (Web Speech API): Recommended. Volume slider applies; uses Chromium\'s speech engine with extra reliability layers (strong-ref keep-alive, cancel-before-speak, onstart watchdog, onerror retry).\n' +
+                  'Native (macOS): Fallback. Volume slider does NOT apply (system output volume only). Use this only if the Browser engine ever flakes.'
                 }
               >
                 Engine
@@ -226,8 +226,8 @@ export function SettingsDrawer({
                   patchTts({ engine: next, voiceURI: undefined });
                 }}
               >
-                <option value="native">Native (macOS) — recommended</option>
-                <option value="browser">Browser (Web Speech API)</option>
+                <option value="browser">Browser (Web Speech API) — recommended</option>
+                <option value="native">Native (macOS) — fallback</option>
               </select>
             </div>
             <div className="row">

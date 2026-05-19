@@ -221,10 +221,15 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   tts: {
     enabled: false,
-    // v0.1.42: default to the native macOS `say` engine. It's the only
-    // platform we currently ship for and the renderer's Web Speech path
-    // has been a recurring source of "TTS just stopped working" issues.
-    engine: 'native',
+    // v0.1.44: flipped back to the browser (Web Speech) engine after the
+    // v0.1.40 strong-ref + v0.1.41 cancel-before-speak + 8s keep-alive +
+    // 500ms onstart watchdog + onerror retry + disk-log layers landed.
+    // The macOS `say` engine (added in v0.1.42) is reliable but ignores
+    // the in-app volume slider — `say` has no `--volume` flag and only
+    // tracks the system output level. Browser engine is now reliable AND
+    // honours the slider, so it's the right default again. Native stays
+    // available as an opt-in toggle in Settings.
+    engine: 'browser',
     readSenderName: false,
     voiceURI: undefined,
     rate: 1.0,

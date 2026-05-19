@@ -114,18 +114,29 @@ describe('Settings migration', () => {
   });
 
   // -------------------------------------------------------------------------
-  // v0.1.42 — `tts.engine` toggle (native | browser).
+  // v0.1.42 → v0.1.44 — `tts.engine` toggle (native | browser).
+  //
+  // History:
+  //   v0.1.42 introduced the native `say` engine and flipped the default
+  //   to `'native'` because the Web Speech path had recurring "TTS just
+  //   stopped working" bugs.
+  //   v0.1.44 flipped the default BACK to `'browser'` after the
+  //   v0.1.40 strong-ref + v0.1.41 cancel-before-speak + 8s keep-alive +
+  //   500ms onstart watchdog + onerror retry layers made the browser
+  //   engine reliable. The deciding factor: the volume slider doesn't
+  //   apply to `say` (no `--volume` flag), and Ethan wants slider control.
   //
   // Pre-v0.1.42 settings blobs have no `engine` field. The migration must
   // back-fill from `DEFAULT_SETTINGS.tts.engine` so the user lands on the
-  // current default (`'native'` on macOS) — which is the whole point of
-  // v0.1.42: replace the flaky Chromium engine with reliable `say`.
+  // current default. Users who explicitly chose `'native'` on v0.1.42 /
+  // v0.1.43 must keep their choice — the default flip in v0.1.44 only
+  // applies to users who never explicitly picked.
   // -------------------------------------------------------------------------
-  it("DEFAULT_SETTINGS.tts.engine is 'native' (v0.1.42 default)", () => {
-    expect(DEFAULT_SETTINGS.tts.engine).toBe('native');
+  it("DEFAULT_SETTINGS.tts.engine is 'browser' (v0.1.44 default)", () => {
+    expect(DEFAULT_SETTINGS.tts.engine).toBe('browser');
   });
 
-  it('defaults tts.engine to native when absent in persisted blob', () => {
+  it('defaults tts.engine to browser when absent in persisted blob', () => {
     const legacy = {
       tts: {
         enabled: true,
@@ -138,7 +149,7 @@ describe('Settings migration', () => {
     } as unknown as Partial<Settings>;
 
     const merged = migrate(legacy);
-    expect(merged.tts.engine).toBe('native');
+    expect(merged.tts.engine).toBe('browser');
   });
 
   it("preserves a user-set tts.engine='browser' across migration", () => {
@@ -150,5 +161,22 @@ describe('Settings migration', () => {
     };
     const merged = migrate(stored);
     expect(merged.tts.engine).toBe('browser');
+  });
+
+  // v0.1.44 default-flip regression pin: a user who explicitly chose
+  // 'native' on v0.1.42 or v0.1.43 must NOT be force-flipped back to
+  // 'browser' just because we changed DEFAULT_SETTINGS. Object-spread
+  // semantics already give us this (stored.tts.engine overrides the
+  // default), but we pin it explicitly so a future refactor that swaps
+  // the merge order (e.g. defaults-win) breaks loudly.
+  it("preserves a user-set tts.engine='native' across the v0.1.44 default flip", () => {
+    const stored: Partial<Settings> = {
+      tts: {
+        ...DEFAULT_SETTINGS.tts,
+        engine: 'native',
+      },
+    };
+    const merged = migrate(stored);
+    expect(merged.tts.engine).toBe('native');
   });
 });
