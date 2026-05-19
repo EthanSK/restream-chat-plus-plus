@@ -1,26 +1,47 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { rcpp } from './api';
-import type { SendTextResult } from '../shared/types';
 
 interface Props {
   authenticated: boolean;
   connected: boolean;
+  /**
+   * v0.1.43 — invoked synchronously when the user presses Enter on a
+   * non-empty text value. The parent (App.tsx) mints the optimistic
+   * placeholder message and ships the enqueue IPC. This component does
+   * NOT await; the input clears the moment this returns so the user can
+   * spam-send without ever being gated by a network round-trip.
+   *
+   * Returns void — there is no "this might fail" path at the input layer
+   * any more. Per-message failures surface as a ⚠ icon on the optimistic
+   * placeholder in the chat feed (driven by `CHAT_SEND_STATUS` from main).
+   */
+  onSend: (text: string) => void;
 }
 
 /**
  * Inline chat input bar.
  *
- * Sits at the bottom of the main feed and POSTs directly to Restream's
- * internal `/client/reply` endpoint via the main-process handler
- * (`CHAT_SEND_TEXT`). Successful sends DO NOT optimistically render —
- * Restream's WS rebroadcasts the message as a `reply_created` frame
- * which our normaliser already surfaces as a `self: true` ChatMessage
- * in the feed.
+ * Sits at the bottom of the main feed and pushes a `CHAT_SEND_ENQUEUE`
+ * IPC for every Enter — the main-process queue serialises the actual
+ * POSTs against Restream's `/client/reply` endpoint. The input clears
+ * IMMEDIATELY on send so the user can fire as many messages as they want
+ * in a row without ever being gated by a network round-trip (v0.1.43).
+ *
+ * Optimistic UI: App.tsx renders the just-typed message in the chat
+ * feed the moment this component calls `onSend`. The main-process queue
+ * broadcasts `CHAT_SEND_STATUS` back; App.tsx flips the placeholder to
+ * sent (replaced by the WS echo) or failed (small ⚠ + tooltip with the
+ * error reason).
  *
  * Keyboard contract:
- *   - Enter           — send (when not busy and text is non-empty)
+ *   - Enter           — send (when text is non-empty)
  *   - Shift+Enter     — newline
  *   - Cmd/Ctrl+Enter  — also sends (matches Slack/Discord muscle memory)
+ *
+ * v0.1.43: removed the local `busy` spinner + `await rcpp.sendChatText`
+ * gate. The input is NEVER disabled by an in-flight send. The previous
+ * spinner + 1msg/sec rate-limit gated typing speed; now sends are
+ * fire-and-forget from the renderer's perspective and the queue paces
+ * the actual POSTs at ≤1/sec under the hood.
  *
  * v0.1.34: the separate "Compose" window (v0.1.32-v0.1.33) was a wash —
  * it called the SAME `rcpp.sendChatText` IPC as this inline input, so
@@ -29,22 +50,19 @@ interface Props {
  *
  * v0.1.40: the small "Webchat" escape-hatch button next to send is also
  * gone. Inline send works now (v0.1.34 fixed the `/api/client/reply`
- * endpoint) so the button is redundant — Ethan asked for it removed in
- * voice 3421. If session cookies expire or the inline send hits a
- * `no-session-cookies` reason in the future, we'll add a more targeted
- * recovery affordance rather than a full webchat window button.
+ * endpoint) so the button is redundant.
  *
  * The cold-start cookie provisioning is handled transparently in the
- * main process — first send may take a beat while it spawns an invisible
- * helper window to populate `persist:restream-oauth`'s cookie jar.
+ * main process — first send may take a beat under the hood while it
+ * spawns an invisible helper window to populate `persist:restream-oauth`'s
+ * cookie jar, but the renderer never blocks on it.
  */
 export function ChatInputInline({
   authenticated,
   connected,
+  onSend,
 }: Props): React.ReactElement | null {
   const [text, setText] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | undefined>();
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Auto-grow the textarea height as the user types (cap at 6 visible lines
@@ -73,32 +91,35 @@ export function ChatInputInline({
   // Hide entirely until the user is signed in. MUST stay below ALL hooks.
   if (!authenticated) return null;
 
-  const doSend = async () => {
+  // Synchronous send: trim, invoke the parent callback (which mints the
+  // optimistic placeholder + ships the enqueue IPC), clear the input.
+  // No await, no busy state. v0.1.43.
+  const doSend = (): void => {
     const value = text.trim();
-    if (!value || busy) return;
-    setBusy(true);
-    setErr(undefined);
+    if (!value) return;
     try {
-      const result: SendTextResult = await rcpp.sendChatText(value);
-      if (result.ok) {
-        setText('');
-      } else {
-        setErr(prettyReason(result));
-      }
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
-    } finally {
-      // Floor the spinner so the button doesn't strobe on instant rejections
-      // (e.g. the 1-msg/sec rate-limiter).
-      setTimeout(() => setBusy(false), 220);
+      onSend(value);
+    } catch (err) {
+      // The parent's onSend wraps a fire-and-forget IPC + a state
+      // update; throwing here would be a programmer error. Log + carry
+      // on — we still clear the input so the user can keep typing.
+      // eslint-disable-next-line no-console
+      console.error('[ChatInputInline] onSend threw', err);
     }
+    setText('');
+    // Reset textarea height — the auto-grow effect runs on next render
+    // but explicit reset here keeps the visible row count snapping back
+    // to 1 immediately rather than waiting a tick.
+    const el = taRef.current;
+    if (el) el.style.height = 'auto';
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Send on Enter; Shift+Enter / Cmd-or-Ctrl+Enter mean newline / send-extra.
+    // Send on Enter; Shift+Enter means newline. Cmd/Ctrl+Enter also sends
+    // (Slack/Discord muscle memory).
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      void doSend();
+      doSend();
     }
   };
 
@@ -116,54 +137,38 @@ export function ChatInputInline({
         onChange={(e) => setText(e.target.value)}
         onKeyDown={onKeyDown}
         rows={1}
-        disabled={busy || !connected}
+        disabled={!connected}
         aria-label="Chat message"
       />
       <button
         type="button"
         className="btn primary chat-input-send"
-        onClick={() => void doSend()}
-        disabled={busy || !connected || text.trim().length === 0}
+        onClick={() => doSend()}
+        disabled={!connected || text.trim().length === 0}
         title="Send"
         aria-label="Send"
       >
-        {busy ? '…' : (
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M22 2L11 13" />
-            <path d="M22 2L15 22L11 13L2 9L22 2Z" />
-          </svg>
-        )}
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M22 2L11 13" />
+          <path d="M22 2L15 22L11 13L2 9L22 2Z" />
+        </svg>
       </button>
-      {err && <span className="chat-input-err">{err}</span>}
     </div>
   );
 }
 
-function prettyReason(result: SendTextResult): string {
-  switch (result.reason) {
-    case 'not-authenticated':
-      return 'Sign in to Restream first.';
-    case 'no-session-cookies':
-      return 'Chat session not provisioned yet — try again in a moment.';
-    case 'no-active-connections':
-      return 'No connected channels to reply to.';
-    case 'no-show-id':
-      return 'No active Restream show — start streaming (or send one message from Restream’s website) so we can pick up the event.';
-    case 'send-failed':
-      return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}.`;
-    case 'error':
-      return result.error ?? 'Send failed.';
-    default:
-      return 'Send failed.';
-  }
-}
+// Helpers live in `chat-send-client.ts` so this component stays free of
+// the `api.ts` → `window.rcpp` module-load coupling and can be unit-
+// tested with `react-test-renderer` under a Node vitest environment.
+// Import them directly from `./chat-send-client` in App.tsx / future
+// callers — do NOT re-export here.

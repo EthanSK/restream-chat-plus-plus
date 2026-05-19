@@ -192,8 +192,22 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
     ? 'via Restream'
     : PLATFORM_LABELS[m.platform];
   const ignoredLabel = regexIgnoredBadgeLabel(m);
+  // v0.1.43 — optimistic-send status indicators (only set on
+  // locally-minted placeholders; see `ChatMessage.pendingSend` docstring).
+  // `sending` → faint "sending…" hint next to the timestamp so the user
+  // knows the POST hasn't completed yet. `failed` → small ⚠ next to the
+  // message body whose tooltip carries `pendingError`. Failed messages
+  // are never auto-removed; subsequent sends are never blocked by them.
+  const isSending = m.pendingSend === 'sending';
+  const isFailed = m.pendingSend === 'failed';
   return (
-    <div className={`message-row${m.self ? ' self' : ''}`}>
+    <div
+      className={
+        `message-row${m.self ? ' self' : ''}` +
+        (isSending ? ' pending-send' : '') +
+        (isFailed ? ' send-failed' : '')
+      }
+    >
       <span
         className="platform-badge"
         style={color ? { background: color } : undefined}
@@ -206,9 +220,28 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
           <span className="platform-label">{platformLabel}</span>
           {m.self && <span className="self-badge">self</span>}
           <span className="timestamp">{formatTs(m.ts)}</span>
+          {isSending && (
+            <span
+              className="send-status-hint sending"
+              title="Sending to Restream…"
+              aria-label="Sending"
+            >
+              sending…
+            </span>
+          )}
         </div>
         <div className="body">
           {m.text}
+          {isFailed && (
+            <span
+              className="send-failed-icon"
+              title={m.pendingError ?? 'Send failed.'}
+              aria-label={`Send failed: ${m.pendingError ?? 'unknown error'}`}
+              role="img"
+            >
+              {'⚠'}
+            </span>
+          )}
           {ignoredLabel && (
             <span
               className="regex-ignored-badge"

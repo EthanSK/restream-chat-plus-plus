@@ -4,6 +4,8 @@ import type {
   AuthStatus,
   ChatConnection,
   ChatMessage,
+  ChatSendEnqueuePayload,
+  ChatSendStatus,
   ConnectionState,
   NativeVoiceWire,
   SendTextResult,
@@ -87,6 +89,33 @@ const api = {
    */
   sendChatText: (text: string): Promise<SendTextResult> =>
     ipcRenderer.invoke(IPC.CHAT_SEND_TEXT, text),
+  /**
+   * v0.1.43 — fire-and-forget enqueue for the non-blocking inline chat
+   * input. The renderer mints `clientId` (UUID) BEFORE calling this so it
+   * can render the optimistic placeholder immediately, then ships
+   * `{ clientId, text }` down to the main-process queue. The main queue
+   * serialises sends + broadcasts `ChatSendStatus` events back via
+   * `onChatSendStatus`. The renderer NEVER awaits this — the input
+   * clears synchronously the moment Enter is pressed so the user can
+   * spam-send without blocking.
+   */
+  enqueueChatSend: (payload: ChatSendEnqueuePayload): void => {
+    try {
+      ipcRenderer.send(IPC.CHAT_SEND_ENQUEUE, payload);
+    } catch {
+      /* never let an IPC failure break the renderer's input loop */
+    }
+  },
+  /**
+   * v0.1.43 — subscribe to lifecycle status events for queued sends.
+   * Renderer keys updates by `clientId` to flip the per-message
+   * "sending…" / sent / failed (⚠) state in the chat feed.
+   */
+  onChatSendStatus: (cb: (status: ChatSendStatus) => void): Unsub => {
+    const h = (_: unknown, status: ChatSendStatus) => cb(status);
+    ipcRenderer.on(IPC.CHAT_SEND_STATUS, h);
+    return () => ipcRenderer.removeListener(IPC.CHAT_SEND_STATUS, h);
+  },
   /**
    * Ask the main process to pop a native context menu anchored at the
    * current cursor position. The only item today is "Clear chat" — on

@@ -13,6 +13,10 @@ import {
 import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
+import {
+  dispatchEnqueueChatSend,
+  mintChatClientId,
+} from './chat-send-client';
 import { SettingsDrawer } from './SettingsDrawer';
 import { UpdateBanner } from './UpdateBanner';
 import { makeTtsEngine, RateLimiter, type TtsEngineLike } from './tts';
@@ -22,6 +26,11 @@ import {
   applyMessageFilters,
   compileIgnorePatterns,
 } from './message-filters';
+import {
+  applyFailedSendStatus,
+  dedupeOptimisticOnEcho,
+  pushOptimisticMessage,
+} from './chat-message-reducers';
 
 const MAX_MESSAGES = 1000;
 
@@ -135,11 +144,22 @@ export function App(): React.ReactElement {
         flags.ignoredByTts || flags.ignoredByNotifications
           ? { ...m, ...flags }
           : m;
-      setMessages((prev) => {
-        const next = [...prev, flagged];
-        if (next.length > MAX_MESSAGES) next.splice(0, next.length - MAX_MESSAGES);
-        return next;
-      });
+      // v0.1.43: dedupe against any locally-minted optimistic placeholder
+      // (the WS rebroadcasts the streamer's own outgoing reply as a
+      // `reply_created` echo, normalised with `id === clientReplyUuid`).
+      // If we already have a placeholder with this id, REPLACE it with
+      // the echo so the feed shows the user's message exactly once.
+      setMessages((prev) => dedupeOptimisticOnEcho(prev, flagged, MAX_MESSAGES));
+    });
+    // v0.1.43 — listen for queue lifecycle updates and flip the matching
+    // optimistic placeholder. `pending` is a no-op (the placeholder is
+    // already in the feed from the click handler). `sent` doesn't touch
+    // state either — the WS echo replaces the placeholder via the
+    // dedupe path above. `failed` keeps the placeholder visible with a
+    // small ⚠ + tooltip carrying the error.
+    const offSendStatus = rcpp.onChatSendStatus((status) => {
+      if (status.status !== 'failed') return;
+      setMessages((prev) => applyFailedSendStatus(prev, status));
     });
     const offMenu = rcpp.onMenuOpenSettings(() => setDrawerOpen(true));
     // "Clear chat" can be triggered from either the chat-feed right-click
@@ -217,12 +237,34 @@ export function App(): React.ReactElement {
       offConn();
       offConnections();
       offChat();
+      offSendStatus();
       offMenu();
       offClear();
       offSettingsPush();
       offUpdate();
     };
   }, []);
+
+  // v0.1.43 — non-blocking send. Mint the optimistic placeholder, push
+  // it into the feed synchronously, fire the enqueue IPC. The renderer
+  // NEVER awaits the result so the user can spam-send. The placeholder's
+  // `id` is the same uuid we ship to Restream as `clientReplyUuid`; the
+  // eventual WS echo arrives with that same id and the `onChatMessage`
+  // listener above replaces the placeholder in place.
+  const handleInlineSend = (text: string): void => {
+    const clientId = mintChatClientId();
+    const optimistic: ChatMessage = {
+      id: clientId,
+      platform: 'unknown',
+      username: 'You',
+      text,
+      ts: Date.now(),
+      self: true,
+      pendingSend: 'sending',
+    };
+    setMessages((prev) => pushOptimisticMessage(prev, optimistic, MAX_MESSAGES));
+    dispatchEnqueueChatSend(text, clientId);
+  };
 
   // Forward each new message to TTS + native notifications, honouring the
   // platform filter and the v0.1.26 regex-ignore lists.
@@ -392,6 +434,7 @@ export function App(): React.ReactElement {
       <ChatInputInline
         authenticated={auth.authenticated}
         connected={conn.status === 'connected'}
+        onSend={handleInlineSend}
       />
       {drawerOpen && (
         <SettingsDrawer

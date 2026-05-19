@@ -54,6 +54,33 @@ export interface ChatMessage {
    * collapses to "🔇🔕 regex-ignored". v0.1.26.
    */
   ignoredByNotifications?: boolean;
+  /**
+   * v0.1.43 — only set on locally-minted OPTIMISTIC placeholders for
+   * outgoing messages the user just hit Enter on. The renderer pushes
+   * the placeholder into the feed synchronously (so the user sees their
+   * text instantly) and the main-process queue broadcasts a
+   * `ChatSendStatus` back over `CHAT_SEND_STATUS`.
+   *
+   *   - `'sending'` — POST hasn't completed yet; renders a faint
+   *                   "sending…" hint next to the timestamp.
+   *   - `'failed'`  — POST returned non-2xx (or auth/cookies missing).
+   *                   Renders a small ⚠ icon next to the message body
+   *                   whose `title` (tooltip) is `pendingError`.
+   *
+   * When the matching WS `reply_created` echo arrives (matched by
+   * `id === clientReplyUuid`), the optimistic placeholder is REPLACED
+   * with the echo — which has `self: true` and no `pendingSend` flag.
+   * Failed placeholders are NEVER auto-removed: the user sees the ⚠
+   * persistently until they take action (clear chat, dismiss).
+   *
+   * Undefined for all incoming messages and for echoed self messages.
+   */
+  pendingSend?: 'sending' | 'failed';
+  /**
+   * Human-readable error string surfaced as the ⚠ icon's tooltip when
+   * `pendingSend === 'failed'`. v0.1.43.
+   */
+  pendingError?: string;
 }
 
 /**
@@ -295,6 +322,26 @@ export const IPC = {
    * showId | eventId | instant body-shape union.
    */
   CHAT_SEND_TEXT: 'chat:send-text',
+  /**
+   * v0.1.43: fire-and-forget enqueue channel for the non-blocking inline
+   * chat input. The renderer pushes `{ clientId, text }` and IMMEDIATELY
+   * resumes accepting input — the main-process queue serialises the actual
+   * POSTs and broadcasts lifecycle updates back over `CHAT_SEND_STATUS`.
+   *
+   * Coexists with the legacy invoke-based `CHAT_SEND_TEXT` (left in place
+   * so any external callers / MCP tooling that still awaits the result
+   * keep working — the v0.1.42 invoke handler is unchanged).
+   */
+  CHAT_SEND_ENQUEUE: 'chat:send-enqueue',
+  /**
+   * v0.1.43: main → renderer push of `ChatSendStatus` lifecycle events
+   * for queued sends. Fires `pending` when the queue accepts the enqueue,
+   * `sent` when the POST succeeds (HTTP 2xx), `failed` when the POST or
+   * the queue's internal validation fails. Renderer uses these to drive
+   * the optimistic placeholder + ⚠ error icon next to the message in
+   * the chat feed.
+   */
+  CHAT_SEND_STATUS: 'chat:send-status',
   /**
    * Renderer → main. Asks the main process to pop a native context menu
    * (Menu.buildFromTemplate + popup) anchored at the cursor. Currently the
@@ -582,4 +629,47 @@ export interface SendTextResult {
     | 'error';
   status?: number;
   error?: string;
+}
+
+/**
+ * v0.1.43 — wire payload for a single `CHAT_SEND_ENQUEUE` IPC. The
+ * renderer mints `clientId` (UUID) and uses it as BOTH the optimistic
+ * message id in the local feed AND the Restream `clientReplyUuid`. When
+ * the WS rebroadcasts the `reply_created` echo, the normaliser surfaces
+ * a ChatMessage with the SAME `id` — the renderer deduplicates by
+ * matching ids and drops the optimistic placeholder in favour of the
+ * echo.
+ */
+export interface ChatSendEnqueuePayload {
+  clientId: string;
+  text: string;
+}
+
+/**
+ * v0.1.43 — lifecycle status for a queued chat send, broadcast over
+ * `CHAT_SEND_STATUS`.
+ *
+ *   - `pending`  — the main-process queue accepted the enqueue. The
+ *                  renderer already shows the optimistic placeholder; this
+ *                  is a no-op confirmation but useful for tests / future
+ *                  debug instrumentation.
+ *   - `sent`     — the POST returned 2xx. The renderer can downgrade any
+ *                  "sending…" affordance; the WS echo (matched by
+ *                  clientReplyUuid → message id) is what actually
+ *                  replaces the placeholder in the feed.
+ *   - `failed`   — the POST failed (or the queue dropped the send for a
+ *                  pre-POST reason — auth, cookies, no connections, etc.).
+ *                  Renderer keeps the optimistic message in the feed with
+ *                  a small ⚠ icon + tooltip carrying `error`. Subsequent
+ *                  sends are NEVER blocked by a single failure.
+ */
+export interface ChatSendStatus {
+  clientId: string;
+  status: 'pending' | 'sent' | 'failed';
+  /** When status==='failed', the reason code from SendTextResult. */
+  reason?: SendTextResult['reason'];
+  /** When status==='failed', a human-readable error string. */
+  error?: string;
+  /** When status==='failed', the HTTP status (if the failure was a non-2xx). */
+  httpStatus?: number;
 }

@@ -17,6 +17,7 @@ import {
   type ChatSendLogRecord,
   type ChatContext,
 } from './chat-send';
+import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
@@ -41,6 +42,8 @@ import {
   Settings,
   AuthStatus,
   ConnectionState,
+  ChatSendEnqueuePayload,
+  ChatSendStatus,
   NativeVoiceWire,
   SendTextResult,
   TtsLogEvent,
@@ -1248,6 +1251,92 @@ app.on('ready', async () => {
         reason: 'error',
         error: String((err as Error)?.message ?? err),
       };
+    }
+  });
+
+  // ----- v0.1.43: non-blocking enqueue path ------------------------------
+  // The renderer's inline chat-input bar uses `ipcRenderer.send` (NOT
+  // `invoke`) so the input clears immediately on Enter — no awaiting the
+  // POST. The FIFO queue below serialises the actual sends + broadcasts
+  // status lifecycle events back over `CHAT_SEND_STATUS`.
+  //
+  // Behavioural contract:
+  //   - Every enqueue is accepted (no "wait 0.x s" surface). The 1 msg/sec
+  //     pacing lives inside the queue, not at the IPC boundary.
+  //   - A failure on one send NEVER blocks subsequent sends.
+  //   - The renderer renders the optimistic placeholder from the click
+  //     handler immediately; the queue's `pending` status is a no-op
+  //     confirmation. `sent` lets the renderer downgrade any "sending…"
+  //     affordance (the WS echo, matched by clientReplyUuid → id, is
+  //     what actually replaces the placeholder in the feed). `failed`
+  //     keeps the placeholder + paints a small ⚠ with the error in
+  //     a tooltip.
+  const emitSendStatus = (status: ChatSendStatus): void => {
+    try {
+      mainWindow?.webContents.send(IPC.CHAT_SEND_STATUS, status);
+    } catch (err) {
+      console.error('[main] CHAT_SEND_STATUS emit failed', err);
+    }
+  };
+  const sendQueue: ChatSendQueue = createChatSendQueue({
+    runSend: async (item) => {
+      // Per-send auth gate: chat.getConnections() / oauth state can drift
+      // between enqueue and actual POST (sign-out, token expiry). Re-check
+      // here so a stale enqueue doesn't 401 against Restream.
+      if (!(await oauth.isAuthenticatedAsync())) {
+        return { ok: false, reason: 'not-authenticated' };
+      }
+      return sendChatText({
+        text: item.text,
+        connections: chat.getConnections(),
+        context: chat.getChatContext(),
+        fetchContext: fetchActiveChatContextFromApi,
+        refreshContext: refreshChatContextForce,
+        log: appendChatSendLog,
+        parentWindow: mainWindow,
+        // v0.1.43: pin the Restream `clientReplyUuid` to the
+        // renderer-minted `clientId`. The WS rebroadcasts a
+        // `reply_created` echo whose `clientReplyUuid` becomes the
+        // ChatMessage `id` (see `src/main/normalize.ts`). The renderer
+        // matches the optimistic placeholder by that id and drops it in
+        // favour of the echo, so the user sees their message exactly
+        // once even though both code paths emit it.
+        uuid: () => item.clientId,
+      });
+    },
+    emitStatus: emitSendStatus,
+    // Keep the 1 msg/sec spacing the v0.1.42 IPC gate enforced. This
+    // protects against Restream's own throttle on rapid spam.
+    minSpacingMs: 1000,
+    log: (event, data) =>
+      console.warn(`[main] chat-send-queue ${event}`, data ?? {}),
+  });
+  ipcMain.on(IPC.CHAT_SEND_ENQUEUE, (_evt, payload: ChatSendEnqueuePayload) => {
+    try {
+      if (
+        !payload ||
+        typeof payload.clientId !== 'string' ||
+        !payload.clientId ||
+        typeof payload.text !== 'string'
+      ) {
+        return;
+      }
+      const text = payload.text.trim();
+      if (!text) return;
+      sendQueue.enqueue({ clientId: payload.clientId, text });
+    } catch (err) {
+      console.error('[main] CHAT_SEND_ENQUEUE handler failed', err);
+      // Best-effort: surface the failure as a failed status so the
+      // renderer's ⚠ icon shows up rather than the message sitting in
+      // "sending…" forever.
+      if (payload?.clientId) {
+        emitSendStatus({
+          clientId: payload.clientId,
+          status: 'failed',
+          reason: 'error',
+          error: String((err as Error)?.message ?? err),
+        });
+      }
     }
   });
 
