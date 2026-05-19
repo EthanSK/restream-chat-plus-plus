@@ -4,7 +4,6 @@ import {
   ipcMain,
   Menu,
   Notification,
-  session,
   shell,
 } from 'electron';
 import path from 'node:path';
@@ -868,83 +867,6 @@ app.on('ready', async () => {
 
   // ----- IPC: connections (channels panel pull-fetch) -----
   ipcMain.handle(IPC.CONNECTIONS_GET, () => chat.getConnections());
-
-  // ----- IPC: open Restream's official webchat (escape hatch) -----
-  //
-  // v0.1.34: the native React Compose window (v0.1.32-v0.1.33) was removed
-  // — it duplicated the inline send path with no functional value beyond
-  // what inline + this webchat escape-hatch provide together. This handler
-  // remains as the single button for: (a) users who need Restream's full
-  // reply UI (emoji picker, per-platform channel targeting), (b)
-  // recovering from an expired session cookie. Exposed via the "Webchat"
-  // ghost button next to the inline send arrow.
-  ipcMain.handle(IPC.CHAT_OPEN_RESTREAM_WEBCHAT, async () => {
-    try {
-      // v0.1.38: async — covers the case where the user clicks "Webchat"
-      // before the boot deferred decrypt has resolved.
-      const token = await oauth.getTokenAsync();
-      if (!token) return { ok: false as const, reason: 'not-authenticated' as const };
-      let url = '';
-      try {
-        const res = await fetch('https://api.restream.io/v2/user/webchat/url', {
-          headers: { authorization: `Bearer ${token.accessToken}` },
-        });
-        if (res.ok) {
-          const json: any = await res.json();
-          if (typeof json?.webchatUrl === 'string') url = json.webchatUrl;
-        } else {
-          console.warn(
-            '[main] webchat-url fetch failed status=' + res.status + ', falling back to chat.restream.io',
-          );
-        }
-      } catch (err) {
-        console.warn('[main] webchat-url fetch threw, falling back to chat.restream.io', err);
-      }
-      if (!url) url = 'https://chat.restream.io';
-      const win = new BrowserWindow({
-        // Restream's /embed needs the bigger frame to render without
-        // min-width clipping — keep the pre-v0.1.32 dimensions for this
-        // escape hatch only.
-        width: 720,
-        height: 720,
-        minWidth: 480,
-        minHeight: 420,
-        useContentSize: true,
-        resizable: true,
-        title: 'Restream Webchat',
-        backgroundColor: '#0d1117',
-        parent: mainWindow ?? undefined,
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          session: session.fromPartition('persist:restream-oauth'),
-          zoomFactor: 1.0,
-        },
-      });
-      win.webContents.on('did-finish-load', () => {
-        try {
-          win.webContents.setZoomFactor(1.0);
-          win.webContents.setVisualZoomLevelLimits(1, 1);
-        } catch (err) {
-          console.error('[main] webchat zoom reset failed', err);
-        }
-      });
-      try {
-        attachComposeRequestLogger(win, chat.getRawLogPath());
-      } catch (err) {
-        console.error('[main] failed to attach webchat request logger', err);
-      }
-      void win.loadURL(url);
-      return { ok: true as const };
-    } catch (err) {
-      console.error('[main] open restream webchat failed', err);
-      return {
-        ok: false as const,
-        reason: 'error' as const,
-        error: String((err as Error)?.message ?? err),
-      };
-    }
-  });
 
   // ----- IPC: inline chat send via Restream's /client/reply endpoint -----
   // Direct fetch from main using the OAuth partition's chat-session cookies.

@@ -187,7 +187,14 @@ describe('normalizeRestreamEvent', () => {
   // which is why Ethan's own messages appeared in the official Restream
   // Chat app but not in our feed.
   describe('reply_created → self ChatMessage', () => {
-    it('surfaces a common reply (eventSourceId=1) as self with platform from connectionIdentifiers', () => {
+    it('surfaces a common reply (eventSourceId=1) as self with platform="unknown" (v0.1.40)', () => {
+      // Common replies are broadcast to ALL connected channels — there's
+      // no single destination platform. We tag them `'unknown'` rather
+      // than picking the first recognised platform out of the
+      // connectionIdentifiers array, because that array's order is not
+      // stable across replies (Ethan voice 3424: "sometimes it goes via
+      // X, sometimes goes via Facebook"). The ChatFeed renders these as
+      // "via Restream" instead of showing a Twitch/YouTube/X badge.
       const raw = {
         action: 'reply_created',
         payload: {
@@ -210,8 +217,39 @@ describe('normalizeRestreamEvent', () => {
       expect(m!.username).toBe('You');
       expect(m!.self).toBe(true);
       expect(m!.id).toBe('reply-1');
-      // First recognised platform wins for common replies.
-      expect(m!.platform).toBe('youtube');
+      // v0.1.40: common replies always render WITHOUT a platform badge —
+      // 'unknown' is the marker the renderer uses to swap the label to
+      // "via Restream" + drop the platform colour-coding.
+      expect(m!.platform).toBe('unknown');
+    });
+
+    it('does NOT vary platform on common replies (eventSourceId=1) when connectionIdentifiers order changes', () => {
+      // Regression test for voice 3424 — pre-v0.1.40 picked the first
+      // recognised platform from connectionIdentifiers, which made the
+      // badge flip between X / Facebook / Twitch / YouTube depending on
+      // Restream's internal ordering of the array. Now both orderings
+      // resolve to the same 'unknown' marker.
+      const buildRaw = (ids: string[]) => ({
+        action: 'reply_created',
+        payload: {
+          eventSourceId: 1,
+          connectionIdentifiers: ids,
+          replyUuid: 'reply-x',
+          text: 'broadcast',
+        },
+      });
+      const a = normalizeRestreamEvent(buildRaw([
+        '5849342-x-1',
+        '5849342-facebook-2',
+        '5849342-twitch-3',
+      ]));
+      const b = normalizeRestreamEvent(buildRaw([
+        '5849342-facebook-2',
+        '5849342-x-1',
+        '5849342-twitch-3',
+      ]));
+      expect(a?.platform).toBe('unknown');
+      expect(b?.platform).toBe('unknown');
     });
 
     it('surfaces a direct Twitch reply (eventSourceId=2) as self/twitch', () => {

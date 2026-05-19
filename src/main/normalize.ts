@@ -53,14 +53,31 @@ export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
     const p = (r.payload ?? {}) as Record<string, any>;
     const text = typeof p.text === 'string' ? p.text : '';
     if (!text) return { drop: { reason: 'no-text' } };
-    // Platform inference: when the reply is sent to ALL connections,
-    // eventSourceId === 1 ("Restream" source). For direct replies the id
-    // matches the destination platform. Fall back to inspecting the first
-    // connectionIdentifier (formatted "<userId>-<platform>-<channelId>") to
-    // recover the platform for common replies too — otherwise every
-    // outgoing common reply renders as "unknown" which looks broken.
+    // Platform inference for self replies:
+    //
+    // - eventSourceId !== 1 → direct reply to a specific destination
+    //   platform (Twitch / YouTube / X / etc.). `mapEventSourceId` returns
+    //   that platform; render the matching badge so the user can see which
+    //   channel their direct reply went to.
+    //
+    // - eventSourceId === 1 → "common reply" broadcast to ALL connected
+    //   channels. There is no single platform — Restream sent the reply
+    //   simultaneously to Twitch + YouTube + Facebook + X + …, and rebroadcast
+    //   the same `reply_created` echo back to us. We deliberately tag these
+    //   as `'unknown'` (rather than first-recognised-from-connectionIdentifiers
+    //   like pre-v0.1.40 did). That earlier "first wins" heuristic meant the
+    //   badge looked random — flipping between X, Facebook, etc. between
+    //   messages — because Restream's connection list order is not stable
+    //   across replies. v0.1.40 product call: self common replies render
+    //   WITHOUT a platform badge (the renderer hides it for `self + unknown`),
+    //   just showing "You" + "self" + a generic Restream tag, which matches
+    //   how the official chat.restream.io page shows the same message
+    //   ("sent by restream.io").
     const platform: Platform =
-      mapEventSourceId(p.eventSourceId) ?? guessPlatformFromConnectionIds(p.connectionIdentifiers);
+      mapEventSourceId(p.eventSourceId) ??
+      (p.eventSourceId === 1
+        ? 'unknown'
+        : guessPlatformFromConnectionIds(p.connectionIdentifiers));
     const ts = Date.now();
     const id =
       (typeof p.replyUuid === 'string' && p.replyUuid) ||

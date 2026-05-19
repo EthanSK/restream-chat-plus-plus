@@ -160,9 +160,8 @@ function EmptyFeedBody({
 }
 
 function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElement {
-  const color = m.color || PLATFORM_COLORS[m.platform];
-  // Self-originated messages (echoes of replies WE sent via the official
-  // Restream Chat webchat / our Compose button) render visually distinct
+  // Self-originated messages (echoes of replies WE sent via the inline
+  // send bar at the bottom of the feed) render visually distinct
   // — accent-tinted background + "You" username + "self" badge — so the
   // user can clearly tell their outgoing post landed without confusing it
   // for an incoming chat. v0.1.10 introduced this when we started
@@ -173,16 +172,38 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
   // "🔕 regex-ignored (notif)" / "🔇🔕 regex-ignored" — next to the
   // message text. Muted color so it doesn't dominate; gives the user
   // immediate positional feedback that their regex matched.
+  //
+  // v0.1.40: self "common replies" (eventSourceId === 1 — broadcast to
+  // ALL connected channels) are normalised with `platform: 'unknown'`
+  // because there's no single destination platform. For those, hide the
+  // platform colour-coding entirely and render a neutral "via Restream"
+  // label instead of "Unknown" — that matches how the official
+  // chat.restream.io page shows the same message ("sent by restream.io")
+  // and avoids the pre-v0.1.40 bug where the badge looked random
+  // because connectionIdentifier order varied between replies. Direct
+  // self replies (eventSourceId === 2/13/20/etc. — sent to ONE specific
+  // platform) keep their normal platform badge so the user can see which
+  // channel a targeted reply landed on.
+  const isSelfCommon = m.self === true && m.platform === 'unknown';
+  const color = isSelfCommon
+    ? undefined
+    : (m.color || PLATFORM_COLORS[m.platform]);
+  const platformLabel = isSelfCommon
+    ? 'via Restream'
+    : PLATFORM_LABELS[m.platform];
   const ignoredLabel = regexIgnoredBadgeLabel(m);
   return (
     <div className={`message-row${m.self ? ' self' : ''}`}>
-      <span className="platform-badge" style={{ background: color }} />
+      <span
+        className="platform-badge"
+        style={color ? { background: color } : undefined}
+      />
       <div className="message-meta">
         <div className="message-header">
-          <span className="username" style={{ color }}>
+          <span className="username" style={color ? { color } : undefined}>
             {m.username}
           </span>
-          <span className="platform-label">{PLATFORM_LABELS[m.platform]}</span>
+          <span className="platform-label">{platformLabel}</span>
           {m.self && <span className="self-badge">self</span>}
           <span className="timestamp">{formatTs(m.ts)}</span>
         </div>

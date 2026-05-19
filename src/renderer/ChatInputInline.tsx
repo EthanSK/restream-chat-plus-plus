@@ -25,10 +25,14 @@ interface Props {
  * v0.1.34: the separate "Compose" window (v0.1.32-v0.1.33) was a wash —
  * it called the SAME `rcpp.sendChatText` IPC as this inline input, so
  * any send bug here also broke Compose. Removing it kept the surface
- * area honest. The "Open Restream webchat" escape-hatch button remains
- * (next to send) for users who need Restream's full reply UI
- * (emoji picker, per-platform channel targeting) or to refresh expired
- * session cookies.
+ * area honest.
+ *
+ * v0.1.40: the small "Webchat" escape-hatch button next to send is also
+ * gone. Inline send works now (v0.1.34 fixed the `/api/client/reply`
+ * endpoint) so the button is redundant — Ethan asked for it removed in
+ * voice 3421. If session cookies expire or the inline send hits a
+ * `no-session-cookies` reason in the future, we'll add a more targeted
+ * recovery affordance rather than a full webchat window button.
  *
  * The cold-start cookie provisioning is handled transparently in the
  * main process — first send may take a beat while it spawns an invisible
@@ -40,7 +44,6 @@ export function ChatInputInline({
 }: Props): React.ReactElement | null {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
-  const [openingWebchat, setOpeningWebchat] = useState(false);
   const [err, setErr] = useState<string | undefined>();
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -88,21 +91,6 @@ export function ChatInputInline({
       // Floor the spinner so the button doesn't strobe on instant rejections
       // (e.g. the 1-msg/sec rate-limiter).
       setTimeout(() => setBusy(false), 220);
-    }
-  };
-
-  const onOpenWebchat = async () => {
-    setOpeningWebchat(true);
-    setErr(undefined);
-    try {
-      const result = await rcpp.openRestreamWebchat();
-      if (!result.ok) {
-        setErr(prettyWebchatReason(result.reason));
-      }
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
-    } finally {
-      setTimeout(() => setOpeningWebchat(false), 250);
     }
   };
 
@@ -156,16 +144,6 @@ export function ChatInputInline({
           </svg>
         )}
       </button>
-      <button
-        type="button"
-        className="btn ghost chat-input-compose-fallback"
-        onClick={() => void onOpenWebchat()}
-        disabled={openingWebchat}
-        title="Open Restream's official webchat (emoji picker, per-platform targeting, cookie refresh)"
-        aria-label="Open Restream webchat"
-      >
-        {openingWebchat ? 'Opening…' : 'Webchat'}
-      </button>
       {err && <span className="chat-input-err">{err}</span>}
     </div>
   );
@@ -176,31 +154,16 @@ function prettyReason(result: SendTextResult): string {
     case 'not-authenticated':
       return 'Sign in to Restream first.';
     case 'no-session-cookies':
-      return 'Chat session not provisioned — open Webchat once to sign in to chat.';
+      return 'Chat session not provisioned yet — try again in a moment.';
     case 'no-active-connections':
       return 'No connected channels to reply to.';
     case 'no-show-id':
       return 'No active Restream show — start streaming (or send one message from Restream’s website) so we can pick up the event.';
     case 'send-failed':
-      return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}. Open Webchat to refresh session.`;
+      return `Send failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? ` — ${result.error}` : ''}.`;
     case 'error':
       return result.error ?? 'Send failed.';
     default:
       return 'Send failed.';
-  }
-}
-
-function prettyWebchatReason(
-  reason: 'not-authenticated' | 'webchat-fetch-failed' | 'no-webchat-url' | 'error',
-): string {
-  switch (reason) {
-    case 'not-authenticated':
-      return 'Sign in to Restream first.';
-    case 'webchat-fetch-failed':
-    case 'no-webchat-url':
-      return 'Could not fetch the webchat URL from Restream.';
-    case 'error':
-    default:
-      return 'Failed to open Restream webchat.';
   }
 }

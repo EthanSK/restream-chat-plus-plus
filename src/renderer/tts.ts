@@ -8,6 +8,32 @@ import type { ChatMessage, Settings } from '../shared/types';
  *   from spiraling during a chat raid)
  * - Allows the user to pick a system voice by URI
  *
+ * v0.1.40 multi-message-stall fix
+ * ===============================
+ *
+ * Ethan voice 3424 reported: "the first message it read out, subsequent
+ * messages it didn't." Codex + Claude diagnosis pointed at two
+ * compounding causes for the queue stalling after the first utterance:
+ *
+ *   1. The SpeechSynthesisUtterance was a function-local variable in
+ *      `speak()` — no strong ref retained on the engine instance — so
+ *      Chromium's GC could collect it mid-flight. When that happened,
+ *      `utter.onend` never fired, `this.speaking` stayed `true` forever,
+ *      and every subsequent `tick()` returned early with "already
+ *      speaking, skipping."
+ *
+ *   2. Even with the ref retained, Web Speech on macOS is notoriously
+ *      flaky — `onend` can fail to fire for opaque reasons unrelated to
+ *      GC. So we add a watchdog timer (`SPEAK_WATCHDOG_MS`) that
+ *      force-resets `speaking` if neither end nor error event arrives
+ *      within the timeout. The queue self-recovers either way.
+ *
+ * Tests in `tts-multi-message.test.ts` exercise:
+ *   - 5 consecutive `enqueue()` calls all reach `speak()` (the
+ *     primary regression)
+ *   - The watchdog drains the queue when `onend` never fires
+ *   - `cancel()` resets the currentUtter ref + watchdog
+ *
  * v0.1.23 latching-fix notes (supersedes v0.1.22)
  * ===============================================
  *
@@ -86,11 +112,44 @@ function log(...args: unknown[]) {
   console.log(LOG_PREFIX, ...args);
 }
 
+/**
+ * Max wall-clock seconds the engine will trust an in-flight utterance
+ * before treating it as silently failed and force-resetting the
+ * `speaking` flag so the next queued message can be processed.
+ *
+ * Cap is generous (60s) since chat messages are short — most utterances
+ * finish in <5s — but we want headroom for slow voices + long messages.
+ * The watchdog ONLY fires when `utter.onend` AND `utter.onerror` both
+ * fail to land within this window, which is the Bug-2 failure mode:
+ * Electron 42 Chromium occasionally drops the end event after the FIRST
+ * successful speak, leaving subsequent messages stuck in queue forever.
+ */
+const SPEAK_WATCHDOG_MS = 60_000;
+
 export class TTSEngine {
   private queue: ChatMessage[] = [];
   private speaking = false;
   private timestamps: number[] = []; // ms of recent spoken utterances
   private settings: Settings['tts'];
+  /**
+   * Strong reference to the in-flight utterance so the JS engine never
+   * GCs it mid-flight. Bug-2 root cause (Codex + Claude diagnosis,
+   * v0.1.40): without retaining the utter, Electron 42 Chromium can
+   * drop `onend` after the FIRST successful playback, leaving
+   * `this.speaking = true` forever and silently blocking every
+   * subsequent `tick()` as "already speaking". Holding the utterance
+   * here keeps it alive until we explicitly clear it on end/error.
+   */
+  private currentUtter: SpeechSynthesisUtterance | null = null;
+  /**
+   * Watchdog timer for Bug-2 belt-and-suspenders. Even with the utter
+   * retained, Web Speech is notoriously flaky on macOS — `onend` can
+   * still fail to fire for opaque reasons. When that happens we want
+   * the queue to recover ON ITS OWN rather than waiting forever for an
+   * event that never arrives. Fires `SPEAK_WATCHDOG_MS` after each
+   * `speak()`, treats the utterance as ended, drains the queue.
+   */
+  private speakWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   constructor(settings: Settings['tts']) {
     this.settings = settings;
@@ -115,6 +174,7 @@ export class TTSEngine {
     if (!settings.enabled) {
       this.queue = [];
       this.speaking = false;
+      this.clearCurrentUtter();
       if (this.hasActiveSpeechSynthesis()) this.cancel();
     }
   }
@@ -141,6 +201,7 @@ export class TTSEngine {
       window.speechSynthesis.cancel();
     }
     this.speaking = false;
+    this.clearCurrentUtter();
   }
 
   voices(): SpeechSynthesisVoice[] {
@@ -180,18 +241,40 @@ export class TTSEngine {
     if (voice) utter.voice = voice;
     this.speaking = true;
     this.timestamps.push(Date.now());
+    // Retain a strong ref to the utterance for the lifetime of this
+    // playback so the JS engine can't GC it out from under
+    // SpeechSynthesis (Bug-2 root cause, see field comment above).
+    this.currentUtter = utter;
+
+    const onDone = (reason: 'end' | 'error' | 'watchdog', detail?: unknown) => {
+      // Guard against late events firing AFTER the watchdog already
+      // marked this utterance done — we only want to advance the queue
+      // ONCE per utterance.
+      if (this.currentUtter !== utter) {
+        log('onDone fired but currentUtter has already moved on', { reason });
+        return;
+      }
+      log(`utter.${reason} (chat)`, detail !== undefined ? { detail } : undefined);
+      this.speaking = false;
+      this.clearCurrentUtter();
+      setTimeout(() => this.tick(), 50);
+    };
 
     utter.onstart = () => log('utter.onstart (chat)');
-    utter.onend = () => {
-      log('utter.onend (chat)');
-      this.speaking = false;
-      setTimeout(() => this.tick(), 50);
-    };
-    utter.onerror = (e) => {
-      log('utter.onerror (chat)', { error: (e as SpeechSynthesisErrorEvent).error });
-      this.speaking = false;
-      setTimeout(() => this.tick(), 50);
-    };
+    utter.onend = () => onDone('end');
+    utter.onerror = (e) =>
+      onDone('error', (e as SpeechSynthesisErrorEvent).error);
+
+    // Watchdog: if neither onend nor onerror fires within
+    // SPEAK_WATCHDOG_MS, treat the utterance as ended so we can move
+    // on to the next queued message. This guards against the Electron
+    // 42 Chromium quirk where `onend` is silently dropped after the
+    // first successful playback, which was the v0.1.40 Bug-2 root cause
+    // (Codex + Claude diagnosis).
+    this.clearSpeakWatchdog();
+    this.speakWatchdog = setTimeout(() => {
+      onDone('watchdog');
+    }, SPEAK_WATCHDOG_MS);
 
     // Lift latched paused state BEFORE cancel/speak (note #5 above).
     if (window.speechSynthesis.paused) {
@@ -204,6 +287,18 @@ export class TTSEngine {
       pending: window.speechSynthesis.pending,
     });
     window.speechSynthesis.speak(utter);
+  }
+
+  private clearCurrentUtter(): void {
+    this.currentUtter = null;
+    this.clearSpeakWatchdog();
+  }
+
+  private clearSpeakWatchdog(): void {
+    if (this.speakWatchdog !== null) {
+      clearTimeout(this.speakWatchdog);
+      this.speakWatchdog = null;
+    }
   }
 
   /**

@@ -646,11 +646,6 @@ body {
   padding: 6px 10px;
 }
 .chat-input-send svg { display: block; }
-.chat-input-compose-fallback {
-  height: 30px;
-  font-size: 11px;
-  padding: 6px 10px;
-}
 
 /* ------------------------------- Settings -------------------------------- */
 
@@ -956,5 +951,7 @@ body {
 
 /* v0.1.34: the native Compose-window CSS block that lived here in
  * v0.1.32-v0.1.33 was removed alongside `ComposeApp.tsx` — the wrapper
- * window duplicated the inline send path with no functional value beyond
- * what the inline input + "Webchat" escape-hatch provide together. */
+ * window duplicated the inline send path with no functional value.
+ * v0.1.40: the "Webchat" escape-hatch button next to inline send was
+ * also removed now that the inline `/api/client/reply` send path is
+ * fully working (v0.1.34+). */

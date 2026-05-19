@@ -67,27 +67,6 @@ const api = {
     return () => ipcRenderer.removeListener(IPC.CONNECTIONS, h);
   },
   /**
-   * Open Restream's official webchat (chat.restream.io) in a dedicated
-   * BrowserWindow. This is the escape hatch for users who need Restream's
-   * full reply UI (emoji picker, per-platform channel targeting) or to
-   * refresh expired session cookies. Bound to the small "Webchat" button
-   * next to the inline send arrow.
-   *
-   * v0.1.34: the native React Compose window that previously wrapped this
-   * was removed — it called the same `sendChatText` IPC as the inline
-   * input so any send-path bug also broke Compose; the wrapper added no
-   * functional value beyond what inline + this button provide together.
-   */
-  openRestreamWebchat: (): Promise<
-    | { ok: true }
-    | {
-        ok: false;
-        reason: 'not-authenticated' | 'webchat-fetch-failed' | 'no-webchat-url' | 'error';
-        status?: number;
-        error?: string;
-      }
-  > => ipcRenderer.invoke(IPC.CHAT_OPEN_RESTREAM_WEBCHAT),
-  /**
    * Send a chat reply inline via Restream's internal
    * `POST /api/client/reply` endpoint. The reply gets broadcast back as
    * a `reply_created` WS frame which surfaces in the feed as a

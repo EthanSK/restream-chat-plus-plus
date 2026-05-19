@@ -248,28 +248,16 @@ export const IPC = {
   /** Pull-fetch counterpart so the renderer can sync on mount. */
   CONNECTIONS_GET: 'connections:get',
   /**
-   * Open Restream's official webchat at https://chat.restream.io in a
-   * dedicated BrowserWindow. Escape hatch for users who need Restream's
-   * full reply UI (emoji picker, per-platform channel targeting) or to
-   * refresh expired session cookies. Bound to the "Webchat" ghost button
-   * next to the inline send arrow.
-   *
-   * v0.1.34: the native React Compose window that previously wrapped this
-   * (v0.1.32-v0.1.33) was removed — it duplicated the inline send path
-   * with no functional differentiation. See preload.ts `openRestreamWebchat`.
-   */
-  CHAT_OPEN_RESTREAM_WEBCHAT: 'chat:open-restream-webchat',
-  /**
    * Send a chat reply text directly via Restream's internal
    * `POST /api/client/reply` endpoint. The renderer's inline chat-input
    * bar invokes this.
    *
    * Main process pulls the chat-session cookies from the
    * `persist:restream-oauth` Electron partition (provisioned when the user
-   * signed in or via the Webchat escape hatch), grabs the
-   * `accessXsrfToken` cookie as the `x-axsrf-token` header, and POSTs the
-   * body. The successful send is echoed back as a `reply_created` WS frame
-   * which our normaliser already surfaces as a `self: true` ChatMessage.
+   * signed in), grabs the `accessXsrfToken` cookie as the `x-axsrf-token`
+   * header, and POSTs the body. The successful send is echoed back as a
+   * `reply_created` WS frame which our normaliser already surfaces as a
+   * `self: true` ChatMessage.
    *
    * v0.1.34: endpoint corrected from `/api/v2/client/reply` (404 ghost
    * route) to `/api/client/reply` (the real path the live chat.restream.io
