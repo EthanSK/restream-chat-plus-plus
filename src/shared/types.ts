@@ -98,9 +98,35 @@ export interface ConnectionState {
   lastError?: string;
 }
 
+/**
+ * TTS engine implementation, v0.1.42.
+ *
+ * - `native` — macOS `say(1)` subprocess driven from the main process.
+ *   Reliable, no Chromium bugs, but currently macOS-only. The renderer
+ *   IPCs into `IPC.TTS_NATIVE_*` channels; the queue lives in the
+ *   main-process `NativeTtsEngine` (`src/main/tts-native.ts`).
+ * - `browser` — Chromium `window.speechSynthesis`. The historical engine
+ *   that v0.1.40 / v0.1.41 hardened with watchdogs. Retained behind the
+ *   toggle so a future Linux / Windows build can keep working without
+ *   needing the OS-specific `say` binary.
+ *
+ * Default is `native` on macOS (which is currently the only target
+ * RC++ ships for). The renderer's `TTSEngine` factory picks the
+ * implementation off this setting at construct + update time, so flipping
+ * the dropdown takes effect for the next enqueued message without an
+ * app restart.
+ */
+export type TtsEngineKind = 'native' | 'browser';
+
 export interface Settings {
   tts: {
     enabled: boolean;
+    /**
+     * Which speech-synthesis backend to use. See `TtsEngineKind` for
+     * the per-value semantics. Defaults to `'native'` on macOS so users
+     * who haven't touched the toggle get the reliable path automatically.
+     */
+    engine: TtsEngineKind;
     /**
      * When true, TTS prefixes each message with the sender's display name,
      * e.g. "alice says hello world". When false (default), only the message
@@ -168,6 +194,10 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   tts: {
     enabled: false,
+    // v0.1.42: default to the native macOS `say` engine. It's the only
+    // platform we currently ship for and the renderer's Web Speech path
+    // has been a recurring source of "TTS just stopped working" issues.
+    engine: 'native',
     readSenderName: false,
     voiceURI: undefined,
     rate: 1.0,
@@ -360,7 +390,68 @@ export const IPC = {
    * single log instead of asking Ethan to keep DevTools open.
    */
   TTS_LOG: 'tts:log',
+  /**
+   * v0.1.42 native-`say` engine IPC channels. The renderer pushes text
+   * onto `TTS_NATIVE_ENQUEUE`; the main process holds the queue + spawns
+   * `say` subprocesses. `TTS_NATIVE_CANCEL` SIGTERMs the in-flight child
+   * and drops the queue. `TTS_NATIVE_UPDATE_SETTINGS` propagates a fresh
+   * `NativeTtsSettings` slice (voice / rate / volume) for the next
+   * utterance. `TTS_NATIVE_GET_VOICES` async-returns the parsed
+   * `say -v "?"` list as `NativeVoice[]`.
+   *
+   * These channels are fire-and-forget on the enqueue / cancel /
+   * update-settings paths — playback never blocks on an IPC round-trip.
+   * Only `getVoices` is async (renderer awaits the response for the
+   * Settings dropdown).
+   */
+  TTS_NATIVE_ENQUEUE: 'tts-native:enqueue',
+  TTS_NATIVE_CANCEL: 'tts-native:cancel',
+  TTS_NATIVE_UPDATE_SETTINGS: 'tts-native:update-settings',
+  TTS_NATIVE_GET_VOICES: 'tts-native:get-voices',
 } as const;
+
+/**
+ * Wire shape for a single voice entry returned by `IPC.TTS_NATIVE_GET_VOICES`.
+ * Mirrors `NativeVoice` in `src/main/tts-native.ts` (intentionally kept
+ * structurally identical so the main-process value passes through unchanged).
+ *
+ * `lang` is in macOS `say` form (`en_GB`, `fr_FR`) — the underscore
+ * separator differs from the Web Speech API's `en-GB`/`fr-FR`. Renderers
+ * that mix native + browser voices in the same UI should normalise the
+ * separator for display.
+ */
+export interface NativeVoiceWire {
+  /** Display name; may include parenthesised qualifier ("Eddy (English (UK))"). */
+  name: string;
+  /** Locale identifier, `say -v "?"` shape. */
+  lang: string;
+  /** Demo phrase shipped by macOS. May be empty. */
+  sample: string;
+}
+
+/**
+ * Wire payload for `IPC.TTS_NATIVE_ENQUEUE`. Mirrors the
+ * `NativeEnqueueOpts` shape on the main-process side, except we explicitly
+ * carry `text` because IPC payloads are flat.
+ */
+export interface TtsNativeEnqueuePayload {
+  text: string;
+  voice?: string;
+  rate?: number;
+  volume?: number;
+  messageId?: string;
+}
+
+/**
+ * Wire payload for `IPC.TTS_NATIVE_UPDATE_SETTINGS`. Only the fields the
+ * native engine consumes — kept narrow so we don't have to ship the
+ * whole Settings tree across IPC on every voice/rate/volume tweak.
+ */
+export interface TtsNativeSettingsPayload {
+  voiceURI?: string;
+  rate: number;
+  volume: number;
+}
 
 /**
  * Payload shape for `IPC.TTS_LOG`. `event` is a stable lowercase identifier;
@@ -377,7 +468,15 @@ export interface TtsLogEvent {
     | 'watchdog_fired'
     | 'onstart_watchdog_retry'
     | 'keepalive_fired'
-    | 'cancel_called';
+    | 'cancel_called'
+    // v0.1.42 native-engine events. Emitted from `NativeTtsEngine` in
+    // the main process; persisted to the same JSONL file so native +
+    // browser events appear in one timeline ordered by wall clock.
+    | 'native_speak_start'
+    | 'native_speak_end'
+    | 'native_speak_error'
+    | 'native_speak_killed'
+    | 'native_queue_size';
   data?: Record<string, unknown>;
 }
 

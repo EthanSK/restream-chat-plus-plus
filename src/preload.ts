@@ -5,9 +5,12 @@ import type {
   ChatConnection,
   ChatMessage,
   ConnectionState,
+  NativeVoiceWire,
   SendTextResult,
   Settings,
   TtsLogEvent,
+  TtsNativeEnqueuePayload,
+  TtsNativeSettingsPayload,
   UpdateInfo,
 } from './shared/types';
 
@@ -211,6 +214,43 @@ const api = {
     } catch {
       /* never let logging crash playback */
     }
+  },
+  /**
+   * v0.1.42 native-`say` engine bindings. The renderer uses these instead
+   * of `window.speechSynthesis` when `settings.tts.engine === 'native'`.
+   *
+   * - `enqueue` / `cancel` / `updateSettings` are fire-and-forget — the
+   *   main-process queue accepts the message and the renderer never
+   *   awaits an ack. This matches the v0.1.41 browser-engine ergonomics
+   *   (renderer-side queue mutations are also sync).
+   * - `getVoices` is async — returns the parsed `say -v "?"` list as
+   *   `NativeVoiceWire[]`. Cached in main, so subsequent calls during
+   *   the same session resolve immediately.
+   */
+  ttsNative: {
+    enqueue: (payload: TtsNativeEnqueuePayload): void => {
+      try {
+        ipcRenderer.send(IPC.TTS_NATIVE_ENQUEUE, payload);
+      } catch {
+        /* never crash the renderer over a logging/queue IPC */
+      }
+    },
+    cancel: (): void => {
+      try {
+        ipcRenderer.send(IPC.TTS_NATIVE_CANCEL);
+      } catch {
+        /* defensive */
+      }
+    },
+    updateSettings: (payload: TtsNativeSettingsPayload): void => {
+      try {
+        ipcRenderer.send(IPC.TTS_NATIVE_UPDATE_SETTINGS, payload);
+      } catch {
+        /* defensive */
+      }
+    },
+    getVoices: (): Promise<NativeVoiceWire[]> =>
+      ipcRenderer.invoke(IPC.TTS_NATIVE_GET_VOICES),
   },
 };
 

@@ -138,6 +138,10 @@ function fireOnerror(u: FakeUtterance | undefined, error: string): void {
 
 const baseTts: Settings['tts'] = {
   enabled: true,
+  // v0.1.42 adds the engine toggle. These browser-engine regression tests
+  // explicitly exercise the Web Speech code path, so we pin the engine
+  // here regardless of what the global default is.
+  engine: 'browser',
   readSenderName: false,
   voiceURI: undefined,
   rate: 1.0,

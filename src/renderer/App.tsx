@@ -15,7 +15,7 @@ import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
 import { SettingsDrawer } from './SettingsDrawer';
 import { UpdateBanner } from './UpdateBanner';
-import { TTSEngine, RateLimiter } from './tts';
+import { makeTtsEngine, RateLimiter, type TtsEngineLike } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
@@ -38,7 +38,7 @@ export function App(): React.ReactElement {
   // we want a soft nag, not a sticky one. The next launch re-checks and
   // re-shows the banner if the user hasn't actually installed the new build.
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const ttsRef = useRef<TTSEngine | undefined>(undefined);
+  const ttsRef = useRef<TtsEngineLike | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
 
   // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
@@ -71,7 +71,10 @@ export function App(): React.ReactElement {
       const s = await rcpp.getSettings();
       if (!alive) return;
       setSettings(s);
-      ttsRef.current = new TTSEngine(s.tts);
+      // v0.1.42 — engine kind comes from settings (native | browser).
+      // `makeTtsEngine` picks the right implementation; the renderer
+      // talks to the polymorphic `TtsEngineLike` surface from here on.
+      ttsRef.current = makeTtsEngine(s.tts);
       notifyLimiterRef.current = new RateLimiter(s.notifications.maxPerMinute);
       // Pull-fetch the current connection state. The push channel
       // (onConnectionState) only delivers UPDATES — if the main process
@@ -164,12 +167,29 @@ export function App(): React.ReactElement {
     // settings state + re-init the TTS engine + rate limiter so the
     // changes take effect immediately — no restart required.
     const offSettingsPush = rcpp.onSettingsPush((next) => {
-      setSettings(next);
-      try {
-        ttsRef.current?.updateSettings(next.tts);
-      } catch (err) {
-        console.error('[App] TTSEngine.updateSettings on push failed', err);
-      }
+      setSettings((prev) => {
+        // v0.1.42 — if the engine kind changed (native ↔ browser), tear
+        // down the old engine and construct a fresh one. The factory in
+        // `makeTtsEngine` picks the right backing implementation; both
+        // satisfy `TtsEngineLike` so App.tsx never needs to know which
+        // is in use beyond this swap site.
+        const engineChanged = prev?.tts?.engine !== next.tts.engine;
+        if (engineChanged) {
+          try {
+            ttsRef.current?.cancel();
+          } catch (err) {
+            console.error('[App] TTSEngine.cancel on engine swap failed', err);
+          }
+          ttsRef.current = makeTtsEngine(next.tts);
+        } else {
+          try {
+            ttsRef.current?.updateSettings(next.tts);
+          } catch (err) {
+            console.error('[App] TTSEngine.updateSettings on push failed', err);
+          }
+        }
+        return next;
+      });
       try {
         notifyLimiterRef.current = new RateLimiter(next.notifications.maxPerMinute);
       } catch (err) {
@@ -237,8 +257,22 @@ export function App(): React.ReactElement {
   );
 
   const updateSettings = async (next: Settings) => {
+    // v0.1.42: detect engine-kind change BEFORE setState so we can swap
+    // the engine instance synchronously rather than racing the next
+    // render. Avoids a brief window where the new engine setting is in
+    // state but the old engine is still attached.
+    const engineChanged = settings.tts.engine !== next.tts.engine;
     setSettings(next);
-    ttsRef.current?.updateSettings(next.tts);
+    if (engineChanged) {
+      try {
+        ttsRef.current?.cancel();
+      } catch (err) {
+        console.error('[App] TTSEngine.cancel on engine swap failed', err);
+      }
+      ttsRef.current = makeTtsEngine(next.tts);
+    } else {
+      ttsRef.current?.updateSettings(next.tts);
+    }
     notifyLimiterRef.current = new RateLimiter(next.notifications.maxPerMinute);
     await rcpp.setSettings(next);
   };
@@ -366,6 +400,12 @@ export function App(): React.ReactElement {
           onClose={() => setDrawerOpen(false)}
           voices={ttsRef.current?.voices() ?? []}
           onPreviewVoice={(uri) => ttsRef.current?.previewVoice(uri)}
+          // v0.1.42 — native engine has its own voice fetch over IPC.
+          // We feed the function down regardless of engine kind; the
+          // drawer only calls it when `settings.tts.engine === 'native'`.
+          getNativeVoices={() =>
+            rcpp.ttsNative?.getVoices?.() ?? Promise.resolve([])
+          }
         />
       )}
     </div>

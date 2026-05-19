@@ -31,13 +31,21 @@ import {
 } from './github-update-check';
 import { startInProcessMcpServer } from './mcp-server';
 import {
+  NativeTtsEngine,
+  ttsToNativeSettings,
+  type NativeVoice,
+} from './tts-native';
+import {
   DEFAULT_SETTINGS,
   IPC,
   Settings,
   AuthStatus,
   ConnectionState,
+  NativeVoiceWire,
   SendTextResult,
   TtsLogEvent,
+  TtsNativeEnqueuePayload,
+  TtsNativeSettingsPayload,
   UpdateInfo,
 } from '../shared/types';
 
@@ -689,6 +697,75 @@ app.on('ready', async () => {
     appendTtsLog(payload);
   });
 
+  // ----- v0.1.42 native `say` engine wiring ------------------------------
+  // Singleton lives for the lifetime of the main process. We seed it with
+  // the currently-persisted Settings.tts values so the very first enqueue
+  // already knows which voice to use; renderer pushes
+  // `TTS_NATIVE_UPDATE_SETTINGS` whenever the user tweaks the dropdown.
+  const initialNativeSettings = ttsToNativeSettings(loadSettings().tts);
+  const nativeTts = new NativeTtsEngine({
+    settings: initialNativeSettings,
+    log: (event, data) => {
+      // Funnel native events through the same tts-events.jsonl writer
+      // the renderer side already uses. Cast is safe because the
+      // shared `TtsLogEvent` event union explicitly covers the
+      // `native_*` names — see types.ts.
+      appendTtsLog({ event: event as TtsLogEvent['event'], data });
+    },
+  });
+  // Pre-warm the voice cache asynchronously so the first
+  // `TTS_NATIVE_GET_VOICES` call from the Settings drawer feels instant.
+  // Best-effort: a failure here doesn't break anything; the next call
+  // re-probes lazily.
+  void nativeTts.getAvailableVoices().catch((err) => {
+    console.warn('[main] native voice pre-warm failed', err);
+  });
+
+  ipcMain.on(IPC.TTS_NATIVE_ENQUEUE, (_evt, payload: TtsNativeEnqueuePayload) => {
+    if (!payload || typeof payload.text !== 'string') return;
+    nativeTts.enqueue(payload.text, {
+      voice: payload.voice,
+      rate: payload.rate,
+      volume: payload.volume,
+      messageId: payload.messageId,
+    });
+  });
+  ipcMain.on(IPC.TTS_NATIVE_CANCEL, () => {
+    nativeTts.cancel();
+  });
+  ipcMain.on(
+    IPC.TTS_NATIVE_UPDATE_SETTINGS,
+    (_evt, payload: TtsNativeSettingsPayload) => {
+      if (!payload) return;
+      nativeTts.updateSettings({
+        voiceURI: payload.voiceURI,
+        rate: typeof payload.rate === 'number' ? payload.rate : 1.0,
+        volume: typeof payload.volume === 'number' ? payload.volume : 1.0,
+      });
+    },
+  );
+  ipcMain.handle(IPC.TTS_NATIVE_GET_VOICES, async (): Promise<NativeVoiceWire[]> => {
+    try {
+      const voices: NativeVoice[] = await nativeTts.getAvailableVoices();
+      // Pass-through: NativeVoice and NativeVoiceWire are structurally
+      // identical (kept that way deliberately so this stays free).
+      return voices;
+    } catch (err) {
+      console.warn('[main] native getVoices failed', err);
+      return [];
+    }
+  });
+  // SIGTERM the in-flight `say` subprocess on quit so we don't leak
+  // a half-spoken utterance into the user's audio output after the
+  // window closes.
+  app.on('before-quit', () => {
+    try {
+      nativeTts.cancel();
+    } catch (err) {
+      console.warn('[main] nativeTts.cancel on quit failed', err);
+    }
+  });
+
   // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
   // Tears down the live WebSocket, resets attempt counters, and immediately
   // opens a fresh connection. If the stored access token is within 60s of
@@ -789,8 +866,17 @@ app.on('ready', async () => {
   // helper so the in-process HTTP MCP server (`mcp-server.ts`,
   // v0.1.36+) can write through the same path — that guarantees the
   // store + the on-disk JSON + the IPC contract all stay aligned.
+  //
+  // v0.1.42: also pushes the latest TTS slice into the native engine so
+  // a setting change via SETTINGS_SET (UI) or the MCP path picks up
+  // immediately for the next enqueue, with no restart needed.
   function saveSettings(settings: Settings): Settings {
     store.set('settings', settings);
+    try {
+      nativeTts.updateSettings(ttsToNativeSettings(settings.tts));
+    } catch (err) {
+      console.warn('[main] nativeTts.updateSettings on saveSettings failed', err);
+    }
     return settings;
   }
   ipcMain.handle(IPC.SETTINGS_GET, (): Settings => loadSettings());

@@ -112,4 +112,43 @@ describe('Settings migration', () => {
   it('returns autoCheck=true when nothing is persisted (clean install)', () => {
     expect(migrate(undefined).update.autoCheck).toBe(true);
   });
+
+  // -------------------------------------------------------------------------
+  // v0.1.42 — `tts.engine` toggle (native | browser).
+  //
+  // Pre-v0.1.42 settings blobs have no `engine` field. The migration must
+  // back-fill from `DEFAULT_SETTINGS.tts.engine` so the user lands on the
+  // current default (`'native'` on macOS) — which is the whole point of
+  // v0.1.42: replace the flaky Chromium engine with reliable `say`.
+  // -------------------------------------------------------------------------
+  it("DEFAULT_SETTINGS.tts.engine is 'native' (v0.1.42 default)", () => {
+    expect(DEFAULT_SETTINGS.tts.engine).toBe('native');
+  });
+
+  it('defaults tts.engine to native when absent in persisted blob', () => {
+    const legacy = {
+      tts: {
+        enabled: true,
+        readSenderName: false,
+        rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
+        maxPerMinute: 20,
+      },
+    } as unknown as Partial<Settings>;
+
+    const merged = migrate(legacy);
+    expect(merged.tts.engine).toBe('native');
+  });
+
+  it("preserves a user-set tts.engine='browser' across migration", () => {
+    const stored: Partial<Settings> = {
+      tts: {
+        ...DEFAULT_SETTINGS.tts,
+        engine: 'browser',
+      },
+    };
+    const merged = migrate(stored);
+    expect(merged.tts.engine).toBe('browser');
+  });
 });

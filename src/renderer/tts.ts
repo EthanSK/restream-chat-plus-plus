@@ -1,4 +1,10 @@
-import type { ChatMessage, Settings } from '../shared/types';
+import type {
+  ChatMessage,
+  NativeVoiceWire,
+  Settings,
+  TtsNativeEnqueuePayload,
+  TtsNativeSettingsPayload,
+} from '../shared/types';
 
 /**
  * Throttled Web Speech TTS engine.
@@ -768,6 +774,231 @@ export function sortVoicesByQuality<V extends Pick<SpeechSynthesisVoice, 'name'>
     if (r !== 0) return r;
     return a.name.localeCompare(b.name);
   });
+}
+
+// ============================================================================
+// v0.1.42 — engine abstraction + native-`say` IPC client
+// ============================================================================
+//
+// Through v0.1.41 the renderer drove playback directly via the
+// `window.speechSynthesis` API encapsulated in `TTSEngine`. v0.1.42 adds a
+// second backend — the macOS-native `say` CLI driven from the main process
+// via IPC — and a thin polymorphic surface so `App.tsx` can swap engines
+// at runtime without sprouting branches at every call site.
+//
+// The contract is `TtsEngineLike` below: just the methods App.tsx needs
+// (enqueue + updateSettings + cancel + voices + previewVoice). Both
+// engines satisfy it. `makeTtsEngine` picks one based on
+// `settings.tts.engine`.
+//
+// Why a SECOND engine class instead of branching inside TTSEngine?
+//   - Browser engine has a lot of Chromium-specific defensive scaffolding
+//     (strong-ref, 60s watchdog, cancel-before-speak, 8s keep-alive,
+//     500ms onstart watchdog, onerror retry). None of that applies to
+//     `say`. Folding both paths into one class would bloat it and re-
+//     create the kind of "is it browser or native?" branching we're
+//     trying to avoid.
+//   - The native engine is essentially a thin IPC stub — all real logic
+//     lives in `src/main/tts-native.ts`. Clean separation makes the
+//     renderer test surface tiny and lets the main-process module be
+//     unit-tested without DOM globals.
+
+/**
+ * Bridge shape provided by the preload (`window.rcpp.ttsNative`) when the
+ * renderer is running inside Electron. Optional — when undefined (test
+ * environment, hot-reload race) the native engine silently no-ops so a
+ * misconfigured environment can't crash the renderer.
+ */
+interface NativeTtsBridge {
+  enqueue(payload: TtsNativeEnqueuePayload): void;
+  cancel(): void;
+  updateSettings(payload: TtsNativeSettingsPayload): void;
+  getVoices(): Promise<NativeVoiceWire[]>;
+}
+
+function getNativeBridge(): NativeTtsBridge | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (window as unknown as { rcpp?: { ttsNative?: NativeTtsBridge } }).rcpp?.ttsNative;
+}
+
+/**
+ * Common surface implemented by both `TTSEngine` (browser/Web Speech) and
+ * `NativeTtsEngine` (macOS `say` via IPC). App.tsx + SettingsDrawer talk
+ * to this interface; the factory swaps the underlying implementation.
+ *
+ * `voices()` returns the browser-side voice list for the browser engine
+ * and an empty array for the native engine (callers use
+ * `getNativeVoices()` for the native list — different shape, so we keep
+ * them in distinct methods).
+ *
+ * `previewVoice()` returns the utterance text that was spoken so tests
+ * can assert on it without spinning up real audio.
+ */
+export interface TtsEngineLike {
+  enqueue(message: ChatMessage): void;
+  cancel(): void;
+  updateSettings(settings: Settings['tts']): void;
+  voices(): SpeechSynthesisVoice[];
+  previewVoice(voiceURI: string | undefined): string;
+}
+
+/**
+ * Renderer-side native engine. The actual queue + spawn lives in the
+ * main process (`src/main/tts-native.ts`); this class is a thin IPC
+ * wrapper that translates `enqueue` / `cancel` / `updateSettings` into
+ * the corresponding `window.rcpp.ttsNative.*` calls.
+ *
+ * `voices()` returns `[]` deliberately — the SpeechSynthesisVoice type
+ * doesn't match the `say` voice list (the lang separator is different
+ * and `voiceURI` doesn't apply). The Settings drawer detects this at
+ * render time and pulls the native list via `getNativeVoices()` instead.
+ *
+ * `previewVoice()` enqueues a sample utterance — same UX as the browser
+ * engine's preview, but driven through the native pipe. Returns the
+ * sample text so the caller / tests can match on it.
+ */
+export class NativeTtsEngine implements TtsEngineLike {
+  private settings: Settings['tts'];
+  /** Same throttle math as the browser engine — applied client-side. */
+  private timestamps: number[] = [];
+  /** Cached `say -v "?"` list once requested. Refreshed when `voices()` is called. */
+  private cachedNativeVoices: NativeVoiceWire[] | undefined;
+  /** Outstanding voice-list fetch — dedupes concurrent calls during settings open. */
+  private nativeVoicesInflight: Promise<NativeVoiceWire[]> | undefined;
+
+  constructor(settings: Settings['tts']) {
+    this.settings = settings;
+    log('native engine constructed', {
+      enabled: settings.enabled,
+      voiceURI: settings.voiceURI,
+      rate: settings.rate,
+      volume: settings.volume,
+    });
+    // Push the initial slice so main has a defined voice/rate before the
+    // first enqueue. Best-effort.
+    this.pushSettings();
+  }
+
+  updateSettings(settings: Settings['tts']): void {
+    const wasEnabled = this.settings.enabled;
+    this.settings = settings;
+    if (!settings.enabled && wasEnabled) {
+      // Disabling clears the in-flight subprocess + queue immediately.
+      this.cancel();
+    }
+    this.pushSettings();
+  }
+
+  enqueue(message: ChatMessage): void {
+    if (!this.settings.enabled) return;
+    // Rate-limit client-side — same maxPerMinute semantics as the browser
+    // engine. Avoids a chat raid spawning hundreds of `say` subprocesses
+    // that queue for minutes.
+    this.pruneTimestamps();
+    if (this.timestamps.length >= this.settings.maxPerMinute) {
+      log('native enqueue: rate-limited, dropping', { id: message.id });
+      return;
+    }
+    this.timestamps.push(Date.now());
+    const text = composeUtterance(message, this.settings.readSenderName);
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      log('native enqueue: bridge missing — dropping', { id: message.id });
+      return;
+    }
+    bridge.enqueue({
+      text,
+      voice: this.settings.voiceURI,
+      rate: this.settings.rate,
+      volume: this.settings.volume,
+      messageId: message.id,
+    });
+  }
+
+  cancel(): void {
+    const bridge = getNativeBridge();
+    bridge?.cancel();
+  }
+
+  /**
+   * Browser-style voice list. Returns `[]` for the native engine — the
+   * Settings drawer reads the native voice list via `getNativeVoices()`
+   * (different wire shape, different lang separator) and renders that
+   * instead when `engine === 'native'`.
+   */
+  voices(): SpeechSynthesisVoice[] {
+    return [];
+  }
+
+  /**
+   * Fetch the `say -v "?"` list. Cached after first call for the
+   * lifetime of this engine instance; the Settings drawer is the only
+   * caller and one fetch per open is plenty.
+   */
+  async getNativeVoices(): Promise<NativeVoiceWire[]> {
+    if (this.cachedNativeVoices) return this.cachedNativeVoices;
+    if (this.nativeVoicesInflight) return this.nativeVoicesInflight;
+    const bridge = getNativeBridge();
+    if (!bridge) return [];
+    this.nativeVoicesInflight = bridge.getVoices().then((vs) => {
+      this.cachedNativeVoices = vs;
+      this.nativeVoicesInflight = undefined;
+      return vs;
+    });
+    return this.nativeVoicesInflight;
+  }
+
+  /**
+   * Speak a sample phrase via `say` so the user can hear a voice before
+   * committing. Bypasses the queue (we explicitly `cancel()` first so
+   * rapid voice-dropdown changes don't pile up overlapping samples).
+   * Returns the spoken text so tests can match on it without audio.
+   */
+  previewVoice(voiceURI: string | undefined): string {
+    const displayName = voiceURI ?? 'system default';
+    const text = `Hello, my name is ${displayName}`;
+    const bridge = getNativeBridge();
+    if (!bridge) return text;
+    bridge.cancel();
+    bridge.enqueue({
+      text,
+      voice: voiceURI,
+      rate: this.settings.rate,
+      volume: this.settings.volume,
+    });
+    return text;
+  }
+
+  private pruneTimestamps(): void {
+    const cutoff = Date.now() - 60_000;
+    while (this.timestamps.length > 0 && this.timestamps[0] < cutoff) {
+      this.timestamps.shift();
+    }
+  }
+
+  private pushSettings(): void {
+    const bridge = getNativeBridge();
+    bridge?.updateSettings({
+      voiceURI: this.settings.voiceURI,
+      rate: this.settings.rate,
+      volume: this.settings.volume,
+    });
+  }
+}
+
+/**
+ * Factory — returns a `TTSEngine` or a `NativeTtsEngine` depending on
+ * the user's engine preference. Called from App.tsx on mount and after
+ * every Settings push so the live engine matches the live setting.
+ *
+ * On settings change between browser ↔ native, App.tsx tears down the
+ * old engine via `cancel()` and constructs a new one through this
+ * factory — the swap is cheap (no audio device handle to negotiate;
+ * just a queue + IPC plumbing).
+ */
+export function makeTtsEngine(settings: Settings['tts']): TtsEngineLike {
+  if (settings.engine === 'native') return new NativeTtsEngine(settings);
+  return new TTSEngine(settings);
 }
 
 // Export for unit testing the rate-limit math without DOM dependencies.

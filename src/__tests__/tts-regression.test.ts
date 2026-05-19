@@ -116,6 +116,12 @@ function uninstallFakeSpeechSynthesis() {
 
 const baseTts: Settings['tts'] = {
   enabled: true,
+  // v0.1.42 adds the engine toggle. These browser-engine regression tests
+  // explicitly exercise the Web Speech code path; pin engine='browser'
+  // even though it doesn't affect the existing TTSEngine class directly
+  // (that class only handles the browser path; the renderer-level
+  // factory picks between native / browser).
+  engine: 'browser',
   readSenderName: false,
   voiceURI: undefined,
   rate: 1.0,

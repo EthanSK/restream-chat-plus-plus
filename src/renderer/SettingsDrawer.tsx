@@ -1,9 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  NativeVoiceWire,
   Platform,
   PLATFORM_COLORS,
   PLATFORM_LABELS,
   Settings,
+  TtsEngineKind,
 } from '../shared/types';
 import { sortVoicesByQuality, voiceQualityRank } from './tts';
 import { validateIgnoreList } from './message-filters';
@@ -19,10 +21,31 @@ interface Props {
    * the voice before committing. Auto-cancels any prior in-flight preview.
    */
   onPreviewVoice?: (voiceURI: string | undefined) => void;
+  /**
+   * v0.1.42 — async fetch for the native `say -v "?"` voice list. Provided
+   * by App.tsx when the active engine is native. When engine is browser
+   * (or this prop is absent) we render the browser voice list as before.
+   * The function is async because the voice list is cached in main; the
+   * first call shells out to `say`.
+   */
+  getNativeVoices?: () => Promise<NativeVoiceWire[]>;
 }
 
-export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoices, onPreviewVoice }: Props): React.ReactElement {
+export function SettingsDrawer({
+  settings,
+  onChange,
+  onClose,
+  voices: initialVoices,
+  onPreviewVoice,
+  getNativeVoices,
+}: Props): React.ReactElement {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>(initialVoices);
+  /**
+   * v0.1.42 — native `say` voice list, fetched once per drawer open when
+   * the active engine is native. Defaults to undefined while in flight
+   * so the dropdown shows "Loading…" instead of an empty list.
+   */
+  const [nativeVoices, setNativeVoices] = useState<NativeVoiceWire[] | undefined>(undefined);
 
   // Voices on some browsers populate asynchronously.
   useEffect(() => {
@@ -37,6 +60,31 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
       };
     }
   }, []);
+
+  // v0.1.42 — fetch the native voice list when the engine is native.
+  // Re-runs only when the engine kind changes, not on every render.
+  useEffect(() => {
+    if (settings.tts.engine !== 'native') {
+      setNativeVoices(undefined);
+      return;
+    }
+    if (!getNativeVoices) {
+      setNativeVoices([]);
+      return;
+    }
+    let alive = true;
+    void getNativeVoices()
+      .then((list) => {
+        if (alive) setNativeVoices(list);
+      })
+      .catch((err) => {
+        console.error('[SettingsDrawer] getNativeVoices failed', err);
+        if (alive) setNativeVoices([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [settings.tts.engine, getNativeVoices]);
 
   // Render voices grouped + sorted by quality rank — Premium/Enhanced at the
   // top, then Neural/Natural, then Siri, then Eloquence, then the long tail of
@@ -157,6 +205,32 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
               />
             </div>
             <div className="row">
+              <label
+                title={
+                  'Native (macOS): drives the OS-level `say` command directly. Reliable — bypasses Chromium speech bugs. Recommended.\n' +
+                  'Browser (Web Speech API): the legacy Chromium engine. Kept for compatibility / future Linux & Windows builds.'
+                }
+              >
+                Engine
+              </label>
+              <select
+                value={settings.tts.engine}
+                onChange={(e) => {
+                  const next = e.target.value as TtsEngineKind;
+                  // Clear the persisted voiceURI when switching engines —
+                  // the two engines use incompatible identifier formats
+                  // (Web Speech voiceURI vs `say` voice name) so the
+                  // old value would resolve to "system default" anyway.
+                  // Letting the user re-pick avoids stale-selection
+                  // confusion in the dropdown below.
+                  patchTts({ engine: next, voiceURI: undefined });
+                }}
+              >
+                <option value="native">Native (macOS) — recommended</option>
+                <option value="browser">Browser (Web Speech API)</option>
+              </select>
+            </div>
+            <div className="row">
               <label>Read sender's name aloud</label>
               <input
                 className="switch"
@@ -167,28 +241,58 @@ export function SettingsDrawer({ settings, onChange, onClose, voices: initialVoi
             </div>
             <div className="row">
               <label>Voice</label>
-              <select
-                value={settings.tts.voiceURI ?? ''}
-                onChange={(e) => {
-                  const next = e.target.value || undefined;
-                  patchTts({ voiceURI: next });
-                  // Preview the freshly-chosen voice so the user can hear it
-                  // before committing. The engine cancels any prior preview
-                  // so rapid dropdown switching doesn't queue overlaps.
-                  onPreviewVoice?.(next);
-                }}
-              >
-                <option value="">System default</option>
-                {groupedVoices.map((g) => (
-                  <optgroup key={g.label} label={g.label}>
-                    {g.voices.map((v) => (
-                      <option key={v.voiceURI} value={v.voiceURI}>
-                        {v.name} ({v.lang})
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
+              {settings.tts.engine === 'native' ? (
+                <select
+                  value={settings.tts.voiceURI ?? ''}
+                  onChange={(e) => {
+                    const next = e.target.value || undefined;
+                    patchTts({ voiceURI: next });
+                    // Preview the freshly-chosen native voice. The
+                    // native engine cancels any prior preview before
+                    // enqueueing this one, so rapid dropdown switching
+                    // never piles up overlaps.
+                    onPreviewVoice?.(next);
+                  }}
+                >
+                  {nativeVoices === undefined ? (
+                    <option value="" disabled>
+                      Loading native voices…
+                    </option>
+                  ) : (
+                    <>
+                      <option value="">System default</option>
+                      {nativeVoices.map((v) => (
+                        <option key={`${v.name}|${v.lang}`} value={v.name}>
+                          {v.name} ({v.lang})
+                        </option>
+                      ))}
+                    </>
+                  )}
+                </select>
+              ) : (
+                <select
+                  value={settings.tts.voiceURI ?? ''}
+                  onChange={(e) => {
+                    const next = e.target.value || undefined;
+                    patchTts({ voiceURI: next });
+                    // Preview the freshly-chosen voice so the user can hear it
+                    // before committing. The engine cancels any prior preview
+                    // so rapid dropdown switching doesn't queue overlaps.
+                    onPreviewVoice?.(next);
+                  }}
+                >
+                  <option value="">System default</option>
+                  {groupedVoices.map((g) => (
+                    <optgroup key={g.label} label={g.label}>
+                      {g.voices.map((v) => (
+                        <option key={v.voiceURI} value={v.voiceURI}>
+                          {v.name} ({v.lang})
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+              )}
             </div>
             <div className="row">
               <label>Rate</label>
