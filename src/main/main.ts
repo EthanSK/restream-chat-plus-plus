@@ -37,6 +37,7 @@ import {
   AuthStatus,
   ConnectionState,
   SendTextResult,
+  TtsLogEvent,
   UpdateInfo,
 } from '../shared/types';
 
@@ -149,6 +150,38 @@ function appendComposeLog(p: string, record: Record<string, unknown>): void {
   } catch (err) {
     // logging must never crash the parent flow
     console.error('[main] compose log append failed', err);
+  }
+}
+
+/**
+ * Resolve the path to the TTS lifecycle event log (v0.1.41 engine-wake
+ * diagnostic). Lives next to the other JSONL logs under `app.getPath('logs')`
+ * — on macOS that's `~/Library/Logs/Restream Chat Plus Plus/tts-events.jsonl`.
+ */
+function resolveTtsLogPath(): string | undefined {
+  try {
+    const dir = app.getPath('logs');
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, 'tts-events.jsonl');
+  } catch {
+    return undefined;
+  }
+}
+
+let ttsLogPathCache: string | undefined;
+
+function appendTtsLog(payload: TtsLogEvent): void {
+  try {
+    if (ttsLogPathCache === undefined) {
+      ttsLogPathCache = resolveTtsLogPath() ?? '';
+    }
+    if (!ttsLogPathCache) return;
+    const line =
+      JSON.stringify({ ts: new Date().toISOString(), ...payload }) + '\n';
+    fs.appendFileSync(ttsLogPathCache, line, 'utf8');
+  } catch (err) {
+    // logging must never crash the parent flow
+    console.error('[main] tts log append failed', err);
   }
 }
 
@@ -646,6 +679,15 @@ app.on('ready', async () => {
 
   // ----- IPC: reveal logs in Finder/Explorer (renderer button) -----
   ipcMain.handle(IPC.REVEAL_LOGS, () => revealLogsInFinder(chat.getRawLogPath()));
+
+  // ----- IPC: TTS lifecycle log (v0.1.41 engine-wake diagnostic) -----
+  // Fire-and-forget. Persists each speak / onstart / onend / onerror /
+  // watchdog / keepalive / cancel event to tts-events.jsonl so we can
+  // correlate intermittent subsequent-message skips without DevTools open.
+  ipcMain.on(IPC.TTS_LOG, (_evt, payload: TtsLogEvent) => {
+    if (!payload || typeof payload.event !== 'string') return;
+    appendTtsLog(payload);
+  });
 
   // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
   // Tears down the live WebSocket, resets attempt counters, and immediately

@@ -7,6 +7,7 @@ import type {
   ConnectionState,
   SendTextResult,
   Settings,
+  TtsLogEvent,
   UpdateInfo,
 } from './shared/types';
 
@@ -197,6 +198,20 @@ const api = {
    */
   quitAndInstall: (): Promise<{ ok: boolean; reason?: string }> =>
     ipcRenderer.invoke(IPC.UPDATE_QUIT_AND_INSTALL),
+  /**
+   * Fire-and-forget TTS lifecycle event. Persisted to
+   * `~/Library/Logs/<productName>/tts-events.jsonl` by the main-process
+   * handler. v0.1.41 — diagnostic hook for the intermittent
+   * subsequent-message-skip Chromium speechSynthesis bug. Renderer never
+   * awaits the result and a failed IPC must not break TTS playback.
+   */
+  ttsLog: (event: TtsLogEvent['event'], data?: TtsLogEvent['data']): void => {
+    try {
+      ipcRenderer.send(IPC.TTS_LOG, { event, data });
+    } catch {
+      /* never let logging crash playback */
+    }
+  },
 };
 
 contextBridge.exposeInMainWorld('rcpp', api);

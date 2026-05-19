@@ -8,8 +8,54 @@ import type { ChatMessage, Settings } from '../shared/types';
  *   from spiraling during a chat raid)
  * - Allows the user to pick a system voice by URI
  *
- * v0.1.40 multi-message-stall fix
- * ===============================
+ * v0.1.41 engine-wake layer (on TOP of v0.1.40 strong-ref + 60s watchdog)
+ * ======================================================================
+ *
+ * Ethan screenshot 2026-05-19 16:26 reported: 5 rapid self-messages
+ * ("hi" / "helo" / "poop" / "um" / "bro"), TTS read the first two and
+ * silently dropped the next three. The v0.1.40 strong-ref + 60s watchdog
+ * was supposed to cover this — and DID fix the GC-driven stall — but a
+ * separate Chromium speechSynthesis quirk surfaced underneath:
+ *
+ *   After a successful utterance, Chromium's internal synthesis state
+ *   machine can decide the engine is still "busy" if `onend` hasn't
+ *   propagated yet, and silently swallow subsequent `speak()` calls
+ *   without firing onstart/onend/onerror. The 60s watchdog eventually
+ *   recovers, but by then the messages are stale and we've appeared
+ *   broken to the user.
+ *
+ * v0.1.41 stacks a fast-recovery + prevention layer on top:
+ *
+ *   1. `cancel()` before every `speak()` — flushes stuck queue state,
+ *      forces the engine to wake. Cheap on an idle engine; lifesaving
+ *      when the engine is in the wedged-busy state.
+ *
+ *   2. ~8s keep-alive ping while no TTS in flight — fires a near-silent
+ *      utterance (volume 0, ~1ms text) OR pause→resume nudge so the
+ *      engine never goes dormant in the first place. Chromium dormancy
+ *      kicks in around 10-15s of idle; we stay just under that.
+ *
+ *   3. Short onstart watchdog (~500ms) — if `onstart` doesn't fire within
+ *      500ms of `speak()`, we treat the utterance as silently dropped,
+ *      `cancel()` + re-`speak()` exactly once, and log the retry. This
+ *      catches the "swallowed by busy engine" case before the user
+ *      notices.
+ *
+ *   4. Auto-retry on `onerror` — Chromium's "interrupted" / "canceled"
+ *      errors during rapid succession get one 100ms backoff retry.
+ *
+ *   5. Disk-persistent TTS event log — every speak_called / onstart /
+ *      onend / onerror / watchdog_fired / keepalive_fired / cancel_called
+ *      event lands in `~/Library/Logs/Restream Chat Plus Plus/
+ *      tts-events.jsonl` via `window.rcpp.ttsLog`. When the next
+ *      intermittent skip happens we have a single-file timeline.
+ *
+ * Throttle theory (Ethan voice): the maxPerMinute rate limit IS real
+ * (default 20) but 5 messages in 1 minute is well below the cap. The
+ * throttle is NOT the cause of this specific symptom — kept as-is.
+ *
+ * v0.1.40 multi-message-stall fix (still active, stacked under v0.1.41)
+ * ====================================================================
  *
  * Ethan voice 3424 reported: "the first message it read out, subsequent
  * messages it didn't." Codex + Claude diagnosis pointed at two
@@ -126,6 +172,50 @@ function log(...args: unknown[]) {
  */
 const SPEAK_WATCHDOG_MS = 60_000;
 
+/**
+ * Fast-recovery watchdog for the v0.1.41 engine-wake layer. If `onstart`
+ * doesn't fire within this window after `speak()`, we treat the utterance
+ * as silently dropped (Chromium busy-state swallow) and force a
+ * cancel + retry exactly once. 500ms is comfortably longer than any
+ * realistic onstart latency (typically <50ms) but short enough that the
+ * user doesn't perceive a gap.
+ */
+const ONSTART_WATCHDOG_MS = 500;
+
+/**
+ * Keep-alive cadence — fire a near-silent nudge every ~8s while idle
+ * to stop Chromium's speechSynthesis from going dormant. Chromium tends
+ * to dormant the engine after 10-15s of idle, so 8s gives us safety
+ * margin without burning CPU.
+ */
+const KEEPALIVE_INTERVAL_MS = 8_000;
+
+/**
+ * Backoff before retrying after an `onerror` event. Chromium's
+ * "interrupted" / "canceled" errors during rapid succession resolve
+ * cleanly after a 100ms gap.
+ */
+const ERROR_RETRY_BACKOFF_MS = 100;
+
+/**
+ * Fire-and-forget bridge to the main-process JSONL persistent log.
+ * Lives on `window.rcpp.ttsLog` (preload). Best-effort: if the bridge
+ * isn't loaded (test environment, hot-reload race), we no-op so TTS
+ * playback never breaks because of logging.
+ */
+function persistTtsEvent(event: string, data?: Record<string, unknown>): void {
+  try {
+    const rcpp = (
+      typeof window !== 'undefined'
+        ? (window as unknown as { rcpp?: { ttsLog?: (e: string, d?: Record<string, unknown>) => void } }).rcpp
+        : undefined
+    );
+    rcpp?.ttsLog?.(event, data);
+  } catch {
+    /* never throw from logging */
+  }
+}
+
 export class TTSEngine {
   private queue: ChatMessage[] = [];
   private speaking = false;
@@ -150,6 +240,34 @@ export class TTSEngine {
    * `speak()`, treats the utterance as ended, drains the queue.
    */
   private speakWatchdog: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Fast `onstart` watchdog (v0.1.41). Detects Chromium silently
+   * swallowing a `speak()` call when its engine is in the wedged-busy
+   * state. Fires ONSTART_WATCHDOG_MS after `speak()` if neither
+   * `onstart` nor `onend` nor `onerror` has arrived — triggers exactly
+   * one cancel + retry per utterance.
+   */
+  private onstartWatchdog: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Set true once `onstart` (or any settling event) fires for the
+   * current utterance — disarms the onstart watchdog.
+   */
+  private currentUtterStarted = false;
+  /**
+   * Retry-count guard for the current utterance. Capped at 1 so we
+   * don't loop forever if a voice is genuinely broken.
+   */
+  private currentUtterRetries = 0;
+  /**
+   * Keep-alive timer (v0.1.41) — fires periodic near-silent nudges
+   * while no TTS is in flight to stop Chromium going dormant.
+   */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Pending `onerror` retry timer — cleared by `cancel()` so a retry
+   * doesn't fire after the user disables TTS.
+   */
+  private errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(settings: Settings['tts']) {
     this.settings = settings;
@@ -160,6 +278,7 @@ export class TTSEngine {
       rate: settings.rate,
       pitch: settings.pitch,
     });
+    if (settings.enabled) this.armKeepalive();
   }
 
   updateSettings(settings: Settings['tts']) {
@@ -170,12 +289,17 @@ export class TTSEngine {
       rate: settings.rate,
       pitch: settings.pitch,
     });
+    const wasEnabled = this.settings.enabled;
     this.settings = settings;
     if (!settings.enabled) {
       this.queue = [];
       this.speaking = false;
       this.clearCurrentUtter();
+      this.clearKeepalive();
       if (this.hasActiveSpeechSynthesis()) this.cancel();
+    } else if (!wasEnabled) {
+      // Re-enabling — bring back the keep-alive nudge.
+      this.armKeepalive();
     }
   }
 
@@ -196,12 +320,14 @@ export class TTSEngine {
 
   cancel() {
     log('cancel');
+    persistTtsEvent('cancel_called', { queuedAtCancel: this.queue.length });
     this.queue = [];
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
     this.speaking = false;
     this.clearCurrentUtter();
+    this.clearErrorRetryTimer();
   }
 
   voices(): SpeechSynthesisVoice[] {
@@ -233,6 +359,27 @@ export class TTSEngine {
   private speak(m: ChatMessage) {
     const text = composeUtterance(m, this.settings.readSenderName);
     log('speak (chat message)', { text, voiceURI: this.settings.voiceURI });
+    persistTtsEvent('speak_called', {
+      message_id: m.id,
+      platform: m.platform,
+      retry: 0,
+    });
+    // Pause the keep-alive so it doesn't fire concurrent with real speech.
+    this.clearKeepalive();
+    this.currentUtterRetries = 0;
+    this.speakUtterance(m, text, 0);
+  }
+
+  /**
+   * Inner speak path — split out so the onstart watchdog + onerror
+   * handlers can retry the same logical message without re-running the
+   * outer queue bookkeeping (timestamps, keepalive clear).
+   *
+   * The `retry` arg is 0 for the original attempt, 1 for the
+   * single allowed retry triggered by either the onstart watchdog or
+   * an onerror event.
+   */
+  private speakUtterance(m: ChatMessage, text: string, retry: number) {
     const utter = new SpeechSynthesisUtterance(text);
     utter.rate = this.settings.rate;
     utter.pitch = this.settings.pitch;
@@ -240,11 +387,14 @@ export class TTSEngine {
     const voice = this.resolveVoice(this.settings.voiceURI);
     if (voice) utter.voice = voice;
     this.speaking = true;
-    this.timestamps.push(Date.now());
+    if (retry === 0) {
+      this.timestamps.push(Date.now());
+    }
     // Retain a strong ref to the utterance for the lifetime of this
     // playback so the JS engine can't GC it out from under
     // SpeechSynthesis (Bug-2 root cause, see field comment above).
     this.currentUtter = utter;
+    this.currentUtterStarted = false;
 
     const onDone = (reason: 'end' | 'error' | 'watchdog', detail?: unknown) => {
       // Guard against late events firing AFTER the watchdog already
@@ -257,41 +407,181 @@ export class TTSEngine {
       log(`utter.${reason} (chat)`, detail !== undefined ? { detail } : undefined);
       this.speaking = false;
       this.clearCurrentUtter();
-      setTimeout(() => this.tick(), 50);
+      if (reason === 'end') {
+        persistTtsEvent('onend', { message_id: m.id, retry });
+      } else if (reason === 'watchdog') {
+        persistTtsEvent('watchdog_fired', {
+          message_id: m.id,
+          retry,
+          phase: 'speak',
+        });
+      }
+      // Drain next message; re-arm keepalive if queue is empty.
+      setTimeout(() => {
+        this.tick();
+        if (!this.speaking && this.queue.length === 0 && this.settings.enabled) {
+          this.armKeepalive();
+        }
+      }, 50);
     };
 
-    utter.onstart = () => log('utter.onstart (chat)');
+    utter.onstart = () => {
+      log('utter.onstart (chat)');
+      this.currentUtterStarted = true;
+      this.clearOnstartWatchdog();
+      persistTtsEvent('onstart', { message_id: m.id, retry });
+    };
     utter.onend = () => onDone('end');
-    utter.onerror = (e) =>
-      onDone('error', (e as SpeechSynthesisErrorEvent).error);
+    utter.onerror = (e) => {
+      const err = (e as SpeechSynthesisErrorEvent).error;
+      persistTtsEvent('onerror', {
+        message_id: m.id,
+        retry,
+        error: typeof err === 'string' ? err : String(err),
+      });
+      // Auto-retry once on Chromium "interrupted" / "canceled" — these
+      // show up during rapid succession because cancel-before-speak
+      // races the previous utterance's tail. A 100ms backoff resolves
+      // cleanly.
+      if (this.currentUtter === utter && retry === 0) {
+        log('utter.onerror — scheduling retry', { error: err });
+        this.speaking = false;
+        this.clearCurrentUtter();
+        this.clearErrorRetryTimer();
+        this.errorRetryTimer = setTimeout(() => {
+          this.errorRetryTimer = null;
+          if (!this.settings.enabled) return;
+          persistTtsEvent('speak_called', {
+            message_id: m.id,
+            retry: 1,
+            reason: 'onerror_retry',
+          });
+          this.speakUtterance(m, text, 1);
+        }, ERROR_RETRY_BACKOFF_MS);
+        return;
+      }
+      onDone('error', err);
+    };
 
-    // Watchdog: if neither onend nor onerror fires within
-    // SPEAK_WATCHDOG_MS, treat the utterance as ended so we can move
-    // on to the next queued message. This guards against the Electron
-    // 42 Chromium quirk where `onend` is silently dropped after the
-    // first successful playback, which was the v0.1.40 Bug-2 root cause
-    // (Codex + Claude diagnosis).
+    // 60s belt-and-suspenders watchdog (v0.1.40) — only fires if
+    // onend/onerror never arrive at all. ALSO armed on retries so a
+    // wedged retry can't stall forever.
     this.clearSpeakWatchdog();
     this.speakWatchdog = setTimeout(() => {
       onDone('watchdog');
     }, SPEAK_WATCHDOG_MS);
 
-    // Lift latched paused state BEFORE cancel/speak (note #5 above).
+    // 500ms onstart watchdog (v0.1.41) — only on the FIRST attempt.
+    // If onstart hasn't fired by then, Chromium silently swallowed
+    // the speak. Cancel + re-issue exactly once.
+    this.clearOnstartWatchdog();
+    if (retry === 0) {
+      this.onstartWatchdog = setTimeout(() => {
+        if (this.currentUtter !== utter) return;
+        if (this.currentUtterStarted) return;
+        log('utter.onstart watchdog fired — cancel+retry');
+        persistTtsEvent('onstart_watchdog_retry', { message_id: m.id });
+        this.currentUtterRetries = 1;
+        // Clear the per-utter state without advancing the queue.
+        this.speaking = false;
+        this.clearCurrentUtter();
+        try {
+          if (typeof window !== 'undefined' && window.speechSynthesis) {
+            window.speechSynthesis.cancel();
+          }
+        } catch {
+          /* defensive — cancel should never throw */
+        }
+        this.speakUtterance(m, text, 1);
+      }, ONSTART_WATCHDOG_MS);
+    }
+
+    // Engine-wake recipe (v0.1.41):
+    //   1. Lift latched-paused state.
+    //   2. cancel() — flushes stuck queue state, forces engine wake.
+    //      Cheap on idle engine, lifesaving when busy-wedged.
+    //   3. speak().
     if (window.speechSynthesis.paused) {
       log('speak: engine paused — resuming first');
       window.speechSynthesis.resume();
+    }
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      /* defensive */
     }
     log('speak: calling window.speechSynthesis.speak()', {
       paused: window.speechSynthesis.paused,
       speaking: window.speechSynthesis.speaking,
       pending: window.speechSynthesis.pending,
+      retry,
     });
     window.speechSynthesis.speak(utter);
   }
 
+  /**
+   * Arm the keep-alive nudge interval. Fires a near-silent
+   * `SpeechSynthesisUtterance` (volume 0, single space) every
+   * KEEPALIVE_INTERVAL_MS while no real TTS is in flight. Stops the
+   * Chromium engine going dormant after 10-15s idle, which was one of
+   * the two compounding failure modes for v0.1.41.
+   *
+   * Safe to call repeatedly — clears any existing timer first.
+   */
+  private armKeepalive(): void {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+    this.clearKeepalive();
+    this.keepaliveTimer = setInterval(() => {
+      // Only nudge when we're genuinely idle — never interfere with a
+      // real utterance.
+      if (this.speaking) return;
+      if (this.currentUtter !== null) return;
+      try {
+        const synth = window.speechSynthesis;
+        if (synth.speaking || synth.pending) return;
+        persistTtsEvent('keepalive_fired');
+        // Cheapest possible nudge: pause+resume on an idle engine.
+        // This is enough to reset Chromium's dormant timer without
+        // emitting audio. We do NOT speak a real utterance because
+        // each one re-enters the speak path + watchdogs.
+        if (synth.paused) {
+          synth.resume();
+        } else {
+          synth.pause();
+          synth.resume();
+        }
+      } catch {
+        /* never throw from keepalive */
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+  }
+
+  private clearKeepalive(): void {
+    if (this.keepaliveTimer !== null) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
+
+  private clearOnstartWatchdog(): void {
+    if (this.onstartWatchdog !== null) {
+      clearTimeout(this.onstartWatchdog);
+      this.onstartWatchdog = null;
+    }
+  }
+
+  private clearErrorRetryTimer(): void {
+    if (this.errorRetryTimer !== null) {
+      clearTimeout(this.errorRetryTimer);
+      this.errorRetryTimer = null;
+    }
+  }
+
   private clearCurrentUtter(): void {
     this.currentUtter = null;
+    this.currentUtterStarted = false;
     this.clearSpeakWatchdog();
+    this.clearOnstartWatchdog();
   }
 
   private clearSpeakWatchdog(): void {

@@ -348,7 +348,38 @@ export const IPC = {
    * that. v0.1.25.
    */
   UPDATE_QUIT_AND_INSTALL: 'update:quit-and-install',
+  /**
+   * Renderer → main, fire-and-forget. One TTS lifecycle event keyed by
+   * message_id, appended to `~/Library/Logs/<productName>/tts-events.jsonl`
+   * (or platform equivalent via `app.getPath('logs')`).
+   *
+   * Used by the v0.1.41 engine-wake layer to diagnose intermittent
+   * subsequent-message skips: every `speak_called`, `onstart`, `onend`,
+   * `onerror`, `watchdog_fired`, `keepalive_fired`, `cancel_called` event
+   * is persisted to disk so when the bug recurs we can correlate from a
+   * single log instead of asking Ethan to keep DevTools open.
+   */
+  TTS_LOG: 'tts:log',
 } as const;
+
+/**
+ * Payload shape for `IPC.TTS_LOG`. `event` is a stable lowercase identifier;
+ * `data` is an arbitrary JSON-serialisable bag (utterance id, retry count,
+ * watchdog reason, etc.). `ts` is filled by the main-process handler so we
+ * don't trust renderer clock drift.
+ */
+export interface TtsLogEvent {
+  event:
+    | 'speak_called'
+    | 'onstart'
+    | 'onend'
+    | 'onerror'
+    | 'watchdog_fired'
+    | 'onstart_watchdog_retry'
+    | 'keepalive_fired'
+    | 'cancel_called';
+  data?: Record<string, unknown>;
+}
 
 /**
  * Result of an update check, broadcast over IPC.UPDATE_STATUS / returned
