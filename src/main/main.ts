@@ -197,6 +197,44 @@ function appendTtsLog(payload: TtsLogEvent): void {
 }
 
 /**
+ * v0.1.45 — auto-reconnect event log.
+ *
+ * One JSONL record per auto-retry attempt fired by the ChatClient. Lives
+ * at `~/Library/Logs/Restream Chat++/reconnect-events.jsonl` on macOS (or
+ * the platform-equivalent `app.getPath('logs')` dir). Cached after first
+ * resolve so we don't re-walk fs.mkdirSync on every line.
+ *
+ * Goal: when Ethan reports "the app sat disconnected for hours", we can
+ * read this file and see per-attempt outcomes (ok / refresh-failed /
+ * not-authenticated / err) without DevTools open. The MANUAL Reconnect
+ * button does NOT write to this file — it always worked. This is purely
+ * for diagnosing the auto path.
+ */
+let reconnectEventLogPathCache: string | undefined;
+function resolveReconnectEventLogPath(): string | undefined {
+  try {
+    const dir = app.getPath('logs');
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, 'reconnect-events.jsonl');
+  } catch {
+    return undefined;
+  }
+}
+function appendReconnectEventLog(record: Record<string, unknown>): void {
+  try {
+    if (reconnectEventLogPathCache === undefined) {
+      reconnectEventLogPathCache = resolveReconnectEventLogPath() ?? '';
+    }
+    if (!reconnectEventLogPathCache) return;
+    const line = JSON.stringify(record) + '\n';
+    fs.appendFileSync(reconnectEventLogPathCache, line, 'utf8');
+  } catch (err) {
+    // logging must never crash the parent flow
+    console.error('[main] reconnect-event log append failed', err);
+  }
+}
+
+/**
  * Best-effort decode of an uploadData[*].bytes Buffer into a string. Most
  * Restream API calls are application/json so this is the common case.
  * Falls back to base64 for binary so we never lose data.
@@ -769,14 +807,34 @@ app.on('ready', async () => {
     }
   });
 
-  // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
-  // Tears down the live WebSocket, resets attempt counters, and immediately
-  // opens a fresh connection. If the stored access token is within 60s of
-  // expiry (matches OAuthCoordinator.isAuthenticated), we transparently
-  // refresh first so the new socket boots with a fresh bearer. If refresh
-  // fails or no token is present, we surface the error via the connection
-  // state stream — the renderer already displays state.lastError.
-  ipcMain.handle(IPC.CONN_RECONNECT, async () => {
+  // ----- v0.1.45: unified reconnect flow -----
+  //
+  // Single source of truth for "tear down the live WebSocket, refresh
+  // OAuth if needed, open a fresh handshake". Used by BOTH the manual
+  // Reconnect toolbar button (via IPC.CONN_RECONNECT) and the auto-retry
+  // path inside ChatClient (installed via setReconnectProvider below).
+  //
+  // Pre-v0.1.45, the auto-retry path called `this.connect()` directly
+  // with the cached access token — no OAuth refresh, no token lookup.
+  // If the token expired during the disconnect window, every retry
+  // handshake failed and the loop ran forever without ever
+  // re-handshaking; only the manual button worked because only the
+  // manual button refreshed. Ethan voice: "reconnecting does nothing in
+  // restream++ but if i click the reconnect button manually it works.
+  // shouldnt it use the same mechanism".
+  //
+  // Returns an outcome the WS client can log + react to. Throws on
+  // genuinely unexpected failures (everything inside the try is caught
+  // so the only way to throw is a `pushAuthStatus`-side error or a
+  // synchronous `chat.reconnect()` crash — both vanishingly rare).
+  const performFullReconnect = async (): Promise<{
+    ok: boolean;
+    reason?:
+      | 'not-authenticated'
+      | 'error'
+      | 'refresh-failed';
+    error?: string;
+  }> => {
     try {
       // v0.1.38: async getter — picks up the deferred decrypt result if
       // the reconnect button is clicked before the boot decrypt settled.
@@ -805,19 +863,66 @@ app.on('ready', async () => {
           mainWindow?.webContents.send(IPC.AUTH_STATUS, {
             authenticated: false,
           } satisfies AuthStatus);
-          return { ok: false, reason: 'not-authenticated' as const };
+          return { ok: false, reason: 'refresh-failed' };
         }
       }
       if (!token) {
-        return { ok: false, reason: 'not-authenticated' as const };
+        return { ok: false, reason: 'not-authenticated' };
       }
       chat.setToken(token.accessToken);
       chat.reconnect();
-      return { ok: true as const };
+      return { ok: true };
     } catch (err) {
-      console.error('[main] reconnect failed', err);
-      return { ok: false, reason: 'error' as const, error: String((err as Error)?.message ?? err) };
+      console.error('[main] performFullReconnect failed', err);
+      return {
+        ok: false,
+        reason: 'error',
+        error: String((err as Error)?.message ?? err),
+      };
     }
+  };
+
+  // Install the unified-reconnect hook on the ChatClient so the
+  // post-close auto-retry inside ws-client.ts runs the SAME flow
+  // (OAuth-refresh + chat.reconnect) as the manual toolbar button.
+  // v0.1.45 fix — see performFullReconnect comment for the why.
+  chat.setReconnectProvider(async () => {
+    const out = await performFullReconnect();
+    return {
+      ok: out.ok,
+      reason: out.ok ? undefined : (out.reason ?? out.error ?? 'unknown'),
+    };
+  });
+
+  // Persist each auto-retry attempt to a JSONL audit log so disconnect
+  // loops are diagnosable without DevTools open.
+  //   ~/Library/Logs/Restream Chat++/reconnect-events.jsonl
+  // (path mirrors the existing raw-frames.jsonl resolution in
+  // ws-client.ts; lives next to it in the same logs dir.)
+  chat.setAutoAttemptListener((entry) => {
+    appendReconnectEventLog({
+      ts: new Date().toISOString(),
+      attempt: entry.attempt,
+      reason: entry.reason,
+      outcome: entry.outcome,
+      failureReason: entry.failureReason,
+    });
+  });
+
+  // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
+  // Wires the manual button to the SAME performFullReconnect function
+  // the auto-retry path uses. v0.1.45.
+  ipcMain.handle(IPC.CONN_RECONNECT, async () => {
+    const out = await performFullReconnect();
+    if (out.ok) return { ok: true as const };
+    if (out.reason === 'not-authenticated' || out.reason === 'refresh-failed') {
+      return { ok: false, reason: 'not-authenticated' as const };
+    }
+    return {
+      ok: false,
+      reason: 'error' as const,
+      error: out.error,
+    };
   });
 
   ipcMain.handle(IPC.AUTH_LOGOUT, async () => {

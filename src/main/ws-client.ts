@@ -32,6 +32,55 @@ const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
 const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
 
+/**
+ * Auto-reconnect retry cadence. v0.1.45: Ethan asked for "every minute or
+ * so its disconnected" — the manual reconnect button always worked but the
+ * post-close exponential-backoff path silently used a stale access token
+ * (no OAuth refresh) so once the token lapsed the loop ran forever without
+ * ever re-handshaking. Auto-reconnect now delegates to the same
+ * `reconnectProvider` hook the manual button calls (which refreshes OAuth
+ * first) and re-tries every 60s while still disconnected. Capped at
+ * Infinity by default — Ethan explicitly preferred "never cap" with 60s
+ * spacing in the v0.1.45 brief.
+ */
+const AUTO_RETRY_INTERVAL_MS = 60_000;
+
+/**
+ * Result returned by the `reconnectProvider` hook. `ok` indicates whether
+ * the WS handshake will be attempted with a fresh token (i.e. OAuth refresh
+ * succeeded if needed AND `chat.reconnect()` fired). When `ok: false`, the
+ * `reason` is surfaced to the reconnect-events log so Ethan can see WHY the
+ * retry didn't fire (no-token / refresh-failed / threw).
+ */
+export interface ReconnectAttemptOutcome {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Hook injected by main.ts so the WS client can call the SAME full
+ * reconnect flow on auto-retry as the manual Reconnect toolbar button.
+ * v0.1.45 — see the file-level comment above and main.ts's
+ * `performFullReconnect()`.
+ *
+ * Callers must NOT swallow errors silently — the hook should still
+ * resolve, with `{ ok: false, reason: '...' }` on failure, so the WS
+ * client can schedule another retry.
+ */
+export type ReconnectProvider = () => Promise<ReconnectAttemptOutcome>;
+
+/**
+ * One auto-reconnect attempt record, fed into the optional attempt
+ * listener so callers can persist a JSONL audit trail. We keep the wire
+ * format minimal + JSON-safe — main.ts adds `ts` + serialises.
+ */
+export interface AutoReconnectAttempt {
+  attempt: number;
+  reason: string;
+  outcome: 'ok' | 'failed';
+  failureReason?: string;
+}
+
 export interface ChatClientEvents {
   message: (m: ChatMessage) => void;
   state: (s: ConnectionState) => void;
@@ -64,6 +113,34 @@ export class ChatClient extends EventEmitter {
   private state: ConnectionState = { status: 'idle', attempt: 0 };
   private rawLogPath?: string;
   private rawLogResolved = false;
+  /**
+   * Hook installed by main.ts so the auto-reconnect path uses the SAME
+   * OAuth-refresh + chat.reconnect() flow as the manual Reconnect toolbar
+   * button (`performFullReconnect()` in main.ts). v0.1.45 fix — see the
+   * file-level comment on AUTO_RETRY_INTERVAL_MS for the bug history.
+   *
+   * Optional so unit tests + early-boot code paths can run without it.
+   * When NOT set the WS client falls back to its legacy behaviour: bare
+   * `this.connect()` retry with the cached (possibly stale) access token.
+   * That fallback is preserved purely so existing tests still pass — the
+   * real app installs the hook on app.ready before `chat.start()` is ever
+   * called.
+   */
+  private reconnectProvider?: ReconnectProvider;
+  /**
+   * Suppresses overlapping retries when a provider call is already
+   * in-flight. Set true at the moment we invoke the provider; cleared
+   * once it resolves. The next state-change (connected / disconnected)
+   * decides whether to schedule another retry.
+   */
+  private providerInFlight = false;
+  /**
+   * Callback fired AFTER every auto-reconnect attempt (provider call) so
+   * main.ts can write a structured entry to `reconnect-events.jsonl`. We
+   * keep the file I/O OUT of this class to preserve the test-time
+   * decoupling and avoid touching the Electron `app` API in test code.
+   */
+  private autoAttemptListener?: (entry: AutoReconnectAttempt) => void;
   /**
    * Map of Restream connection_info entries keyed by connectionIdentifier.
    * Replaces on every fresh connection_info, deleted on connection_closed
@@ -101,6 +178,25 @@ export class ChatClient extends EventEmitter {
 
   setToken(token: string) {
     this.accessToken = token;
+  }
+
+  /**
+   * Install the unified-reconnect hook. v0.1.45 — auto-retry now calls
+   * this provider so it runs the same OAuth-refresh + reconnect flow as
+   * the manual button. Idempotent; pass `undefined` to revert to legacy
+   * bare-connect retry (used only by unit tests).
+   */
+  setReconnectProvider(provider: ReconnectProvider | undefined) {
+    this.reconnectProvider = provider;
+  }
+
+  /**
+   * Subscribe to per-attempt outcomes for the JSONL audit log.
+   * v0.1.45 — see `~/Library/Logs/Restream Chat++/reconnect-events.jsonl`
+   * appender in main.ts.
+   */
+  setAutoAttemptListener(listener: ((entry: AutoReconnectAttempt) => void) | undefined) {
+    this.autoAttemptListener = listener;
   }
 
   start() {
@@ -347,12 +443,100 @@ export class ChatClient extends EventEmitter {
     this.clearTimers();
     if (this.stopped) return;
     this.attempt += 1;
+    this.setState({ status: 'reconnecting', attempt: this.attempt, lastError: reason });
+
+    // v0.1.45: when the unified-reconnect provider is installed (real app
+    // path), run the SAME OAuth-refresh + chat.reconnect() flow the
+    // manual Reconnect button uses, on a fixed 60s cadence. If the
+    // provider isn't installed (unit tests that exercise the WS state
+    // machine without spinning up the full main.ts wiring), fall back to
+    // the legacy exponential-backoff `this.connect()` retry so existing
+    // tests still pass.
+    if (this.reconnectProvider) {
+      this.scheduleAutoRetry(reason);
+      return;
+    }
+
     const backoff = Math.min(
       MAX_BACKOFF_MS,
       BASE_BACKOFF_MS * Math.pow(2, Math.min(10, this.attempt - 1)),
     );
-    this.setState({ status: 'reconnecting', attempt: this.attempt, lastError: reason });
     this.reconnectTimer = setTimeout(() => this.connect(), backoff);
+  }
+
+  /**
+   * Schedule the next auto-retry via the unified-reconnect provider.
+   * v0.1.45 — see file-level comment on `AUTO_RETRY_INTERVAL_MS`.
+   *
+   * The provider call is fire-and-forget from this method's perspective —
+   * on resolve we either land in 'connected' (the provider's
+   * `chat.reconnect()` re-armed the socket; the WS open handler will
+   * have flipped state already) or we land back in 'reconnecting' /
+   * 'error' (provider returned `ok: false`, OR the new socket also
+   * closed). The next disconnect event then re-enters this method.
+   *
+   * IMPORTANT: we deliberately do NOT chain retries off the
+   * `then`-branch of the provider promise. The provider triggers
+   * `chat.reconnect()` which fires `connect()` synchronously; that
+   * either resolves to 'connected' shortly after or fires another
+   * close event that re-runs `handleDisconnect`. Chaining inside the
+   * promise would double-schedule.
+   */
+  private scheduleAutoRetry(reason: string) {
+    if (this.stopped) return;
+    const attempt = this.attempt;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (this.stopped) return;
+      if (this.providerInFlight) return;
+      this.providerInFlight = true;
+      const provider = this.reconnectProvider;
+      if (!provider) {
+        this.providerInFlight = false;
+        // Provider was unset between schedule + tick. Bail.
+        return;
+      }
+      Promise.resolve()
+        .then(() => provider())
+        .then((outcome) => {
+          this.providerInFlight = false;
+          try {
+            this.autoAttemptListener?.({
+              attempt,
+              reason,
+              outcome: outcome.ok ? 'ok' : 'failed',
+              failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+          // If the provider didn't actually re-arm the socket (ok=false,
+          // e.g. no token / refresh failed) the WS will still be torn
+          // down and we won't get a fresh `close` event to re-enter
+          // handleDisconnect. Schedule another tick ourselves so we keep
+          // retrying every 60s — that's the whole point of v0.1.45.
+          if (!outcome.ok && !this.stopped && this.state.status !== 'connected') {
+            this.scheduleAutoRetry(outcome.reason ?? 'provider-not-ok');
+          }
+        })
+        .catch((err) => {
+          this.providerInFlight = false;
+          const msg = (err as Error)?.message ?? String(err);
+          try {
+            this.autoAttemptListener?.({
+              attempt,
+              reason,
+              outcome: 'failed',
+              failureReason: msg,
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+          if (!this.stopped && this.state.status !== 'connected') {
+            this.scheduleAutoRetry(msg);
+          }
+        });
+    }, AUTO_RETRY_INTERVAL_MS);
   }
 
   private startHeartbeat() {
@@ -508,6 +692,10 @@ export class ChatClient extends EventEmitter {
 // Re-export Backoff math for unit tests.
 export const __test_backoff_for = (attempt: number): number =>
   Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * Math.pow(2, Math.min(10, attempt - 1)));
+
+// v0.1.45: expose the auto-retry cadence so the unified-reconnect tests can
+// fake-timer-advance by exactly one interval.
+export const __test_auto_retry_interval_ms = AUTO_RETRY_INTERVAL_MS;
 
 // ---------------------------------------------------------------------------
 // Connection helpers (free-standing so they're trivially unit-testable and
