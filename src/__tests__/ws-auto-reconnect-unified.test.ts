@@ -60,6 +60,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     client.setToken('abc');
     const provider = vi.fn().mockResolvedValue({ ok: true });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -90,6 +91,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
       return { ok: true };
     });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
 
     // 1. Manual reconnect: in the real app the IPC handler calls
     //    `performFullReconnect()` directly, then chat.reconnect(). The
@@ -120,6 +122,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     // Always return ok: false (e.g. refresh-failed every time).
     const provider = vi.fn().mockResolvedValue({ ok: false, reason: 'refresh-failed' });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -155,6 +158,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
       return { ok: true };
     });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -177,6 +181,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     client.setToken('abc');
     const provider = vi.fn().mockResolvedValue({ ok: false, reason: 'still-no' });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -206,6 +211,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
       return { ok: true };
     });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -225,10 +231,13 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
   });
 
   it('falls back to legacy exponential backoff when no provider is installed', async () => {
-    // Backward-compat: existing tests that don't install a provider still
-    // see the old self-reconnect behaviour.
+    // Backward-compat: when auto-reconnect is explicitly enabled and no
+    // provider is installed, the WS client falls back to its legacy
+    // exponential-backoff path. v0.1.47: tests must opt in to
+    // auto-reconnect because the prod default is now OFF (Ethan voice 3630).
     const client = new ChatClient();
     client.setToken('abc');
+    client.setAutoReconnectEnabled(true);
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
@@ -239,11 +248,42 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     client.stop();
   });
 
+  it('v0.1.47: auto-reconnect is DISABLED by default — no retry timer scheduled', async () => {
+    // Regression test for Ethan voice 3630. On any disconnect, state
+    // should flip to `disconnected` and stay there. No second WebSocket
+    // instance should ever be created (no legacy backoff, no provider
+    // call) until the user manually invokes `reconnect()`.
+    const client = new ChatClient();
+    client.setToken('abc');
+    const provider = vi.fn().mockResolvedValue({ ok: true });
+    client.setReconnectProvider(provider);
+    // Deliberately do NOT call setAutoReconnectEnabled — default is OFF.
+    client.start();
+    const ws = WS.instances[0];
+    ws.emit('open');
+    ws.emit('close', 1006, Buffer.from('boom'));
+
+    expect(client.getState().status).toBe('disconnected');
+
+    // Advance well past every interval we know about — nothing should fire.
+    await vi.advanceTimersByTimeAsync(60_001 * 5);
+    expect(provider).not.toHaveBeenCalled();
+    expect(WS.instances.length).toBe(1);
+
+    // Manual reconnect still works — opens a fresh socket immediately.
+    client.reconnect();
+    expect(WS.instances.length).toBe(2);
+    expect(client.getState().status).toBe('connecting');
+
+    client.stop();
+  });
+
   it('a manual reconnect() cancels any pending auto-retry timer', async () => {
     const client = new ChatClient();
     client.setToken('abc');
     const provider = vi.fn().mockResolvedValue({ ok: true });
     client.setReconnectProvider(provider);
+    client.setAutoReconnectEnabled(true); // v0.1.47: default is now OFF; tests opt in.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');

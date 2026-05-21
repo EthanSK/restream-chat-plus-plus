@@ -51,8 +51,10 @@ describe('ChatClient reconnect', () => {
   });
 
   it('transitions to reconnecting on close and schedules a retry', () => {
+    // v0.1.47: auto-reconnect is OFF by default in prod; tests opt in.
     const client = new ChatClient();
     client.setToken('abc');
+    client.setAutoReconnectEnabled(true);
     const states: any[] = [];
     client.on('state', (s: any) => states.push(s));
     client.start();
@@ -67,6 +69,23 @@ describe('ChatClient reconnect', () => {
     vi.advanceTimersByTime(1_500);
     expect(WS.instances.length).toBe(2);
 
+    client.stop();
+  });
+
+  it('v0.1.47: with auto-reconnect OFF, close transitions to disconnected and stays', () => {
+    // Regression test for Ethan voice 3630 — production default is no
+    // auto-reconnect. The state must flip to `disconnected` and stay
+    // there; no second socket is created.
+    const client = new ChatClient();
+    client.setToken('abc');
+    // Deliberately do NOT call setAutoReconnectEnabled — default is OFF.
+    client.start();
+    const ws = WS.instances[0];
+    ws.emit('open');
+    ws.emit('close', 1006, Buffer.from('boom'));
+    expect(client.getState().status).toBe('disconnected');
+    vi.advanceTimersByTime(120_000); // 2 minutes — far past any historical backoff
+    expect(WS.instances.length).toBe(1);
     client.stop();
   });
 

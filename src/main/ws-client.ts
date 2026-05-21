@@ -33,15 +33,23 @@ const BASE_BACKOFF_MS = 1_000;
 const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
 
 /**
- * Auto-reconnect retry cadence. v0.1.45: Ethan asked for "every minute or
- * so its disconnected" — the manual reconnect button always worked but the
- * post-close exponential-backoff path silently used a stale access token
- * (no OAuth refresh) so once the token lapsed the loop ran forever without
- * ever re-handshaking. Auto-reconnect now delegates to the same
- * `reconnectProvider` hook the manual button calls (which refreshes OAuth
- * first) and re-tries every 60s while still disconnected. Capped at
- * Infinity by default — Ethan explicitly preferred "never cap" with 60s
- * spacing in the v0.1.45 brief.
+ * Auto-reconnect retry cadence.
+ *
+ * v0.1.45: introduced — every 60s while disconnected, run the same flow
+ * as the manual Reconnect button (OAuth refresh → chat.reconnect).
+ *
+ * v0.1.47: **auto-reconnect is DISABLED by default** (Ethan voice 3630 —
+ * the 60s loop and the legacy exponential-backoff path were both
+ * generating constant network traffic against api.restream.io that
+ * Ethan suspected was clogging his Wi-Fi / ISP). On any disconnect we
+ * now flip to `disconnected` and stay there until the user manually
+ * clicks Reconnect (which goes through `performFullReconnect()` →
+ * `chat.reconnect()` and is unaffected by this change). The interval
+ * constant + `setReconnectProvider` / `setAutoAttemptListener` API
+ * surface are kept so the v0.1.45 unit tests can still opt-in via
+ * `setAutoReconnectEnabled(true)`, but the default for the shipped app
+ * is OFF. To restore the old behaviour app-wide, set
+ * `client.setAutoReconnectEnabled(true)` from main.ts.
  */
 const AUTO_RETRY_INTERVAL_MS = 60_000;
 
@@ -135,6 +143,16 @@ export class ChatClient extends EventEmitter {
    */
   private providerInFlight = false;
   /**
+   * v0.1.47: Master switch for the auto-reconnect timer. Default OFF
+   * (see file-level comment on `AUTO_RETRY_INTERVAL_MS` — Ethan voice
+   * 3630). When false, `handleDisconnect` flips state to `disconnected`
+   * and does NOT schedule any retry timer. Manual `reconnect()` (the
+   * toolbar button) is unaffected because it bypasses
+   * `handleDisconnect`. Tests can set this to true to exercise the
+   * v0.1.45 unified-provider behaviour.
+   */
+  private autoReconnectEnabled = false;
+  /**
    * Callback fired AFTER every auto-reconnect attempt (provider call) so
    * main.ts can write a structured entry to `reconnect-events.jsonl`. We
    * keep the file I/O OUT of this class to preserve the test-time
@@ -197,6 +215,26 @@ export class ChatClient extends EventEmitter {
    */
   setAutoAttemptListener(listener: ((entry: AutoReconnectAttempt) => void) | undefined) {
     this.autoAttemptListener = listener;
+  }
+
+  /**
+   * v0.1.47: Toggle the auto-reconnect timer. Default OFF (no polling).
+   * When true, restores the v0.1.45 behaviour: every 60s while
+   * disconnected, run the unified reconnect provider (or fall back to
+   * exponential backoff if no provider is installed). Idempotent.
+   *
+   * Manual `reconnect()` always works regardless of this flag — it's
+   * the toolbar "Reconnect" button path and bypasses `handleDisconnect`.
+   */
+  setAutoReconnectEnabled(enabled: boolean) {
+    this.autoReconnectEnabled = enabled;
+    if (!enabled) {
+      // Cancel any pending retry that was already scheduled.
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = undefined;
+      }
+    }
   }
 
   start() {
@@ -443,6 +481,23 @@ export class ChatClient extends EventEmitter {
     this.clearTimers();
     if (this.stopped) return;
     this.attempt += 1;
+
+    // v0.1.47: auto-reconnect is DISABLED by default (Ethan voice 3630 —
+    // the 60s loop / legacy exponential backoff was generating constant
+    // network traffic against api.restream.io that he suspected was
+    // clogging his Wi-Fi / ISP). On any disconnect, flip to
+    // `disconnected` and stay there. The user clicks the manual
+    // Reconnect toolbar button when they want to come back, which goes
+    // through `performFullReconnect()` → `chat.reconnect()` and is
+    // unaffected by this change.
+    //
+    // Tests can opt back in to the v0.1.45 polling behaviour via
+    // `setAutoReconnectEnabled(true)`.
+    if (!this.autoReconnectEnabled) {
+      this.setState({ status: 'disconnected', attempt: this.attempt, lastError: reason });
+      return;
+    }
+
     this.setState({ status: 'reconnecting', attempt: this.attempt, lastError: reason });
 
     // v0.1.45: when the unified-reconnect provider is installed (real app
