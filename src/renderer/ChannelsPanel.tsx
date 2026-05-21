@@ -1,12 +1,103 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ChatConnection,
   PLATFORM_COLORS,
   PLATFORM_LABELS,
 } from '../shared/types';
+import {
+  reconcileStableConnections,
+  type PendingDipsMap,
+} from './connections-stable';
 
 interface Props {
   connections: ChatConnection[];
+}
+
+/**
+ * v0.1.46 — when Restream's WS replays its current connections at
+ * boot, each per-platform connection often cycles
+ * `connected → connecting → connected` (sometimes twice) within ~1s as
+ * the server re-subscribes. The renderer used to paint every
+ * transition, so the channels-panel pills and the `N/M connected`
+ * counter visibly flickered for ~10s after launch. We coalesce dips
+ * shorter than `TRANSIENT_CONNECTING_HOLD_MS` (see
+ * `connections-stable.ts` for the full algorithm and the captured
+ * raw-frame trace).
+ *
+ * This hook is the renderer-side glue around the pure reducer in
+ * `connections-stable.ts`: it persists the pending-dip map across
+ * renders via a ref, re-runs the reducer on every `connections` push
+ * AND on a single deferred timer when there are pending dips
+ * (so an unrecovered dip flushes itself after the hold window even if
+ * no new push arrives).
+ */
+function useStableConnections(upstream: ChatConnection[]): ChatConnection[] {
+  const [stable, setStable] = useState<ChatConnection[]>(upstream);
+  const pendingRef = useRef<PendingDipsMap>(new Map());
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // We keep a ref to the latest upstream so the deferred-flush timer
+  // sees the freshest input, not the snapshot from when it was armed.
+  const upstreamRef = useRef<ChatConnection[]>(upstream);
+
+  useEffect(() => {
+    upstreamRef.current = upstream;
+    const result = reconcileStableConnections(
+      upstream,
+      stable,
+      pendingRef.current,
+      Date.now(),
+    );
+    pendingRef.current = result.pendingDips;
+    setStable(result.view);
+
+    // Cancel any prior timer; schedule the next deferred flush if needed.
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (result.wakeAtMs !== null) {
+      const delay = Math.max(0, result.wakeAtMs - Date.now()) + 1;
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        const r = reconcileStableConnections(
+          upstreamRef.current,
+          stable,
+          pendingRef.current,
+          Date.now(),
+        );
+        pendingRef.current = r.pendingDips;
+        setStable(r.view);
+        if (r.wakeAtMs !== null) {
+          // Schedule the next flush if another dip is still in-flight.
+          const next = Math.max(0, r.wakeAtMs - Date.now()) + 1;
+          timerRef.current = setTimeout(() => {
+            timerRef.current = null;
+            const rr = reconcileStableConnections(
+              upstreamRef.current,
+              stable,
+              pendingRef.current,
+              Date.now(),
+            );
+            pendingRef.current = rr.pendingDips;
+            setStable(rr.view);
+          }, next);
+        }
+      }, delay);
+    }
+    return () => {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+    // We INTENTIONALLY don't depend on `stable` here — including it
+    // would re-run this effect after every state update we make and
+    // never settle. The reducer's `prev` argument is read from the
+    // CURRENT React state at the time the new upstream arrives, which
+    // is exactly the "last painted view" semantics we want.
+  }, [upstream]);
+
+  return stable;
 }
 
 /**
@@ -29,15 +120,16 @@ interface Props {
  */
 export function ChannelsPanel({ connections }: Props): React.ReactElement | null {
   const [open, setOpen] = useState(false);
+  const stableConnections = useStableConnections(connections);
 
   const { connectedCount, total } = useMemo(() => {
-    const connected = connections.filter((c) => c.status === 'connected').length;
-    return { connectedCount: connected, total: connections.length };
-  }, [connections]);
+    const connected = stableConnections.filter((c) => c.status === 'connected').length;
+    return { connectedCount: connected, total: stableConnections.length };
+  }, [stableConnections]);
 
   if (total === 0) return null;
 
-  const platformDots = uniqueConnectedPlatforms(connections);
+  const platformDots = uniqueConnectedPlatforms(stableConnections);
 
   return (
     <div className="channels-panel">
@@ -65,7 +157,7 @@ export function ChannelsPanel({ connections }: Props): React.ReactElement | null
       </button>
       {open && (
         <ChannelsPopover
-          connections={connections}
+          connections={stableConnections}
           onClose={() => setOpen(false)}
         />
       )}
