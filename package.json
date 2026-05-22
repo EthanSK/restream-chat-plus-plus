@@ -1,7 +1,7 @@
 {
   "name": "restream-chat-plus-plus",
   "productName": "Restream Chat Plus Plus",
-  "version": "0.1.54",
+  "version": "0.1.55",
   "description": "Native cross-platform replacement for Restream's broken Apple-Silicon Chat desktop app.",
   "homepage": "https://github.com/EthanSK/restream-chat-plus-plus",
   "repository": {

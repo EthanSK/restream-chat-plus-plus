@@ -249,10 +249,11 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
   });
 
   it('v0.1.47: auto-reconnect is DISABLED by default — no retry timer scheduled', async () => {
-    // Regression test for Ethan voice 3630. On any disconnect, state
-    // should flip to `disconnected` and stay there. No second WebSocket
-    // instance should ever be created (no legacy backoff, no provider
-    // call) until the user manually invokes `reconnect()`.
+    // v0.1.55: regression for Ethan's "stuck on Idle after the WS dropped
+    // mid-session" bug. With auto-reconnect disabled (default per v0.1.47
+    // for Ethan voice 3630) AND the WS having reached 'open' at least
+    // once, the v0.1.55 logic schedules ONE retry after
+    // POST_CONNECT_RETRY_DELAY_MS (30s) and then stops. NOT polling.
     const client = new ChatClient();
     client.setToken('abc');
     const provider = vi.fn().mockResolvedValue({ ok: true });
@@ -263,17 +264,47 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     ws.emit('open');
     ws.emit('close', 1006, Buffer.from('boom'));
 
-    expect(client.getState().status).toBe('disconnected');
+    // v0.1.55: hasEverConnectedThisSession=true → schedule one retry.
+    expect(client.getState().status).toBe('reconnecting');
+    expect(provider).not.toHaveBeenCalled(); // 30s delay before fire.
 
-    // Advance well past every interval we know about — nothing should fire.
+    // Tick past retry delay — provider fires once.
+    await vi.advanceTimersByTimeAsync(30_500);
+    expect(provider).toHaveBeenCalledTimes(1);
+
+    // Advance way past every other interval — must NOT fire again.
     await vi.advanceTimersByTimeAsync(60_001 * 5);
-    expect(provider).not.toHaveBeenCalled();
-    expect(WS.instances.length).toBe(1);
+    expect(provider).toHaveBeenCalledTimes(1);
 
     // Manual reconnect still works — opens a fresh socket immediately.
     client.reconnect();
-    expect(WS.instances.length).toBe(2);
-    expect(client.getState().status).toBe('connecting');
+    expect(WS.instances.length).toBeGreaterThanOrEqual(2);
+
+    client.stop();
+  });
+
+  it('v0.1.47/55: WS that NEVER reaches `open` does NOT trigger post-connect retry', async () => {
+    // The post-connect retry is gated on hasEverConnectedThisSession.
+    // If the very first WS closes before `'open'` (handshake failure,
+    // DNS, network refused), there's been no healthy session — the
+    // v0.1.47 silent-disconnected behaviour applies and the user must
+    // manually click Reconnect. Preserves the no-pre-connect-polling
+    // promise (Ethan voice 3630).
+    const client = new ChatClient();
+    client.setToken('abc');
+    const provider = vi.fn().mockResolvedValue({ ok: true });
+    client.setReconnectProvider(provider);
+    client.start();
+    const ws = WS.instances[0];
+    // DELIBERATELY do NOT emit 'open' — simulate pre-handshake close.
+    ws.emit('close', 1006, Buffer.from('boom'));
+
+    expect(client.getState().status).toBe('disconnected');
+
+    // Advance well past every interval — provider must NEVER fire.
+    await vi.advanceTimersByTimeAsync(60_001 * 5);
+    expect(provider).not.toHaveBeenCalled();
+    expect(WS.instances.length).toBe(1);
 
     client.stop();
   });

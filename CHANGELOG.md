@@ -70,3 +70,13 @@ If you were stuck on Idle after updating to v0.1.49-v0.1.52: this restores the v
 ### Dropped (still reverted from v0.1.49/v0.1.50/v0.1.51)
 
 - Pre-`open` retry budget + early-close 30s retry window — they patched the WS-retry layer when the actual user-facing bug was in boot/auth. Reverting these restores the v0.1.48 connection code path.
+
+## [0.1.55] - 2026-05-22
+
+### Fixed
+
+- **Stuck on "Idle" after WS dropped mid-session.** v0.1.47 disabled all auto-reconnect (Ethan voice 3630 — to stop network polling). That accidentally killed the post-successful-connect recovery path too — a single WS blip after hours of healthy connection landed silently on Idle forever, even with the fixes shipped in v0.1.49-v0.1.54. v0.1.55 adds ONE post-connect retry after `POST_CONNECT_RETRY_DELAY_MS` (30s) when the WS reached `'open'` at least once this session. Strictly one-shot — not polling. Pre-`'open'` failures still go straight to disconnected (preserves the no-pre-connect-polling promise from v0.1.47).
+
+### Tests
+
+- Updated `ws-auto-reconnect-unified.test.ts` to assert the new one-shot behaviour + added a separate test verifying pre-`'open'` failures DON'T trigger the retry (v0.1.47 silent-disconnect preserved for that path).

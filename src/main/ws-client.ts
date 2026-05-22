@@ -52,6 +52,13 @@ const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
  * `client.setAutoReconnectEnabled(true)` from main.ts.
  */
 const AUTO_RETRY_INTERVAL_MS = 60_000;
+/**
+ * v0.1.55: delay before the one-shot post-connect retry fires. 30s is long
+ * enough that a transient network blip clears (WiFi handoff, brief sleep,
+ * etc) but short enough the user isn't staring at "Idle" for ages. ONE
+ * retry per session — no polling.
+ */
+const POST_CONNECT_RETRY_DELAY_MS = 30_000;
 
 /**
  * Result returned by the `reconnectProvider` hook. `ok` indicates whether
@@ -153,6 +160,25 @@ export class ChatClient extends EventEmitter {
    */
   private autoReconnectEnabled = false;
   /**
+   * v0.1.55: tracks whether THIS WS session ever reached `'open'`. Set in
+   * the `'open'` handler; reset in `start()` / `stop()` / `reconnect()`.
+   *
+   * Used to gate the post-connect one-shot retry (below). Distinct from
+   * `autoReconnectEnabled` because that flag governs ongoing polling
+   * (Ethan voice 3630 — disabled because it was clogging his network).
+   * This is for the strictly different case of "WS was healthy, then
+   * dropped, and we want to try ONCE to recover" — without re-enabling
+   * polling.
+   */
+  private hasEverConnectedThisSession = false;
+  /**
+   * v0.1.55: tracks whether the one-shot post-connect retry has already
+   * fired in THIS session. Prevents the retry path from turning back
+   * into a loop if the provider call itself also closes the WS before
+   * `'open'`. Reset in `start()` / `stop()` / `reconnect()`.
+   */
+  private postConnectRetryUsedThisSession = false;
+  /**
    * Callback fired AFTER every auto-reconnect attempt (provider call) so
    * main.ts can write a structured entry to `reconnect-events.jsonl`. We
    * keep the file I/O OUT of this class to preserve the test-time
@@ -239,11 +265,15 @@ export class ChatClient extends EventEmitter {
 
   start() {
     this.stopped = false;
+    this.hasEverConnectedThisSession = false;
+    this.postConnectRetryUsedThisSession = false;
     this.connect();
   }
 
   stop() {
     this.stopped = true;
+    this.hasEverConnectedThisSession = false;
+    this.postConnectRetryUsedThisSession = false;
     this.clearTimers();
     this.ws?.removeAllListeners();
     try {
@@ -283,6 +313,8 @@ export class ChatClient extends EventEmitter {
     }
     this.stopped = false;
     this.attempt = 0;
+    this.hasEverConnectedThisSession = false;
+    this.postConnectRetryUsedThisSession = false;
     this.connect();
   }
 
@@ -368,6 +400,7 @@ export class ChatClient extends EventEmitter {
 
     ws.on('open', () => {
       this.attempt = 0;
+      this.hasEverConnectedThisSession = true;
       this.setState({ status: 'connected', attempt: 0 });
       this.startHeartbeat();
     });
@@ -493,6 +526,37 @@ export class ChatClient extends EventEmitter {
     //
     // Tests can opt back in to the v0.1.45 polling behaviour via
     // `setAutoReconnectEnabled(true)`.
+    //
+    // v0.1.55: Ethan voice 2026-05-22 — v0.1.47's blanket disable went
+    // too far. If the WS was healthy and then dropped (heartbeats had
+    // been flowing for hours, then suddenly stopped), the previous
+    // behaviour landed silently on `disconnected` with no recovery.
+    // Restore ONE post-connect retry via the provider — but only ONCE
+    // per session, NOT polling — so a real connection blip self-heals
+    // without re-introducing the network spam Ethan disabled in v0.1.47.
+    //
+    // Gate: `hasEverConnectedThisSession` must be true (we never had a
+    // healthy WS in this session = no retry, exactly like v0.1.47 to
+    // preserve the no-pre-connect-polling promise) AND
+    // `postConnectRetryUsedThisSession` must be false (one-shot, never
+    // a loop) AND a provider must be installed (real app path; tests
+    // exercise via setAutoReconnectEnabled(true)).
+    if (
+      !this.autoReconnectEnabled &&
+      this.hasEverConnectedThisSession &&
+      !this.postConnectRetryUsedThisSession &&
+      this.reconnectProvider
+    ) {
+      this.postConnectRetryUsedThisSession = true;
+      this.setState({
+        status: 'reconnecting',
+        attempt: this.attempt,
+        lastError: reason,
+      });
+      this.schedulePostConnectRetry(reason);
+      return;
+    }
+
     if (!this.autoReconnectEnabled) {
       this.setState({ status: 'disconnected', attempt: this.attempt, lastError: reason });
       return;
@@ -537,6 +601,63 @@ export class ChatClient extends EventEmitter {
    * close event that re-runs `handleDisconnect`. Chaining inside the
    * promise would double-schedule.
    */
+  /**
+   * v0.1.55: schedule the ONE-SHOT post-connect retry. Distinct from
+   * `scheduleAutoRetry` (which polls every 60s on the v0.1.45 path):
+   * this fires exactly once after a `POST_CONNECT_RETRY_DELAY_MS` delay,
+   * never loops. The caller (`handleDisconnect`) has already flipped
+   * `postConnectRetryUsedThisSession = true` so even if the retry's
+   * close also triggers `handleDisconnect`, the gate prevents re-entry.
+   */
+  private schedulePostConnectRetry(reason: string) {
+    if (this.stopped) return;
+    const attempt = this.attempt;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (this.stopped) return;
+      if (this.providerInFlight) return;
+      this.providerInFlight = true;
+      const provider = this.reconnectProvider;
+      if (!provider) {
+        this.providerInFlight = false;
+        return;
+      }
+      Promise.resolve()
+        .then(() => provider())
+        .then((outcome) => {
+          this.providerInFlight = false;
+          try {
+            this.autoAttemptListener?.({
+              attempt,
+              reason: `post-connect-retry:${reason}`,
+              outcome: outcome.ok ? 'ok' : 'failed',
+              failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+          // No re-schedule on failure — this is one-shot. If it failed,
+          // the WS lands in 'disconnected' via the next handleDisconnect
+          // hit (the postConnectRetryUsedThisSession flag prevents
+          // re-entry into this scheduler).
+        })
+        .catch((err) => {
+          this.providerInFlight = false;
+          const msg = (err as Error)?.message ?? String(err);
+          try {
+            this.autoAttemptListener?.({
+              attempt,
+              reason: `post-connect-retry:${reason}`,
+              outcome: 'failed',
+              failureReason: msg,
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+        });
+    }, POST_CONNECT_RETRY_DELAY_MS);
+  }
+
   private scheduleAutoRetry(reason: string) {
     if (this.stopped) return;
     const attempt = this.attempt;

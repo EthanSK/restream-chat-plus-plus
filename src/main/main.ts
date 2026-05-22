@@ -970,7 +970,7 @@ app.on('ready', async () => {
           });
       return result.response === 1;
     } catch (err) {
-      log.error('[main] authConfirmLogout dialog threw', err);
+      console.error('[main] authConfirmLogout dialog threw', err);
       // Fail closed — never log the user out if the prompt errored.
       return false;
     }
