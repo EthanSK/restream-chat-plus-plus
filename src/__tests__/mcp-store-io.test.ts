@@ -80,8 +80,11 @@ describe('store-io: mergeSettings', () => {
       },
     } as any;
     const merged = mergeSettings(legacy);
-    expect(merged.filters.tts.ignoreRegex).toEqual([]);
-    expect(merged.filters.notifications.ignoreRegex).toEqual([]);
+    // v0.1.48: DEFAULT_SETTINGS.filters now ships `['^viewer$']` in both
+    // lists, so a pre-v0.1.26 blob (no `filters` section) falls back to
+    // the seeded default through the merge.
+    expect(merged.filters.tts.ignoreRegex).toEqual(['^viewer$']);
+    expect(merged.filters.notifications.ignoreRegex).toEqual(['^viewer$']);
     expect(merged.tts.enabled).toBe(true);
   });
 

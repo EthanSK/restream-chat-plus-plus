@@ -940,8 +940,15 @@ app.on('ready', async () => {
   // merge is enough — every section is a flat object.
   function loadSettings(): Settings {
     const stored = store.get('settings') as Partial<Settings> | undefined;
-    if (!stored) return DEFAULT_SETTINGS;
-    return {
+    if (!stored) {
+      // Fresh install — still mark migrations as already applied so the
+      // user doesn't get the seed re-injected if they later delete it
+      // from the Settings drawer (DEFAULT_SETTINGS already carries the
+      // v0.1.48 `^viewer$` seed; no migration work to do here).
+      markMigrationApplied(SEED_VIEWER_MIGRATION_KEY);
+      return DEFAULT_SETTINGS;
+    }
+    const merged: Settings = {
       ...DEFAULT_SETTINGS,
       ...stored,
       tts: { ...DEFAULT_SETTINGS.tts, ...(stored.tts ?? {}) },
@@ -955,6 +962,12 @@ app.on('ready', async () => {
       // that has `filters.tts.ignoreRegex` but not `filters.notifications`
       // (or vice versa, or neither — pre-v0.1.26 blobs lack the section
       // entirely) still resolves to fully-typed arrays via the defaults.
+      //
+      // IMPORTANT: an EXISTING `stored.filters.tts.ignoreRegex` (e.g. an
+      // empty array from a pre-v0.1.48 install) OVERRIDES the default
+      // `['^viewer$']` here — that's why v0.1.48 also has the one-time
+      // migration below (`applySettingsMigrations`) that injects the seed
+      // into a persisted blob if it hasn't been injected before.
       filters: {
         ...DEFAULT_SETTINGS.filters,
         ...(stored.filters ?? {}),
@@ -969,6 +982,74 @@ app.on('ready', async () => {
       },
       update: { ...DEFAULT_SETTINGS.update, ...(stored.update ?? {}) },
     };
+    return applySettingsMigrations(merged);
+  }
+
+  // ---------------------------------------------------------------------
+  // v0.1.48 one-time settings migrations.
+  //
+  // Persisted settings from a pre-v0.1.48 install will already have
+  // `filters.tts.ignoreRegex` / `filters.notifications.ignoreRegex` set
+  // (typically `[]`), which means the shallow merge in `loadSettings`
+  // OVERRIDES the new v0.1.48 default `['^viewer$']` seed. To make sure
+  // upgrading users actually get the seed (not just fresh installs), we
+  // record which migrations we've already applied in
+  // `store.settingsMigrationsApplied` and inject the seed exactly once.
+  //
+  // Idempotency: if the user has since deliberately removed the entry
+  // from the Settings drawer, the migration key is still marked applied,
+  // so we don't bring it back. If the user already had `^viewer$` in the
+  // list (e.g. added it manually before upgrading), the migration is a
+  // no-op for that list (we de-dupe before writing).
+  // ---------------------------------------------------------------------
+  const SEED_VIEWER_MIGRATION_KEY = 'seed-viewer-ignore-regex';
+
+  function hasMigrationBeenApplied(key: string): boolean {
+    const applied = (store.get('settingsMigrationsApplied') ?? []) as string[];
+    return Array.isArray(applied) && applied.includes(key);
+  }
+
+  function markMigrationApplied(key: string): void {
+    const applied = (store.get('settingsMigrationsApplied') ?? []) as string[];
+    if (!Array.isArray(applied)) {
+      store.set('settingsMigrationsApplied', [key]);
+      return;
+    }
+    if (applied.includes(key)) return;
+    store.set('settingsMigrationsApplied', [...applied, key]);
+  }
+
+  function applySettingsMigrations(settings: Settings): Settings {
+    let next = settings;
+    if (!hasMigrationBeenApplied(SEED_VIEWER_MIGRATION_KEY)) {
+      const seed = '^viewer$';
+      const ttsList = next.filters?.tts?.ignoreRegex ?? [];
+      const notifList = next.filters?.notifications?.ignoreRegex ?? [];
+      const ttsHas = ttsList.includes(seed);
+      const notifHas = notifList.includes(seed);
+      if (!ttsHas || !notifHas) {
+        next = {
+          ...next,
+          filters: {
+            ...next.filters,
+            tts: {
+              ...next.filters.tts,
+              ignoreRegex: ttsHas ? ttsList : [...ttsList, seed],
+            },
+            notifications: {
+              ...next.filters.notifications,
+              ignoreRegex: notifHas ? notifList : [...notifList, seed],
+            },
+          },
+        };
+        // Persist the seeded blob back so the renderer reads the same
+        // value on its next IPC call (settings drawer textarea will
+        // show `^viewer$` populated, matching what the filter applies).
+        store.set('settings', next);
+      }
+      markMigrationApplied(SEED_VIEWER_MIGRATION_KEY);
+    }
+    return next;
   }
   // Persist Settings + return the saved value. Pulled out as a named
   // helper so the in-process HTTP MCP server (`mcp-server.ts`,

@@ -154,9 +154,10 @@ describe('mcp protocol: dispatchRpc', () => {
       expect(r.id).toBe('abc');
       expect(r.result.content[0].type).toBe('text');
       const payload = JSON.parse(r.result.content[0].text);
-      // Default-settings shape comes through.
+      // Default-settings shape comes through. v0.1.48 seeded `^viewer$`
+      // into the ignoreRegex baseline.
       expect(payload.tts.enabled).toBe(false);
-      expect(payload.filters.tts.ignoreRegex).toEqual([]);
+      expect(payload.filters.tts.ignoreRegex).toEqual(['^viewer$']);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

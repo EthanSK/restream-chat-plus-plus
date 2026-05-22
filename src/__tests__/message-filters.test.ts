@@ -178,21 +178,44 @@ describe('regexIgnoredBadgeLabel', () => {
   });
 });
 
-describe('DEFAULT_SETTINGS.filters (v0.1.26 product direction)', () => {
-  it('ships with empty ignoreRegex lists — read EVERY message by default', () => {
-    // The whole point of v0.1.26: the moment TTS is enabled, ALL incoming
-    // messages get read aloud. A non-empty default would silently filter
-    // some — which is exactly the behaviour Ethan asked us to remove.
-    expect(DEFAULT_SETTINGS.filters.tts.ignoreRegex).toEqual([]);
-    expect(DEFAULT_SETTINGS.filters.notifications.ignoreRegex).toEqual([]);
+describe('DEFAULT_SETTINGS.filters (v0.1.48 seed)', () => {
+  it('ships with `^viewer$` in both ignoreRegex lists — generic anonymous "Viewer" messages stay silent by default', () => {
+    // v0.1.48 (Ethan voice 3646) — anonymous-platform "Viewer" placeholder
+    // messages whose text is literally "Viewer" / "viewer" / "VIEWER"
+    // shouldn't wake TTS or notifications. The `^viewer$` anchored pattern
+    // is uniformly compiled with the case-insensitive `i` flag in
+    // compileIgnorePatterns, so all capitalisations match. Users can still
+    // remove the entry from the Settings drawer; the v0.1.48 one-time
+    // migration won't re-add it once the migration key is recorded.
+    expect(DEFAULT_SETTINGS.filters.tts.ignoreRegex).toEqual(['^viewer$']);
+    expect(DEFAULT_SETTINGS.filters.notifications.ignoreRegex).toEqual([
+      '^viewer$',
+    ]);
   });
 
-  it('a fresh-defaults run of the filter pipeline produces no ignore flags', () => {
+  it('the seed catches "Viewer" / "VIEWER" / "viewer" exact-match messages but not "Viewer joined"', () => {
     const tts = compileIgnorePatterns(DEFAULT_SETTINGS.filters.tts.ignoreRegex);
     const notif = compileIgnorePatterns(
       DEFAULT_SETTINGS.filters.notifications.ignoreRegex,
     );
-    expect(applyMessageFilters('any message at all', tts, notif)).toEqual({});
+    // Each capitalisation of the bare word matches → message gets ignored.
+    expect(applyMessageFilters('Viewer', tts, notif)).toEqual({
+      ignoredByTts: true,
+      ignoredByNotifications: true,
+    });
+    expect(applyMessageFilters('VIEWER', tts, notif)).toEqual({
+      ignoredByTts: true,
+      ignoredByNotifications: true,
+    });
+    expect(applyMessageFilters('viewer', tts, notif)).toEqual({
+      ignoredByTts: true,
+      ignoredByNotifications: true,
+    });
+    // Anchored `^viewer$` does NOT match substrings of longer messages.
+    expect(applyMessageFilters('Viewer joined the stream', tts, notif)).toEqual(
+      {},
+    );
+    expect(applyMessageFilters('hi from a viewer', tts, notif)).toEqual({});
   });
 });
 
@@ -238,7 +261,12 @@ function migrate(stored: Partial<typeof DEFAULT_SETTINGS> | undefined) {
 }
 
 describe('Settings migration — v0.1.26 filters section', () => {
-  it('defaults filters to empty lists when missing from a pre-v0.1.26 blob', () => {
+  it('defaults filters to the v0.1.48 seeded lists when missing from a pre-v0.1.26 blob', () => {
+    // This `migrate()` helper mirrors only the SHALLOW MERGE in main.ts —
+    // not the v0.1.48 one-time `applySettingsMigrations` injector. A
+    // pre-v0.1.26 blob has no `filters` section, so it falls back to
+    // `DEFAULT_SETTINGS.filters` wholesale, which in v0.1.48 carries the
+    // `^viewer$` seed.
     const legacy = {
       tts: {
         enabled: true,
@@ -250,8 +278,8 @@ describe('Settings migration — v0.1.26 filters section', () => {
       },
     } as Partial<typeof DEFAULT_SETTINGS>;
     const m = migrate(legacy);
-    expect(m.filters.tts.ignoreRegex).toEqual([]);
-    expect(m.filters.notifications.ignoreRegex).toEqual([]);
+    expect(m.filters.tts.ignoreRegex).toEqual(['^viewer$']);
+    expect(m.filters.notifications.ignoreRegex).toEqual(['^viewer$']);
   });
 
   it('preserves user-set regex lists across migration', () => {
@@ -262,6 +290,10 @@ describe('Settings migration — v0.1.26 filters section', () => {
       },
     } as Partial<typeof DEFAULT_SETTINGS>;
     const m = migrate(stored);
+    // Persisted lists override the v0.1.48 default seed in the shallow
+    // merge — the one-time migration in main.ts is what re-injects the
+    // seed for upgrading users (covered by mcp-tools / mcp-store-io
+    // integration tests, not this pure-merge helper).
     expect(m.filters.tts.ignoreRegex).toEqual(['^!cmd', 'spam$']);
     expect(m.filters.notifications.ignoreRegex).toEqual(['bot']);
   });
@@ -274,6 +306,7 @@ describe('Settings migration — v0.1.26 filters section', () => {
     } as unknown as Partial<typeof DEFAULT_SETTINGS>;
     const m = migrate(stored);
     expect(m.filters.tts.ignoreRegex).toEqual(['only-tts']);
-    expect(m.filters.notifications.ignoreRegex).toEqual([]);
+    // Missing notifications.ignoreRegex falls back to the v0.1.48 default.
+    expect(m.filters.notifications.ignoreRegex).toEqual(['^viewer$']);
   });
 });

@@ -256,10 +256,17 @@ export const DEFAULT_SETTINGS: Settings = {
     },
   },
   filters: {
-    // Empty by default — v0.1.26 product direction is "read everything";
-    // users opt in to filtering by adding patterns in the Settings drawer.
-    tts: { ignoreRegex: [] },
-    notifications: { ignoreRegex: [] },
+    // v0.1.48: seed both lists with `^viewer$` (anchored, case-insensitive
+    // via the uniform `i` flag in compileIgnorePatterns) so the generic
+    // anonymous-YouTube/Facebook "Viewer" placeholder username's messages
+    // — where the message *text* itself is literally "Viewer" — never
+    // wake TTS or notifications. Users can still remove it from the
+    // Settings drawer if they actually want those messages read. The
+    // pre-v0.1.48 default was empty; the existing settings of a user who
+    // already has the v0.1.26 filters section persisted to disk are
+    // upgraded via the one-time migration in `main.ts`.
+    tts: { ignoreRegex: ['^viewer$'] },
+    notifications: { ignoreRegex: ['^viewer$'] },
   },
   update: {
     // Opt-out, not opt-in: unsigned builds get no other update signal.

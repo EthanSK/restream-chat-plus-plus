@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.48 — seed `^viewer$` into regex-ignore lists
+
+Add `^viewer$` (anchored, case-insensitive via the uniform `i` flag the
+filter compiler applies to every pattern) to both `filters.tts.ignoreRegex`
+and `filters.notifications.ignoreRegex` so the generic anonymous-platform
+"Viewer" placeholder username's messages — whose text is literally
+`Viewer` / `viewer` / `VIEWER` — never wake TTS or notifications.
+
+- `DEFAULT_SETTINGS` now ships with the seed populated, so fresh installs
+  get it out of the box.
+- One-time migration (`seed-viewer-ignore-regex`) injects the entry into
+  existing persisted settings on first launch after upgrade. The migration
+  is idempotent — if the user later deletes the entry from the Settings
+  drawer, it does NOT come back; if the entry was already present
+  (manually added), the migration is a no-op for that list.
+- Tracked via a new `settingsMigrationsApplied: string[]` field on the
+  electron-store schema so future seeds follow the same pattern.
+
 ## v0.1.47 — disable auto-reconnect polling
 
 Disable the WebSocket auto-reconnect loop per Ethan voice 3630 — the 60s

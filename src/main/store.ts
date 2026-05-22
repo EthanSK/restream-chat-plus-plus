@@ -59,6 +59,19 @@ export interface StoreSchema {
    * reads or writes it any more.
    */
   composeWindow?: ComposeWindowBounds;
+  /**
+   * Tracks which one-time settings migrations have been applied to the
+   * persisted `settings` blob. Each entry is an opaque migration key (see
+   * `applySettingsMigrations` in `main.ts`). Migrations are idempotent —
+   * the flag exists so we don't re-inject seed values a user has
+   * deliberately removed.
+   *
+   * v0.1.48 added the first entry, `seed-viewer-ignore-regex`, which
+   * appends `^viewer$` to `filters.tts.ignoreRegex` and
+   * `filters.notifications.ignoreRegex` on first launch after upgrade
+   * (skipped if already present).
+   */
+  settingsMigrationsApplied?: string[];
 }
 
 export interface Store {

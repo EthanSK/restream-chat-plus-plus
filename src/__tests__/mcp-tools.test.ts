@@ -106,7 +106,17 @@ describe('mcp tools: set_tts_enabled / set_notifications_enabled', () => {
 });
 
 describe('mcp tools: filter list management', () => {
+  // v0.1.48: DEFAULT_SETTINGS.filters.{tts,notifications}.ignoreRegex now
+  // ship with `['^viewer$']` as the seeded baseline. A fresh test store
+  // (empty / no settings persisted) therefore reads back the seeded list,
+  // not `[]`. The mutate→read flow tests below remove the seed first when
+  // they want a clean baseline so the meaningful assertion is on the
+  // operation under test rather than the seed.
+  const SEED = '^viewer$';
+
   it('add → list → remove for the TTS list', async () => {
+    // Strip the v0.1.48 seed so the rest of the test reads cleanly.
+    await call('remove_tts_filter', { regex: SEED });
     await call('add_tts_filter', { regex: '^!cmd' });
     await call('add_tts_filter', { regex: 'bot$' });
     let s = loadSettings(storeFile);
@@ -129,6 +139,9 @@ describe('mcp tools: filter list management', () => {
   });
 
   it('TTS + notifications lists are independent', async () => {
+    // Strip the v0.1.48 seed from both lists first.
+    await call('remove_tts_filter', { regex: SEED });
+    await call('remove_notification_filter', { regex: SEED });
     await call('add_tts_filter', { regex: 'tts-only' });
     await call('add_notification_filter', { regex: 'notif-only' });
     const s = loadSettings(storeFile);
@@ -137,9 +150,17 @@ describe('mcp tools: filter list management', () => {
   });
 
   it('remove on a missing pattern is a silent no-op', async () => {
+    // The v0.1.48 seed sits in the list at the start of this test; removing
+    // a never-added pattern is a no-op, so the seed stays put.
     await call('remove_tts_filter', { regex: 'never-added' });
     const s = loadSettings(storeFile);
-    expect(s.filters.tts.ignoreRegex).toEqual([]);
+    expect(s.filters.tts.ignoreRegex).toEqual([SEED]);
+  });
+
+  it('v0.1.48: empty store reads back the seeded `^viewer$` baseline', () => {
+    const s = loadSettings(storeFile);
+    expect(s.filters.tts.ignoreRegex).toEqual([SEED]);
+    expect(s.filters.notifications.ignoreRegex).toEqual([SEED]);
   });
 });
 
@@ -156,10 +177,16 @@ describe('mcp tools: get_status / get_filters / list_settings', () => {
   it('list_settings returns merged defaults on empty store', async () => {
     const out = (await call('list_settings', {})) as any;
     expect(out.tts.enabled).toBe(false);
-    expect(out.filters.tts.ignoreRegex).toEqual([]);
+    // v0.1.48: the empty-store default now seeds `^viewer$` into both
+    // ignoreRegex lists.
+    expect(out.filters.tts.ignoreRegex).toEqual(['^viewer$']);
+    expect(out.filters.notifications.ignoreRegex).toEqual(['^viewer$']);
   });
 
   it('get_filters returns current ignore lists', async () => {
+    // Strip the v0.1.48 seed before adding so the assertion is clean.
+    await call('remove_tts_filter', { regex: '^viewer$' });
+    await call('remove_notification_filter', { regex: '^viewer$' });
     await call('add_tts_filter', { regex: 'foo' });
     await call('add_notification_filter', { regex: 'bar' });
     const r = (await call('get_filters', {})) as any;
