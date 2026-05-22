@@ -248,11 +248,17 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     client.stop();
   });
 
-  it('v0.1.47: auto-reconnect is DISABLED by default — no retry timer scheduled', async () => {
-    // Regression test for Ethan voice 3630. On any disconnect, state
-    // should flip to `disconnected` and stay there. No second WebSocket
-    // instance should ever be created (no legacy backoff, no provider
-    // call) until the user manually invokes `reconnect()`.
+  it('v0.1.47: auto-reconnect is DISABLED by default — no retry timer scheduled (steady-state close)', async () => {
+    // Regression test for Ethan voice 3630. On any disconnect (past the
+    // v0.1.51 30s early-close window), state should flip to `disconnected`
+    // and stay there. No second WebSocket instance should ever be created
+    // (no legacy backoff, no provider call) until the user manually
+    // invokes `reconnect()`.
+    //
+    // v0.1.51: advance the fake timer 60s between `open` and `close` so
+    // the close is treated as a steady-state drop, NOT an early close.
+    // The new early-close retry would also produce `reconnecting`, but
+    // that path is exercised by the v0.1.51 tests in ws-reconnect.test.ts.
     const client = new ChatClient();
     client.setToken('abc');
     const provider = vi.fn().mockResolvedValue({ ok: true });
@@ -261,6 +267,7 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
+    vi.advanceTimersByTime(60_000);
     ws.emit('close', 1006, Buffer.from('boom'));
 
     expect(client.getState().status).toBe('disconnected');

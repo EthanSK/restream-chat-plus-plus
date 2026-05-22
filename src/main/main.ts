@@ -9,6 +9,7 @@ import {
 import path from 'node:path';
 import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
+import log from 'electron-log/main';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
 import { createStore } from './store';
@@ -1635,6 +1636,12 @@ app.on('ready', async () => {
   // the `startupAuthDone` Promise still gates the initial AUTH_STATUS
   // push so the user sees no "Sign in" flash before the refresh settles.
   const resumeAuth = async (): Promise<void> => {
+    // v0.1.51: structured boot-path logging so a future "stuck on idle" /
+    // "still not connecting after update" session is diagnosable without
+    // having to ship another build. Previously `main.log` only contained
+    // updater chatter — there was no record of whether `chat.start()`
+    // was ever called, which token leg ran, or where the boot path bailed.
+    log.info('[main] resumeAuth: start');
     try {
       // First leg: see if the (possibly deferred) decrypted token is
       // still within its access-token validity window. After the first
@@ -1642,6 +1649,10 @@ app.on('ready', async () => {
       // launch waits up to 2s for the decrypt timeout.
       if (await oauth.isAuthenticatedAsync()) {
         const t = (await oauth.getTokenAsync())!;
+        log.info('[main] resumeAuth: cached/decrypted token valid, calling chat.start()', {
+          expiresAtMs: t.expiresAt,
+          msUntilExpiry: t.expiresAt - Date.now(),
+        });
         chat.setToken(t.accessToken);
         chat.start();
       } else {
@@ -1650,18 +1661,27 @@ app.on('ready', async () => {
         // refresh-token round-trip — succeeds for the second case,
         // returns undefined for the first/third (no refresh token to
         // present), leaving the user on the sign-in screen.
+        log.info('[main] resumeAuth: no valid cached token, trying refresh');
         const refreshed = await oauth.refresh();
         if (refreshed) {
+          log.info('[main] resumeAuth: refresh succeeded, calling chat.start()', {
+            expiresAtMs: refreshed.expiresAt,
+            msUntilExpiry: refreshed.expiresAt - Date.now(),
+          });
           chat.setToken(refreshed.accessToken);
           chat.start();
+        } else {
+          log.warn('[main] resumeAuth: refresh failed/no refresh token — leaving user on sign-in');
         }
       }
     } catch (err) {
+      log.error('[main] resumeAuth: threw', err);
       console.error('[main] startup auth resume failed', err);
     } finally {
       // Broadcast the final auth state and unblock did-finish-load.
       pushAuthStatus();
       resolveStartupAuth();
+      log.info('[main] resumeAuth: done', { chatState: chat.getState() });
     }
   };
   // Fire-and-forget — do NOT await. The `ready` callback completes

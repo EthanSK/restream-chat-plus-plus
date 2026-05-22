@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.1.51 — Post-open "early close" one-shot retry + boot-path logging
+
+Fix for Ethan voice 3709: "I updated Restream Chat++ to 0.1.50 and it's
+still stuck on idle." The earlier v0.1.49 / v0.1.50 work covered ONLY
+the **pre-`'open'`** handshake-failure path. Production logs on the
+v0.1.50 build show a different failure mode that the prior fixes don't
+catch: the WS **opens** successfully, frames flow for a fraction of a
+second, then the server immediately fires `'close'`. The most common
+trigger is Restream sending a WS-level `connection_replaced` when a
+second client grabs the same session token (e.g. the prior app
+instance still alive after a Sparkle update swap, an open
+`chat.restream.io` tab, or a stale `Restream Chat` app). An immediate
+server-side auth reject right after handshake produces the same shape.
+
+Pre-v0.1.51 behaviour: `'open'` flips `hasEverConnectedThisSession=true`,
+the subsequent close hits the v0.1.47 short-circuit (auto-reconnect
+off + ever-connected = true), and we land on `'disconnected'` silently
+— NO entry in `reconnect-events.jsonl`, no banner explaining why, just
+a dead app. From the user's perspective, indistinguishable from "stuck
+on idle".
+
+**Fix — post-open "early close" one-shot retry.** If the WS closes
+within `EARLY_CLOSE_WINDOW_MS` (30 seconds) of the `'open'` event, we
+schedule exactly ONE retry via the unified-reconnect provider — same
+shape as the v0.1.49 pre-open retry, just gated on a new flag
+(`earlyCloseRetryUsedThisSession`) so the two budgets are independent.
+After this one retry (regardless of outcome), or for any close
+**outside** the 30s window, we fall through to the v0.1.47 default and
+stay on `'disconnected'`. No 5s polling loop — the budget guard
+prevents the v0.1.50 regression that hardened the pre-open path.
+
+**The two budgets stack but don't collide.** A session that fails pre-
+`'open'` AND then has a post-open early close gets at most TWO retries
+total (one from each budget), then `'disconnected'`. New test:
+`v0.1.51: initial-connect + early-close budgets are SEPARATE one-shots`.
+
+**Boot-path logging in `main.ts`.** `resumeAuth()` now writes
+structured entries to `main.log` at every decision point: which leg ran
+(cached token / refresh / no-token), whether `chat.start()` was called,
+the token's `expiresAtMs`/`msUntilExpiry`, and the final `chat.getState()`.
+Pre-v0.1.51 the only thing in `main.log` was Squirrel update chatter —
+there was no record of whether the WS layer even got invoked, which
+made diagnosing this v0.1.50 case much harder than it should have been.
+
+**New regression tests in `src/__tests__/ws-reconnect.test.ts`:**
+
+- `v0.1.51: post-open early close (within 30s) gets ONE retry`
+- `v0.1.51: post-open early close one-shot budget — second early close goes to disconnected`
+- `v0.1.51: close AFTER the 30s window is treated as steady-state drop (no retry)`
+- `v0.1.51: initial-connect + early-close budgets are SEPARATE one-shots`
+
+Two existing tests were updated to advance fake timers past the 30s
+window so they exercise the steady-state path explicitly (they were
+relying on the pre-v0.1.51 "any post-open close goes straight to
+disconnected" assumption that no longer holds).
+
 ## v0.1.50 — Codex-blocking fix to v0.1.49
 
 Codex review of v0.1.49 caught two production-only paths that re-armed

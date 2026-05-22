@@ -72,7 +72,7 @@ describe('ChatClient reconnect', () => {
     client.stop();
   });
 
-  it('v0.1.47: with auto-reconnect OFF, close transitions to disconnected and stays', () => {
+  it('v0.1.47: with auto-reconnect OFF, close (after early-close window) transitions to disconnected and stays', () => {
     // Regression test for Ethan voice 3630 — production default is no
     // auto-reconnect. The state must flip to `disconnected` and stay
     // there; no second socket is created.
@@ -82,12 +82,19 @@ describe('ChatClient reconnect', () => {
     // retry never fires — `hasEverConnectedThisSession` flips to true
     // on the open event. The post-connected disconnect path is still
     // the v0.1.47 "stay disconnected" behaviour, exactly as before.
+    //
+    // v0.1.51 update: the close MUST land past EARLY_CLOSE_WINDOW_MS
+    // (30s) so the new post-open early-close retry doesn't fire — that
+    // would also produce `reconnecting`, not `disconnected`. Advance
+    // the fake timer 60s between open and close to exercise the
+    // steady-state path explicitly.
     const client = new ChatClient();
     client.setToken('abc');
     // Deliberately do NOT call setAutoReconnectEnabled — default is OFF.
     client.start();
     const ws = WS.instances[0];
     ws.emit('open');
+    vi.advanceTimersByTime(60_000);
     ws.emit('close', 1006, Buffer.from('boom'));
     expect(client.getState().status).toBe('disconnected');
     vi.advanceTimersByTime(120_000); // 2 minutes — far past any historical backoff
@@ -160,18 +167,21 @@ describe('ChatClient reconnect', () => {
     client.stop();
   });
 
-  it('v0.1.49: once we reach `connected`, a subsequent disconnect goes straight to `disconnected` (no retry)', () => {
-    // After a successful initial connect, the one-shot retry budget is
-    // moot — any future disconnect this session goes through the normal
+  it('v0.1.51: connected for >30s then disconnect → no retry, straight to disconnected', () => {
+    // After a STABLE connection (open + >30s elapsed), any disconnect is
+    // treated as a genuine mid-session drop and goes through the normal
     // v0.1.47 default (stay disconnected, wait for manual Reconnect).
-    // This guards against accidentally giving every disconnect a retry
-    // budget by resetting `hasEverConnectedThisSession` too aggressively.
+    // The v0.1.51 early-close retry only fires when the close lands
+    // within EARLY_CLOSE_WINDOW_MS of the `'open'` event.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
     const ws0 = WS.instances[0];
     ws0.emit('open');
     expect(client.getState().status).toBe('connected');
+
+    // Advance past the early-close window so the next close is "real".
+    vi.advanceTimersByTime(60_000);
 
     // Now the live socket drops.
     ws0.emit('close', 1006, Buffer.from('mid-session-drop'));
@@ -291,11 +301,13 @@ describe('ChatClient reconnect', () => {
     client.stop();
   });
 
-  it("v0.1.50: double-fire after `connected` doesn't run handleDisconnect twice", () => {
+  it("v0.1.50: double-fire after `connected` doesn't run handleDisconnect twice (stable session)", () => {
     // Same guard, post-connected path: if a live socket emits both
     // `'error'` and `'close'`, we shouldn't double-bump `attempt` or
-    // re-fire state transitions. The state should land at `disconnected`
-    // with attempt=1, not attempt=2.
+    // re-fire state transitions. State should land at `disconnected`
+    // with attempt=1, not attempt=2. v0.1.51: advance the clock past
+    // EARLY_CLOSE_WINDOW_MS so the close is NOT eligible for the
+    // post-open one-shot retry — we're testing the steady-state path.
     const client = new ChatClient();
     client.setToken('abc');
     client.start();
@@ -303,12 +315,135 @@ describe('ChatClient reconnect', () => {
     ws0.emit('open');
     expect(client.getState().status).toBe('connected');
 
+    vi.advanceTimersByTime(60_000);
+
     ws0.emit('error', new Error('mid-session-error'));
     ws0.emit('close', 1006, Buffer.from('mid-session-close'));
 
     expect(client.getState().status).toBe('disconnected');
     expect(client.getState().attempt).toBe(1);
     expect(WS.instances.length).toBe(1);
+
+    client.stop();
+  });
+
+  it('v0.1.51: post-open early close (within 30s) gets ONE retry', () => {
+    // Ethan voice 3709: v0.1.50 update applied, still stuck on idle. The
+    // production failure mode is the WS opens, briefly receives frames,
+    // then the server fires `'close'` — e.g. Restream `connection_replaced`,
+    // or an immediate auth reject. Pre-v0.1.51, this landed silently on
+    // `disconnected`. v0.1.51 schedules ONE retry via the unified-reconnect
+    // provider when the close fires within EARLY_CLOSE_WINDOW_MS of open.
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    ws0.emit('open');
+    expect(client.getState().status).toBe('connected');
+
+    // Server immediately closes the WS (e.g. `connection_replaced`).
+    vi.advanceTimersByTime(500);
+    ws0.emit('close', 1006, Buffer.from('connection_replaced'));
+
+    // Per v0.1.51: state goes to `reconnecting`, retry is armed.
+    expect(client.getState().status).toBe('reconnecting');
+    expect(WS.instances.length).toBe(1);
+
+    // 5s later the retry fires (uses the unified `scheduleInitialConnectRetry`).
+    vi.advanceTimersByTime(5_000);
+    expect(WS.instances.length).toBe(2);
+
+    client.stop();
+  });
+
+  it('v0.1.51: post-open early close one-shot budget — second early close goes to disconnected', () => {
+    // Budget guard: only ONE retry per session via the early-close path.
+    // If the retry handshake ALSO opens then closes within the window,
+    // we land at `disconnected` rather than looping. Mirrors the
+    // v0.1.49/v0.1.50 initial-retry budget shape.
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    ws0.emit('open');
+    vi.advanceTimersByTime(500);
+    ws0.emit('close', 1006, Buffer.from('first-early-close'));
+    expect(client.getState().status).toBe('reconnecting');
+
+    // 5s retry fires.
+    vi.advanceTimersByTime(5_000);
+    expect(WS.instances.length).toBe(2);
+    const ws1 = WS.instances[1];
+
+    // Second handshake also opens then closes early.
+    ws1.emit('open');
+    vi.advanceTimersByTime(500);
+    ws1.emit('close', 1006, Buffer.from('second-early-close'));
+
+    // Budget exhausted — must land at disconnected, no third socket.
+    expect(client.getState().status).toBe('disconnected');
+    vi.advanceTimersByTime(120_000);
+    expect(WS.instances.length).toBe(2);
+
+    client.stop();
+  });
+
+  it('v0.1.51: close AFTER the 30s window is treated as steady-state drop (no retry)', () => {
+    // The early-close window is bounded — sessions that have been up for
+    // more than EARLY_CLOSE_WINDOW_MS are considered stable, so a close
+    // at that point goes through the v0.1.47 default and waits for
+    // manual Reconnect. Otherwise, every disconnect over a long-running
+    // session would burn the budget without good cause.
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    ws0.emit('open');
+    expect(client.getState().status).toBe('connected');
+
+    // 31s in — past the early-close window.
+    vi.advanceTimersByTime(31_000);
+    ws0.emit('close', 1006, Buffer.from('late-drop'));
+
+    expect(client.getState().status).toBe('disconnected');
+    vi.advanceTimersByTime(120_000);
+    expect(WS.instances.length).toBe(1);
+
+    client.stop();
+  });
+
+  it('v0.1.51: initial-connect + early-close budgets are SEPARATE one-shots', () => {
+    // A session that has both a pre-open failure AND a post-open early
+    // close gets ONE retry from each budget — total two retries, then
+    // disconnected. Confirms the two flags don't accidentally collide.
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const ws0 = WS.instances[0];
+    // First handshake never opens.
+    ws0.emit('close', 1006, Buffer.from('handshake-fail'));
+    expect(client.getState().status).toBe('reconnecting');
+    vi.advanceTimersByTime(5_000);
+    expect(WS.instances.length).toBe(2);
+
+    // Second handshake opens, then early-closes.
+    const ws1 = WS.instances[1];
+    ws1.emit('open');
+    vi.advanceTimersByTime(500);
+    ws1.emit('close', 1006, Buffer.from('early-close'));
+    expect(client.getState().status).toBe('reconnecting');
+    vi.advanceTimersByTime(5_000);
+    expect(WS.instances.length).toBe(3);
+
+    // Third handshake opens, then closes again — both budgets exhausted.
+    const ws2 = WS.instances[2];
+    ws2.emit('open');
+    vi.advanceTimersByTime(500);
+    ws2.emit('close', 1006, Buffer.from('third-close'));
+
+    expect(client.getState().status).toBe('disconnected');
+    vi.advanceTimersByTime(120_000);
+    expect(WS.instances.length).toBe(3);
 
     client.stop();
   });
