@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   Notification,
@@ -931,6 +932,48 @@ app.on('ready', async () => {
     const status: AuthStatus = { authenticated: false };
     mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
     return status;
+  });
+
+  // v0.1.52: native Sign Out confirmation dialog.
+  //
+  // Pre-v0.1.52 the renderer used `window.confirm()` to gate the
+  // destructive sign-out. In our Electron BrowserWindow config
+  // (`sandbox: false`, `contextIsolation: true`), `window.confirm` was
+  // returning `false` synchronously without ever showing a dialog —
+  // so the renderer's `shouldProceedWithSignOut` short-circuited and
+  // `authLogout()` was never called. To the user: "I click Sign out
+  // and nothing happens". Ethan voice 3719.
+  //
+  // Fix: route the prompt through `dialog.showMessageBox` from main
+  // (a real native modal that always renders). The renderer awaits the
+  // boolean and only fires AUTH_LOGOUT on `true`. dialog.showMessageBox
+  // is documented stable across all supported Electron versions.
+  ipcMain.handle(IPC.AUTH_CONFIRM_LOGOUT, async () => {
+    try {
+      const parent = mainWindow ?? undefined;
+      const result = parent
+        ? await dialog.showMessageBox(parent, {
+            type: 'warning',
+            buttons: ['Cancel', 'Sign out'],
+            defaultId: 0,
+            cancelId: 0,
+            message: 'Sign out of Restream?',
+            detail: "You'll need to re-authenticate on next launch.",
+          })
+        : await dialog.showMessageBox({
+            type: 'warning',
+            buttons: ['Cancel', 'Sign out'],
+            defaultId: 0,
+            cancelId: 0,
+            message: 'Sign out of Restream?',
+            detail: "You'll need to re-authenticate on next launch.",
+          });
+      return result.response === 1;
+    } catch (err) {
+      log.error('[main] authConfirmLogout dialog threw', err);
+      // Fail closed — never log the user out if the prompt errored.
+      return false;
+    }
   });
 
   // ----- IPC: settings -----

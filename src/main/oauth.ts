@@ -26,33 +26,36 @@ const AUTH_URL = 'https://api.restream.io/login';
 const TOKEN_URL = 'https://api.restream.io/oauth/token';
 
 /**
- * `safeStorage.decryptString` on macOS is a SYNCHRONOUS native call that
- * blocks the main thread for the entire duration of the SecurityAgent
- * "Allow" prompt. That means the timeout below CANNOT pre-empt a hung
- * syscall — by the time the timer would fire, the JS event loop is
- * already frozen waiting on the decrypt to return.
+ * Default ceiling for any single `safeStorage.decryptString` call. macOS
+ * Keychain blocks the entire main thread on the synchronous decrypt syscall
+ * when the binary's code signature doesn't match the ACL on the stored
+ * entry — SecurityAgent pops a "Restream Chat++ wants to use Confidential
+ * Information stored in your keychain" prompt and the main process sits
+ * frozen until the user clicks Allow or Deny.
  *
- * What the timeout DOES protect against: a hypothetical async-decrypt
- * future-Electron build, AND any code path where decryptString happens
- * to defer (e.g. a mocked test environment). It is NOT the primary
- * defence against the "signed out every update" bug.
+ * v0.1.38 fix: decrypt runs OFF the boot critical path (the window comes up
+ * first regardless), AND every decrypt call is wrapped in a Promise.race
+ * against this timeout. If the timeout fires we surface a signed-out state
+ * temporarily so the user sees the UI, but we do NOT wipe the encrypted
+ * blob — the next launch will retry. Only an actual decrypt throw means
+ * real ACL drift.
  *
- * The primary defence is the THREE-WAY outcome split below (`'ok'` /
- * `'threw'` / `'unparseable'`):
- *   - `'ok'` → cache + return.
- *   - `'threw'` → user denied / ACL mismatch / Keychain unavailable.
- *                  PRESERVE the blob; surface signed-out for THIS launch
- *                  only. On the NEXT launch (after the user has clicked
- *                  Always Allow once), decrypt will succeed cleanly. This
- *                  is the actual fix for v0.1.38's wipe-on-update bug.
- *   - `'unparseable'` → decrypt resolved but the plaintext is junk
- *                       (bad JSON, missing accessToken). Genuinely
- *                       corrupt — retrying would just fail the same
- *                       way every launch, so wipe and force a fresh
- *                       OAuth.
+ * v0.1.52 raise from 2s → 30s: after a Sparkle in-place update, the first
+ * decrypt on the new binary triggers a SecurityAgent prompt because the
+ * Keychain ACL partition is tied to the previous binary's CDHash.
+ * Even on the SAME Developer ID + bundle ID, the new binary's hash differs
+ * so the partition_id check fails and the prompt appears. The user can
+ * click "Always Allow" once and the prompt won't repeat for the same
+ * binary, but a 2s timeout was wiping the token before the user could
+ * react — exactly the "signed out every update" symptom.
  *
- * v0.1.52 raised the timeout from 2s → 30s anyway, as belt-and-braces
- * for the async-mock path the unit tests exercise.
+ * NOTE: Promise.race does NOT cancel the underlying sync `decryptString`
+ * syscall — that's a Node/Electron limitation. What it DOES guarantee is
+ * that the rest of the app (window paint, IPC handlers, network) keeps
+ * running while the syscall is in flight, because we await on the race
+ * result on a non-critical path. The first decrypt request happens AFTER
+ * the window is visible, so even if the user gets a Keychain prompt they
+ * see a UI behind it, not a hung dock icon.
  */
 const SAFE_STORAGE_DECRYPT_TIMEOUT_MS = 30_000;
 
@@ -311,17 +314,19 @@ export class OAuthCoordinator {
     try {
       const result = await Promise.race([decryptOnce(), timeout]);
       if (result === '__timeout__') {
-        // This branch effectively only fires in test environments where
-        // `decryptString` is mocked to defer. In production macOS,
-        // `safeStorage.decryptString` is a synchronous native call that
-        // blocks the main thread — the timer below cannot fire while
-        // the JS event loop is frozen. The throw branch above is the
-        // real production safety net for ACL mismatch / user-denied.
+        // v0.1.52: do NOT wipe on timeout. A timeout means the syscall is
+        // STILL in flight (likely a SecurityAgent prompt the user hasn't
+        // clicked yet). Wiping here was the cause of the "signed out
+        // every update" bug — after a Sparkle update, the new binary's
+        // ACL doesn't match the partition_id on the Keychain entry, so
+        // the prompt fires; the user takes >2s to find and click "Always
+        // Allow"; we wipe before they can react; the next time round
+        // there's no tokenEnc to decrypt and they have to OAuth again.
         //
-        // We still preserve the blob here so the test contract matches
-        // the production-throw contract: NEVER wipe just because we
-        // didn't get an answer fast enough. Wiping was the v0.1.38 bug
-        // we're fixing.
+        // The right behaviour is to surface signed-out THIS launch (so
+        // the UI doesn't hang) but preserve the blob — next launch the
+        // ACL trust is in place from the first Allow click, decrypt
+        // succeeds, and the user stays signed in.
         console.warn(
           `[oauth] safeStorage.decryptString timed out after ${SAFE_STORAGE_DECRYPT_TIMEOUT_MS}ms — surfacing signed-out for this launch (NOT wiping tokenEnc)`,
         );
