@@ -18,6 +18,10 @@ import { normalizeRestreamEventDetailed } from './normalize';
  * outside of an Electron main-process context.
  */
 function tryGetElectronApp(): { getPath?: (name: string) => string } | undefined {
+  // Unit tests mock ws and do not need filesystem raw logs. Requiring the
+  // real electron package under Vitest can trigger an Electron binary
+  // download on Linux CI, which makes otherwise-fast reconnect tests time out.
+  if (process.env.VITEST) return undefined;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return require('electron')?.app;
