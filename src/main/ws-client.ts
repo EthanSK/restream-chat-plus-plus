@@ -54,19 +54,6 @@ const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
 const AUTO_RETRY_INTERVAL_MS = 60_000;
 
 /**
- * v0.1.49: one-shot initial-connect retry delay.
- *
- * If the FIRST WS handshake after `start()` / `reconnect()` closes
- * before reaching `connected`, we retry exactly ONCE after this delay.
- * Picked at 5s to give a transient network/server blip room to clear
- * without making the user wait too long. Subsequent failures fall back
- * to the v0.1.47 default of "sit at `disconnected` until the user
- * clicks Reconnect" — we don't loop. See the field-level comment on
- * `initialRetryUsedThisSession` in `ChatClient` for the rationale.
- */
-const INITIAL_CONNECT_RETRY_MS = 5_000;
-
-/**
  * Result returned by the `reconnectProvider` hook. `ok` indicates whether
  * the WS handshake will be attempted with a fresh token (i.e. OAuth refresh
  * succeeded if needed AND `chat.reconnect()` fired). When `ok: false`, the
@@ -166,40 +153,6 @@ export class ChatClient extends EventEmitter {
    */
   private autoReconnectEnabled = false;
   /**
-   * v0.1.49: one-shot recovery on the initial connect path.
-   *
-   * The bug v0.1.49 fixes (Ethan voice 3692, "Restream Chat++ is stuck on
-   * idle. I just signed in. Can you investigate?"): with auto-reconnect
-   * fully OFF (v0.1.47 default), if the very first WS handshake after
-   * `start()` / `reconnect()` ever closes / errors before reaching the
-   * `connected` state — a network blip during boot, an api.restream.io
-   * blip during the handshake, a TLS hiccup — the client flips straight
-   * to `disconnected` and stays there, leaving the user with no live
-   * connection and no automatic recovery. The only escape is the manual
-   * Reconnect toolbar button, but the user may not realise they need to
-   * click it (the UI just shows "Disconnected" or, on first launch
-   * before any state has flipped, the leftover initial `idle` placeholder
-   * in the renderer).
-   *
-   * The fix is a one-shot 5-second retry that fires exactly ONCE per
-   * `start()` / `reconnect()` invocation — IF we've never reached
-   * `connected` in this session. It runs the unified `performFullReconnect`
-   * provider (same OAuth-refresh + WS-handshake path the manual button
-   * uses), so it covers the "token expired during the handshake gap"
-   * case too. After this one retry succeeds (→ `connected`) the flag
-   * resets and any subsequent disconnect goes back to the default
-   * "stay disconnected, wait for manual click" path Ethan wants. If
-   * the retry ALSO fails to reach `connected`, we stop retrying and
-   * surface `disconnected` so the user clicks the manual button — we
-   * don't loop, that's what Ethan disabled in v0.1.47.
-   *
-   * Distinct from `autoReconnectEnabled` because that flag enables the
-   * full 60s polling loop the user explicitly disabled in v0.1.47.
-   * This is one retry, period.
-   */
-  private hasEverConnectedThisSession = false;
-  private initialRetryUsedThisSession = false;
-  /**
    * Callback fired AFTER every auto-reconnect attempt (provider call) so
    * main.ts can write a structured entry to `reconnect-events.jsonl`. We
    * keep the file I/O OUT of this class to preserve the test-time
@@ -286,11 +239,6 @@ export class ChatClient extends EventEmitter {
 
   start() {
     this.stopped = false;
-    // v0.1.49: reset the one-shot initial-retry tracking so a brand-new
-    // `start()` always gets its one retry budget, even after a previous
-    // session ended in `disconnected`.
-    this.hasEverConnectedThisSession = false;
-    this.initialRetryUsedThisSession = false;
     this.connect();
   }
 
@@ -304,14 +252,7 @@ export class ChatClient extends EventEmitter {
       // ignore
     }
     this.ws = undefined;
-    // v0.1.49: reset the one-shot initial-retry tracking — the next
-    // `start()` (e.g. after a sign-out → sign-in cycle) gets a clean
-    // budget. We intentionally do this AFTER setState so the listener
-    // sees the disconnected event with the same tracking state it had
-    // during the live session.
     this.setState({ status: 'disconnected', attempt: 0 });
-    this.hasEverConnectedThisSession = false;
-    this.initialRetryUsedThisSession = false;
   }
 
   /**
@@ -342,12 +283,6 @@ export class ChatClient extends EventEmitter {
     }
     this.stopped = false;
     this.attempt = 0;
-    // v0.1.49: manual Reconnect is a fresh user-driven attempt. Reset
-    // the one-shot initial-retry tracking so the new handshake gets its
-    // own retry budget; the previous session's tracking shouldn't
-    // suppress recovery on a brand-new manual reconnect.
-    this.hasEverConnectedThisSession = false;
-    this.initialRetryUsedThisSession = false;
     this.connect();
   }
 
@@ -433,12 +368,6 @@ export class ChatClient extends EventEmitter {
 
     ws.on('open', () => {
       this.attempt = 0;
-      // v0.1.49: mark that we've successfully reached `connected` at
-      // least once this session. From this point on, any future
-      // disconnect goes through the normal v0.1.47 default path (stay
-      // at `disconnected` until manual Reconnect). Only the
-      // PRE-`connected` initial handshake gets the one-shot retry.
-      this.hasEverConnectedThisSession = true;
       this.setState({ status: 'connected', attempt: 0 });
       this.startHeartbeat();
     });
@@ -565,39 +494,6 @@ export class ChatClient extends EventEmitter {
     // Tests can opt back in to the v0.1.45 polling behaviour via
     // `setAutoReconnectEnabled(true)`.
     if (!this.autoReconnectEnabled) {
-      // v0.1.49 — one-shot initial-connect recovery (Ethan voice 3692:
-      // "Restream Chat++ is stuck on idle. I just signed in."). If
-      // we've NEVER reached `connected` this session AND haven't used
-      // our retry yet, schedule exactly ONE retry after a short delay
-      // via the unified-reconnect provider (or `connect()` fallback for
-      // tests without a provider installed). This handles transient
-      // boot-time handshake hiccups — network blip during sign-in, an
-      // api.restream.io blip during the very first handshake, a TLS
-      // hiccup — without re-enabling the 60s polling loop that v0.1.47
-      // disabled. After this one retry, regardless of outcome, we fall
-      // through to the v0.1.47 "stay at disconnected" path on any
-      // further close events.
-      //
-      // The retry is fire-and-forget — if it succeeds (WS open event
-      // fires), `hasEverConnectedThisSession` flips true and any future
-      // disconnect this session goes through the normal "stay
-      // disconnected" path. If it fails (another close event), we
-      // re-enter handleDisconnect, hit this same block, find
-      // `initialRetryUsedThisSession=true`, and short-circuit straight
-      // to `disconnected` — no looping.
-      if (
-        !this.hasEverConnectedThisSession &&
-        !this.initialRetryUsedThisSession
-      ) {
-        this.initialRetryUsedThisSession = true;
-        this.setState({
-          status: 'reconnecting',
-          attempt: this.attempt,
-          lastError: reason,
-        });
-        this.scheduleInitialConnectRetry(reason);
-        return;
-      }
       this.setState({ status: 'disconnected', attempt: this.attempt, lastError: reason });
       return;
     }
@@ -696,101 +592,6 @@ export class ChatClient extends EventEmitter {
           }
         });
     }, AUTO_RETRY_INTERVAL_MS);
-  }
-
-  /**
-   * v0.1.49: schedule the one-shot initial-connect retry (5s) on the
-   * very first handshake failure of a fresh `start()` / `reconnect()`
-   * session. This is INTENTIONALLY scoped narrower than `scheduleAutoRetry`:
-   *
-   * - Fires at most ONCE per session (gated by `initialRetryUsedThisSession`
-   *   in `handleDisconnect`).
-   * - Does NOT chain off its own failure — if the retry also fails to
-   *   reach `connected`, we land in `disconnected` and wait for the
-   *   manual Reconnect button. The whole point of v0.1.47 was to stop
-   *   the perpetual polling, and this retry only exists for the
-   *   "transient blip during sign-in" case; if the second attempt fails,
-   *   the user's network or token is genuinely off and a 60s poll
-   *   wouldn't help any more than a manual click would.
-   * - Uses the unified-reconnect provider when installed (real app path)
-   *   so the retry handshake gets a fresh OAuth refresh + chat.reconnect()
-   *   pipeline, identical to the manual button. Falls back to bare
-   *   `this.connect()` (with the cached access token) when no provider
-   *   is installed — that's the unit-test path and matches the legacy
-   *   behaviour for `scheduleAutoRetry`'s fallback branch.
-   */
-  private scheduleInitialConnectRetry(reason: string) {
-    if (this.stopped) return;
-    const attempt = this.attempt;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      if (this.stopped) return;
-      // If something flipped us to `connected` in the meantime (rare —
-      // would mean someone else called `reconnect()` during the delay —
-      // but safe to guard) skip the retry to avoid tearing down the
-      // already-healthy socket.
-      if (this.state.status === 'connected') return;
-      if (this.providerInFlight) return;
-      const provider = this.reconnectProvider;
-      if (!provider) {
-        // Test path / pre-app-ready: no provider installed. Fall back to
-        // a bare `this.connect()` with the cached access token. That
-        // matches the legacy `scheduleAutoRetry` fallback branch and
-        // keeps the v0.1.47 unit tests working without changes.
-        this.connect();
-        return;
-      }
-      this.providerInFlight = true;
-      Promise.resolve()
-        .then(() => provider())
-        .then((outcome) => {
-          this.providerInFlight = false;
-          try {
-            this.autoAttemptListener?.({
-              attempt,
-              reason: `initial-retry:${reason}`,
-              outcome: outcome.ok ? 'ok' : 'failed',
-              failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
-            });
-          } catch {
-            // never break delivery on a listener failure
-          }
-          // If the provider returned ok=false (no token / refresh failed)
-          // it never re-armed the socket, so we won't get a fresh
-          // `close` event to re-enter `handleDisconnect`. Surface
-          // `disconnected` here so the UI stops spinning on
-          // `reconnecting`. The user can then click manual Reconnect
-          // once their auth is sorted.
-          if (!outcome.ok && !this.stopped && this.state.status !== 'connected') {
-            this.setState({
-              status: 'disconnected',
-              attempt: this.attempt,
-              lastError: outcome.reason ?? 'initial-retry-failed',
-            });
-          }
-        })
-        .catch((err) => {
-          this.providerInFlight = false;
-          const msg = (err as Error)?.message ?? String(err);
-          try {
-            this.autoAttemptListener?.({
-              attempt,
-              reason: `initial-retry:${reason}`,
-              outcome: 'failed',
-              failureReason: msg,
-            });
-          } catch {
-            // never break delivery on a listener failure
-          }
-          if (!this.stopped && this.state.status !== 'connected') {
-            this.setState({
-              status: 'disconnected',
-              attempt: this.attempt,
-              lastError: msg,
-            });
-          }
-        });
-    }, INITIAL_CONNECT_RETRY_MS);
   }
 
   private startHeartbeat() {

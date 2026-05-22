@@ -1,42 +1,5 @@
 # Changelog
 
-## v0.1.49 — one-shot initial-connect retry (fix "stuck on idle")
-
-Fix for Ethan voice 3692: "Restream Chat++ is stuck on idle. I just
-signed in. Can you investigate?". With v0.1.47's auto-reconnect fully
-disabled, the very first WebSocket handshake after sign-in / app launch
-had no recovery if it closed before reaching `connected` — a transient
-network blip, an `api.restream.io` blip, a TLS hiccup, or even a
-pre-emptive `close 1006` would land the user on `disconnected` (or, on
-a brand-new launch, leave the renderer on its initial `idle`
-placeholder) with no automatic recovery and no obvious cue beyond the
-small toolbar Reconnect icon.
-
-v0.1.49 adds a **one-shot 5-second retry** scoped narrowly to the
-initial-connect path:
-
-- Fires at most ONCE per `start()` / `reconnect()` session.
-- Only fires if the WS has NEVER reached `connected` this session
-  (`hasEverConnectedThisSession === false`). Once a successful connect
-  lands, all future disconnects go straight to `disconnected` per
-  v0.1.47's behaviour — no change to the post-connected path.
-- After the retry, regardless of outcome, the v0.1.47 default takes
-  over. We never loop, we never poll. The whole network-traffic
-  rationale Ethan cited in voice 3630 is preserved.
-- Runs through the unified `performFullReconnect()` provider so the
-  retry handshake gets the same OAuth-refresh + `chat.reconnect()`
-  pipeline as the manual button — covers the "token expired during the
-  handshake gap" case.
-- `setAutoReconnectEnabled(true)` (test-only opt-in) still restores the
-  full v0.1.45 polling behaviour.
-
-Regression tests in `src/__tests__/ws-reconnect.test.ts`:
-
-- `initial-connect failure (no open before close) gets ONE 5s retry`
-- `initial-connect retry fires AT MOST ONCE — second failure goes to disconnected`
-- `once we reach connected, a subsequent disconnect goes straight to disconnected (no retry)`
-- `manual reconnect() resets the one-shot budget for the new session`
-
 ## v0.1.48 — seed `^viewer$` into regex-ignore lists
 
 Add `^viewer$` (anchored, case-insensitive via the uniform `i` flag the
