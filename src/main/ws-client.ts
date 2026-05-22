@@ -28,6 +28,7 @@ function tryGetElectronApp(): { getPath?: (name: string) => string } | undefined
 
 const RESTREAM_WS_URL = 'wss://chat.api.restream.io/ws';
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const STALE_INBOUND_TIMEOUT_MS = 90_000;
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
 const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
@@ -122,6 +123,7 @@ export class ChatClient extends EventEmitter {
   private ws?: WebSocket;
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
+  private lastInboundFrameAt = 0;
   private attempt = 0;
   private accessToken?: string;
   private stopped = false;
@@ -265,6 +267,7 @@ export class ChatClient extends EventEmitter {
 
   start() {
     this.stopped = false;
+    this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
     this.connect();
@@ -272,6 +275,7 @@ export class ChatClient extends EventEmitter {
 
   stop() {
     this.stopped = true;
+    this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
     this.clearTimers();
@@ -313,6 +317,7 @@ export class ChatClient extends EventEmitter {
     }
     this.stopped = false;
     this.attempt = 0;
+    this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
     this.connect();
@@ -400,12 +405,15 @@ export class ChatClient extends EventEmitter {
 
     ws.on('open', () => {
       this.attempt = 0;
+      this.lastInboundFrameAt = Date.now();
       this.hasEverConnectedThisSession = true;
+      this.appendRawLog({ kind: 'ws-open' });
       this.setState({ status: 'connected', attempt: 0 });
       this.startHeartbeat();
     });
 
     ws.on('message', (data) => {
+      this.lastInboundFrameAt = Date.now();
       const text = data.toString();
       let parsed: unknown;
       try {
@@ -502,11 +510,15 @@ export class ChatClient extends EventEmitter {
     });
 
     ws.on('close', (code, reason) => {
-      this.handleDisconnect(`close ${code} ${reason?.toString() ?? ''}`);
+      const reasonText = reason?.toString() ?? '';
+      this.appendRawLog({ kind: 'ws-close', code, reason: reasonText });
+      this.handleDisconnect(`close ${code} ${reasonText}`);
     });
 
     ws.on('error', (err) => {
-      this.handleDisconnect(err.message || 'ws error');
+      const message = err.message || 'ws error';
+      this.appendRawLog({ kind: 'ws-error', message });
+      this.handleDisconnect(message);
     });
   }
 
@@ -719,6 +731,32 @@ export class ChatClient extends EventEmitter {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
+        const staleForMs = this.lastInboundFrameAt
+          ? Date.now() - this.lastInboundFrameAt
+          : 0;
+        if (staleForMs > STALE_INBOUND_TIMEOUT_MS) {
+          const reason = `stale inbound ${staleForMs}ms`;
+          this.appendRawLog({
+            kind: 'ws-stale',
+            staleForMs,
+            timeoutMs: STALE_INBOUND_TIMEOUT_MS,
+          });
+          const staleWs = this.ws;
+          this.ws = undefined;
+          try {
+            staleWs?.removeAllListeners();
+          } catch {
+            // ignore
+          }
+          try {
+            if (typeof staleWs?.terminate === 'function') staleWs.terminate();
+            else staleWs?.close();
+          } catch {
+            // ignore
+          }
+          this.handleDisconnect(reason);
+          return;
+        }
         try {
           this.ws.ping();
         } catch {
@@ -872,6 +910,7 @@ export const __test_backoff_for = (attempt: number): number =>
 // v0.1.45: expose the auto-retry cadence so the unified-reconnect tests can
 // fake-timer-advance by exactly one interval.
 export const __test_auto_retry_interval_ms = AUTO_RETRY_INTERVAL_MS;
+export const __test_stale_inbound_timeout_ms = STALE_INBOUND_TIMEOUT_MS;
 
 // ---------------------------------------------------------------------------
 // Connection helpers (free-standing so they're trivially unit-testable and

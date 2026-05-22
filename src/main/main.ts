@@ -102,6 +102,7 @@ if (process.argv.includes('--mcp-stdio')) {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const SEED_VIEWER_MIGRATION_KEY = 'seed-viewer-ignore-regex';
 
 /**
  * Reveal the user-data log folder in Finder / Explorer. We prefer to reveal
@@ -1045,8 +1046,6 @@ app.on('ready', async () => {
   // list (e.g. added it manually before upgrading), the migration is a
   // no-op for that list (we de-dupe before writing).
   // ---------------------------------------------------------------------
-  const SEED_VIEWER_MIGRATION_KEY = 'seed-viewer-ignore-regex';
-
   function hasMigrationBeenApplied(key: string): boolean {
     const applied = (store.get('settingsMigrationsApplied') ?? []) as string[];
     return Array.isArray(applied) && applied.includes(key);

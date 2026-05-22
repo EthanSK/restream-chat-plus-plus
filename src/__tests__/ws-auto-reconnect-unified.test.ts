@@ -24,6 +24,9 @@ vi.mock('ws', () => {
       FakeWS.instances.push(this);
     }
     ping() {}
+    terminate() {
+      this.readyState = 3;
+    }
     close() {}
     removeAllListeners() {
       super.removeAllListeners();
@@ -36,6 +39,7 @@ vi.mock('ws', () => {
 import {
   ChatClient,
   __test_auto_retry_interval_ms,
+  __test_stale_inbound_timeout_ms,
   type AutoReconnectAttempt,
 } from '../main/ws-client';
 import WSMock from 'ws';
@@ -305,6 +309,26 @@ describe('ChatClient unified reconnect (v0.1.45)', () => {
     await vi.advanceTimersByTimeAsync(60_001 * 5);
     expect(provider).not.toHaveBeenCalled();
     expect(WS.instances.length).toBe(1);
+
+    client.stop();
+  });
+
+  it('v0.1.56: stale open socket forces the post-connect retry path', async () => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    const provider = vi.fn().mockResolvedValue({ ok: true });
+    client.setReconnectProvider(provider);
+    client.start();
+    const ws = WS.instances[0];
+    ws.readyState = WS.OPEN;
+    ws.emit('open');
+
+    await vi.advanceTimersByTimeAsync(__test_stale_inbound_timeout_ms + 30_001);
+    expect(client.getState().status).toBe('reconnecting');
+    expect(provider).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(30_500);
+    expect(provider).toHaveBeenCalledTimes(1);
 
     client.stop();
   });
