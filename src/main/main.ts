@@ -827,17 +827,7 @@ app.on('ready', async () => {
   // genuinely unexpected failures (everything inside the try is caught
   // so the only way to throw is a `pushAuthStatus`-side error or a
   // synchronous `chat.reconnect()` crash — both vanishingly rare).
-  // v0.1.50: `opts.preserveInitialBudget` controls whether the resulting
-  // `chat.reconnect()` resets the one-shot initial-connect retry budget
-  // (defined in ws-client.ts). The provider-triggered retry path
-  // (`setReconnectProvider`) MUST pass `true` — otherwise a retry
-  // handshake that also fails before `'open'` would reset both flags and
-  // fire another 5s retry, producing an infinite 5s polling loop. The
-  // manual Reconnect button (default — flag omitted) gets a fresh budget
-  // because a user click is an explicit "try again from scratch" gesture.
-  const performFullReconnect = async (
-    opts?: { preserveInitialBudget?: boolean },
-  ): Promise<{
+  const performFullReconnect = async (): Promise<{
     ok: boolean;
     reason?:
       | 'not-authenticated'
@@ -880,7 +870,7 @@ app.on('ready', async () => {
         return { ok: false, reason: 'not-authenticated' };
       }
       chat.setToken(token.accessToken);
-      chat.reconnect({ preserveInitialBudget: opts?.preserveInitialBudget });
+      chat.reconnect();
       return { ok: true };
     } catch (err) {
       console.error('[main] performFullReconnect failed', err);
@@ -897,11 +887,7 @@ app.on('ready', async () => {
   // (OAuth-refresh + chat.reconnect) as the manual toolbar button.
   // v0.1.45 fix — see performFullReconnect comment for the why.
   chat.setReconnectProvider(async () => {
-    // v0.1.50: preserve the initial-connect retry budget across this
-    // call. Without this, a retry handshake that ALSO fails pre-`open`
-    // would reset both budget flags and fire another 5s retry, producing
-    // an infinite 5s polling loop.
-    const out = await performFullReconnect({ preserveInitialBudget: true });
+    const out = await performFullReconnect();
     return {
       ok: out.ok,
       reason: out.ok ? undefined : (out.reason ?? out.error ?? 'unknown'),
