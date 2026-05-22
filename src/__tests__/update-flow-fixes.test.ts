@@ -114,6 +114,11 @@ vi.mock('electron-log/main', () => ({
 // suites. Using `vi.resetModules()` inside each `beforeEach`.
 async function loadUpdater() {
   vi.resetModules();
+  // These regressions exercise Squirrel's macOS updater path. GitHub CI
+  // runs this suite on Linux, where triggerSquirrelDownload correctly
+  // returns unsupported-platform unless we pin the mocked Electron runtime
+  // to darwin before importing the updater module.
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
   // Re-arm the listener registry so each test starts from zero.
   for (const k of Object.keys(fakeAutoUpdater.listeners)) {
     delete fakeAutoUpdater.listeners[k];
