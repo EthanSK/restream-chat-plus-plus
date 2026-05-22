@@ -103,25 +103,17 @@ click "Always Allow"; we wiped the blob; next read had nothing to
 decrypt; user had to re-OAuth from scratch. Every. Single. Update.
 
 **Fix in `src/main/oauth.ts`:**
-- Three-way outcome split (`'ok'` / `'threw'` / `'unparseable'`)
-  instead of the previous two-way `undefined`-means-everything:
-  - `'ok'` → cache + return the token.
-  - `'threw'` → PRESERVE `tokenEnc`, signal signed-out for THIS
-    launch only. This is the actual production fix — Codex's audit
-    confirmed that `safeStorage.decryptString` on macOS is a
-    synchronous native call that blocks the main thread, so the
-    timeout race below cannot pre-empt a hung syscall; it's the
-    THROW path that fires in real-world Sparkle-update ACL drift.
-  - `'unparseable'` → decrypt resolved but plaintext is junk (bad
-    JSON, missing accessToken) — genuinely corrupt, retry would
-    fail the same way every launch, so wipe and force fresh OAuth.
-- Raised the decrypt timeout from 2 s → 30 s as belt-and-braces for
-  the async-mock test path. The timer effectively only fires under
-  test conditions; in production the throw-path is what catches
-  ACL-mismatch.
-- On the next launch — after the user has clicked "Always Allow"
-  once on the SecurityAgent prompt — decrypt resolves cleanly and
-  the user stays signed in across all future updates.
+- Raise the decrypt timeout from 2 s → 30 s, plenty of time for the
+  user to interact with the SecurityAgent prompt.
+- More important: on timeout, PRESERVE the blob. Surface signed-out
+  for THIS launch (so the UI doesn't hang waiting on the prompt), but
+  don't touch `tokenEnc`. Next launch — after the user has clicked
+  "Always Allow" once and the Keychain trust is in place — decrypts
+  cleanly and the user stays signed in across all future updates.
+- Only an actual decrypt THROW (genuine "this ciphertext is junk" —
+  bad base64, JSON parse error, missing accessToken) still triggers
+  the wipe-and-force-re-auth path. That's the case where preserving
+  the blob would just loop the failure every launch.
 
 **Sign-out fix is structural, not a workaround.** The Developer ID
 `T34G959ZG8` and bundle ID `com.ethansk.restream-chat-plus-plus` are

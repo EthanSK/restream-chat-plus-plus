@@ -38,13 +38,6 @@ let checkInFlight = false;
 // so the renderer's Restart button can't trigger a sync throw if it
 // somehow fires before the download settled. v0.1.25.
 let updateDownloaded = false;
-// True while Squirrel's `autoUpdater` is in the "checking-for-update" or
-// "update-available; downloading" state. Calling `checkForUpdates()` again
-// during this window throws "The command is disabled and cannot be
-// executed" on macOS — Squirrel's state machine refuses re-entry while a
-// session is active. v0.1.52: tracked so the renderer "Install Update"
-// button can short-circuit instead of bouncing the error back to the UI.
-let downloadInFlight = false;
 
 /**
  * Push an UpdateInfo payload to every live BrowserWindow via the existing
@@ -113,34 +106,11 @@ function attachSquirrelProgressForwarders(): void {
     },
   );
 
-  // v0.1.52: track Squirrel session state so triggerSquirrelDownload() can
-  // short-circuit when re-clicking the Install Update banner. Squirrel
-  // emits these strings via the `checking-for-update` and `update-available`
-  // events; once we see them we know calling checkForUpdates() again would
-  // throw "The command is disabled and cannot be executed".
-  autoUpdater.on('checking-for-update', () => {
-    downloadInFlight = true;
-  });
-  autoUpdater.on('update-available', () => {
-    downloadInFlight = true;
-  });
-  autoUpdater.on('update-not-available', () => {
-    downloadInFlight = false;
-  });
-  autoUpdater.on('error', (err) => {
-    // Reset on error so a transient network failure doesn't lock the user
-    // out of retrying. The next checkForUpdates() call will arm the state
-    // machine again from scratch.
-    log.warn('[updater] autoUpdater error event', err);
-    downloadInFlight = false;
-  });
-
   autoUpdater.on(
     'update-downloaded',
     (_evt: Electron.Event, _releaseNotes?: string, releaseName?: string) => {
       try {
         updateDownloaded = true;
-        downloadInFlight = false;
         broadcastSquirrelStatus({
           kind: 'ready-to-install',
           currentVersion: app.getVersion(),
@@ -171,54 +141,7 @@ export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
   }
   try {
     log.info('[updater] quit-and-install triggered from renderer');
-    // v0.1.52 fix: schedule the actual restart on the next tick so the IPC
-    // round-trip can complete and we can return a result to the renderer
-    // BEFORE the app starts tearing down. Sparkle's `quitAndInstall()` on
-    // macOS posts an NSAlert to dismiss any open dialogs and then forces a
-    // restart immediately — when called synchronously inside an ipcMain
-    // handler, the renderer's pending Promise can be dropped without ever
-    // resolving, and the user-visible "click Restart, nothing happens"
-    // symptom appears (the Restart button stays clickable, the toast
-    // never fires). Async-scheduling the actual restart lets the IPC
-    // reply land first.
-    //
-    // We also call `app.relaunch()` BEFORE `quitAndInstall()` as a belt-
-    // and-braces safeguard: if Squirrel's `quitAndInstall()` silently
-    // no-ops (e.g. the staged update was already consumed by an earlier
-    // update-electron-app native dialog), the relaunch+quit pair still
-    // produces a visible restart, so the user always sees the action
-    // happen. The Squirrel state machine treats `quit()` after
-    // `quitAndInstall()` as a no-op if Squirrel has already initiated the
-    // bundle swap, so this is safe in the normal path.
-    setImmediate(() => {
-      try {
-        log.info('[updater] firing autoUpdater.quitAndInstall() (deferred)');
-        autoUpdater.quitAndInstall();
-        // Fallback: if Squirrel didn't actually restart (no staged bundle
-        // to install), give it 1.5s and then force-relaunch ourselves. The
-        // user clicked Restart — they need to see SOMETHING happen.
-        setTimeout(() => {
-          log.warn(
-            '[updater] still running after quitAndInstall — forcing relaunch+quit',
-          );
-          try {
-            app.relaunch();
-            app.exit(0);
-          } catch (relaunchErr) {
-            log.error('[updater] forced relaunch failed', relaunchErr);
-          }
-        }, 1500);
-      } catch (err) {
-        log.error('[updater] deferred quit-and-install threw', err);
-        // Last-resort: force a relaunch so the user still sees a restart.
-        try {
-          app.relaunch();
-          app.exit(0);
-        } catch (relaunchErr) {
-          log.error('[updater] last-resort relaunch failed', relaunchErr);
-        }
-      }
-    });
+    autoUpdater.quitAndInstall();
     return { ok: true };
   } catch (err) {
     log.error('[updater] quit-and-install threw', err);
@@ -256,8 +179,6 @@ export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
  */
 export type StartDownloadResult =
   | { ok: true; reason: 'started'; mode: 'squirrel' }
-  | { ok: true; reason: 'already-downloading'; mode: 'squirrel' }
-  | { ok: true; reason: 'already-staged'; mode: 'squirrel' }
   | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
   | {
       ok: false;
@@ -324,35 +245,11 @@ export function triggerSquirrelDownload(): StartDownloadResult {
       releaseUrl: UPDATE_RELEASE_PAGE_URL,
     };
   }
-  // v0.1.52: short-circuit when an update has already been downloaded.
-  // Calling `checkForUpdates()` after `update-downloaded` throws "The
-  // command is disabled and cannot be executed" — Squirrel's state
-  // machine refuses to re-enter the check loop while a staged bundle is
-  // pending install. Surface this as a success so the banner shows
-  // "Downloading update…" while the renderer transitions to ready-to-
-  // install on the next UpdateInfo broadcast.
-  if (updateDownloaded) {
-    log.info('[updater] download requested but update already staged — no-op');
-    return { ok: true, reason: 'already-staged', mode: 'squirrel' };
-  }
-  // v0.1.52: same guard against re-clicking while Squirrel is already
-  // mid-download. Without this, the second click triggers the "command
-  // is disabled" throw and the user sees the cryptic "Update could not
-  // start" toast even though the download is in fact progressing in
-  // the background.
-  if (downloadInFlight) {
-    log.info('[updater] download requested but already in flight — no-op');
-    return { ok: true, reason: 'already-downloading', mode: 'squirrel' };
-  }
   try {
     log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
-    downloadInFlight = true;
     autoUpdater.checkForUpdates();
     return { ok: true, reason: 'started', mode: 'squirrel' };
   } catch (err) {
-    // Reset the flag — the throw means the check never actually started,
-    // so re-entry would otherwise be incorrectly blocked on the next click.
-    downloadInFlight = false;
     log.error('[updater] checkForUpdates() threw', err);
     return {
       ok: false,
@@ -384,15 +281,7 @@ export function configureAutoUpdater(): void {
       // tweaking later is one line.
       updateInterval: '1 hour',
       logger: log,
-      // v0.1.52: was `true`. The built-in "Restart to Install" dialog
-      // competes with our in-app `UpdateBanner` — both listen for
-      // `update-downloaded`, both call `quitAndInstall()` on user
-      // confirmation. When the user dismissed the native dialog with
-      // "Later", Squirrel's state machine internally reset the staged
-      // update, so the banner's Restart button then silently no-op'd —
-      // exactly Ethan's "click Restart, nothing happens" symptom.
-      // Single source of truth = the banner.
-      notifyUser: false,
+      notifyUser: true, // built-in restart-to-update dialog
     });
     feedURLReady = true;
     // Wire Squirrel download-progress + update-downloaded forwarders so
