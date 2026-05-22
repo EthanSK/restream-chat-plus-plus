@@ -336,14 +336,9 @@ export function App(): React.ReactElement {
     // button once and lost the session; guard with a confirm dialog so a
     // mis-click is recoverable. Tests cover the cancel-path-does-not-clear
     // behaviour via the `shouldProceedWithSignOut` helper below.
-    //
-    // v0.1.52: route the confirm through native `dialog.showMessageBox`
-    // in the main process via AUTH_CONFIRM_LOGOUT IPC — `window.confirm`
-    // in our Electron BrowserWindow was returning `false` without ever
-    // rendering a dialog, so the previous implementation made the Sign
-    // Out button silently no-op. Ethan voice 3719.
-    const proceed = await shouldProceedWithSignOut(rcpp.authConfirmLogout);
-    if (!proceed) return;
+    if (!shouldProceedWithSignOut(typeof window !== 'undefined' ? window.confirm : undefined)) {
+      return;
+    }
     const s = await rcpp.authLogout();
     setAuth(s);
     setMessages([]);
