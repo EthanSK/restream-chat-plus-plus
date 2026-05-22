@@ -304,6 +304,26 @@ export const IPC = {
   AUTH_START: 'auth:start',
   AUTH_STATUS: 'auth:status',
   AUTH_LOGOUT: 'auth:logout',
+  /**
+   * v0.1.52: confirmation dialog for the destructive Sign Out flow.
+   *
+   * Pre-v0.1.52 the renderer called `window.confirm()` directly. In an
+   * Electron `BrowserWindow` (especially with `sandbox: false` +
+   * `contextIsolation: true`, which is our config), `window.confirm` is
+   * unreliable: depending on the Electron version + webPreferences combo
+   * it either returns `false` synchronously without showing UI, or shows
+   * a blocking modal that the main process intercepts and discards.
+   *
+   * Effect of the v0.1.x regression: the user clicked "Sign out", saw no
+   * dialog, and the button just sat there because `shouldProceedWithSignOut`
+   * received `false` and short-circuited before ever calling `authLogout`.
+   *
+   * The fix routes the confirm prompt through `dialog.showMessageBox`
+   * (proper native modal) via this IPC channel. Renderer awaits the
+   * boolean and only then fires AUTH_LOGOUT. Tested in main process where
+   * `dialog` is fully wired and reliable.
+   */
+  AUTH_CONFIRM_LOGOUT: 'auth:confirm-logout',
   CONN_STATE: 'conn:state',
   CONN_STATE_GET: 'conn:state:get',
   CONN_RECONNECT: 'conn:reconnect',

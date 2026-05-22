@@ -35,9 +35,19 @@ const TOKEN_URL = 'https://api.restream.io/oauth/token';
  *
  * v0.1.38 fix: decrypt runs OFF the boot critical path (the window comes up
  * first regardless), AND every decrypt call is wrapped in a Promise.race
- * against this timeout. If the timeout fires we assume ACL drift, wipe the
- * encrypted blob from the store, and surface a signed-out state so the
- * user can re-auth — no synchronous Keychain prompt blocks boot.
+ * against this timeout. If the timeout fires we surface a signed-out state
+ * temporarily so the user sees the UI, but we do NOT wipe the encrypted
+ * blob — the next launch will retry. Only an actual decrypt throw means
+ * real ACL drift.
+ *
+ * v0.1.52 raise from 2s → 30s: after a Sparkle in-place update, the first
+ * decrypt on the new binary triggers a SecurityAgent prompt because the
+ * Keychain ACL partition is tied to the previous binary's CDHash.
+ * Even on the SAME Developer ID + bundle ID, the new binary's hash differs
+ * so the partition_id check fails and the prompt appears. The user can
+ * click "Always Allow" once and the prompt won't repeat for the same
+ * binary, but a 2s timeout was wiping the token before the user could
+ * react — exactly the "signed out every update" symptom.
  *
  * NOTE: Promise.race does NOT cancel the underlying sync `decryptString`
  * syscall — that's a Node/Electron limitation. What it DOES guarantee is
@@ -47,7 +57,7 @@ const TOKEN_URL = 'https://api.restream.io/oauth/token';
  * the window is visible, so even if the user gets a Keychain prompt they
  * see a UI behind it, not a hung dock icon.
  */
-const SAFE_STORAGE_DECRYPT_TIMEOUT_MS = 2000;
+const SAFE_STORAGE_DECRYPT_TIMEOUT_MS = 30_000;
 
 export class OAuthCoordinator {
   private server?: http.Server;
@@ -261,17 +271,35 @@ export class OAuthCoordinator {
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
 
-    const decryptOnce = async (): Promise<TokenSet | undefined> => {
-      if (!this.encryptionAvailable()) return undefined;
+    // Distinguish "decrypt threw because user denied / ACL mismatch" from
+    // "decrypt resolved to junk that we can't parse" — the first case
+    // means the blob might still be valid on a subsequent launch (after
+    // the user has clicked Always Allow); the second is a genuine
+    // corrupt-data case where retrying would just fail the same way.
+    // v0.1.52: only the genuinely-corrupt case triggers a wipe.
+    type DecryptOutcome =
+      | { kind: 'ok'; token: TokenSet }
+      | { kind: 'threw' }
+      | { kind: 'unparseable' };
+    const decryptOnce = async (): Promise<DecryptOutcome> => {
+      if (!this.encryptionAvailable()) return { kind: 'threw' };
+      let json: string;
       try {
         const buf = Buffer.from(encBase64, 'base64');
-        const json = safeStorage.decryptString(buf);
-        const parsed = JSON.parse(json) as TokenSet;
-        if (!parsed || typeof parsed.accessToken !== 'string') return undefined;
-        return parsed;
+        json = safeStorage.decryptString(buf);
       } catch (err) {
         console.error('[oauth] safeStorage.decryptString failed', err);
-        return undefined;
+        return { kind: 'threw' };
+      }
+      try {
+        const parsed = JSON.parse(json) as TokenSet;
+        if (!parsed || typeof parsed.accessToken !== 'string') {
+          return { kind: 'unparseable' };
+        }
+        return { kind: 'ok', token: parsed };
+      } catch (err) {
+        console.error('[oauth] decrypted blob is not parseable JSON', err);
+        return { kind: 'unparseable' };
       }
     };
 
@@ -286,24 +314,55 @@ export class OAuthCoordinator {
     try {
       const result = await Promise.race([decryptOnce(), timeout]);
       if (result === '__timeout__') {
+        // v0.1.52: do NOT wipe on timeout. A timeout means the syscall is
+        // STILL in flight (likely a SecurityAgent prompt the user hasn't
+        // clicked yet). Wiping here was the cause of the "signed out
+        // every update" bug — after a Sparkle update, the new binary's
+        // ACL doesn't match the partition_id on the Keychain entry, so
+        // the prompt fires; the user takes >2s to find and click "Always
+        // Allow"; we wipe before they can react; the next time round
+        // there's no tokenEnc to decrypt and they have to OAuth again.
+        //
+        // The right behaviour is to surface signed-out THIS launch (so
+        // the UI doesn't hang) but preserve the blob — next launch the
+        // ACL trust is in place from the first Allow click, decrypt
+        // succeeds, and the user stays signed in.
         console.warn(
-          `[oauth] safeStorage.decryptString timed out after ${SAFE_STORAGE_DECRYPT_TIMEOUT_MS}ms — assuming stale Keychain ACL, wiping tokenEnc`,
+          `[oauth] safeStorage.decryptString timed out after ${SAFE_STORAGE_DECRYPT_TIMEOUT_MS}ms — surfacing signed-out for this launch (NOT wiping tokenEnc)`,
+        );
+        this.decryptDisabled = true;
+        return undefined;
+      }
+      if (result.kind === 'threw') {
+        // v0.1.52: decrypt threw — user denied / ACL mismatch / Keychain
+        // unavailable. PRESERVE the blob; the next launch may succeed
+        // once the user clicks "Always Allow" or the underlying issue
+        // clears. The user falls through to the sign-in screen for
+        // THIS launch, but a successful OAuth re-auth will overwrite
+        // the stale blob via persistToken. Wiping here is the second-
+        // most-common cause of "signed out every update" — many
+        // Sparkle in-place updates emit a one-shot SecurityAgent
+        // "User canceled" error even when the user clicks Allow,
+        // because the partition_id check fires before the prompt
+        // resolves.
+        console.warn(
+          '[oauth] safeStorage.decryptString threw — surfacing signed-out for this launch (NOT wiping tokenEnc)',
+        );
+        this.decryptDisabled = true;
+        return undefined;
+      }
+      if (result.kind === 'unparseable') {
+        // Decrypt resolved but the plaintext isn't a valid TokenSet —
+        // genuinely corrupt data, retrying would fail the same way.
+        // Safe to wipe so the next OAuth attempt can start clean.
+        console.warn(
+          '[oauth] decrypted blob is unparseable — wiping tokenEnc',
         );
         this.handleAclDrift();
         return undefined;
       }
-      if (!result) {
-        // Decrypt returned undefined (encryption-unavailable / bad
-        // ciphertext / JSON parse error / missing accessToken). Same
-        // treatment as a timeout — wipe and force re-auth.
-        console.warn(
-          '[oauth] safeStorage.decryptString returned no usable token — wiping tokenEnc',
-        );
-        this.handleAclDrift();
-        return undefined;
-      }
-      this.cachedToken = result;
-      return result;
+      this.cachedToken = result.token;
+      return result.token;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -373,6 +432,14 @@ export class OAuthCoordinator {
   }
 
   /**
+   * In-flight refresh promise. Coalesces concurrent callers (boot-resume,
+   * WS reconnect, IPC reconnect button) onto a single Restream token
+   * round-trip so we never burn a one-time refresh token by trying it
+   * in parallel. v0.1.52.
+   */
+  private refreshPromise?: Promise<TokenSet | undefined>;
+
+  /**
    * If the access token is expired but a refresh token exists, refresh.
    * Returns the new token set or undefined if refresh failed / not possible.
    *
@@ -383,8 +450,36 @@ export class OAuthCoordinator {
    *
    * v0.1.38: awaits the deferred decrypt so a refresh kicked before the
    * first cache hydration still finds the refresh-token correctly.
+   *
+   * v0.1.52: two production fixes for Ethan voice 3720 (stuck on Idle;
+   * `reconnect-events.jsonl` shows 11+ consecutive `refresh-failed`):
+   *
+   * 1. **Coalesce concurrent refreshes.** Pre-v0.1.52 the WS reconnect
+   *    loop + the manual Reconnect button + the renderer mount could all
+   *    fire `refresh()` in parallel. Restream rotates refresh tokens
+   *    (every successful refresh returns a NEW `refresh_token` that
+   *    invalidates the previous one) so two concurrent refreshes race:
+   *    the "winner" gets the new pair, the loser tries to refresh with
+   *    a now-invalidated token and gets `invalid_grant`. Coalesce via
+   *    `refreshPromise`.
+   *
+   * 2. **Detect 4xx → force logout.** A 4xx refresh response (most
+   *    commonly `invalid_grant`) means the persisted refresh token is
+   *    permanently dead — keep retrying it forever and the user sits on
+   *    "Idle" with no recovery (exactly the v0.1.51 bug). Wipe state via
+   *    `logout()` so the next `AUTH_STATUS` push surfaces
+   *    `authenticated: false` and the renderer flips to the sign-in
+   *    screen. Anything 5xx is treated as transient.
    */
   async refresh(): Promise<TokenSet | undefined> {
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.refreshInner().finally(() => {
+      this.refreshPromise = undefined;
+    });
+    return this.refreshPromise;
+  }
+
+  private async refreshInner(): Promise<TokenSet | undefined> {
     const existing = await this.getTokenAsync();
     if (!existing?.refreshToken) return undefined;
     const creds = loadRestreamCreds();
@@ -407,7 +502,35 @@ export class OAuthCoordinator {
         },
         body: body.toString(),
       });
-      if (!res.ok) return undefined;
+      if (!res.ok) {
+        // v0.1.52: a 4xx means the refresh token is permanently dead
+        // (most commonly `invalid_grant` after a concurrent refresh
+        // already rotated the pair, OR the user revoked the token in
+        // Restream's settings, OR > 30 days idle). Wipe state so the
+        // user sees the sign-in screen instead of looping on "Idle".
+        // 5xx is transient — leave the token in place so the next
+        // attempt can succeed.
+        if (res.status >= 400 && res.status < 500) {
+          let errCode: string | undefined;
+          try {
+            const errJson: any = await res.json();
+            errCode = errJson?.error ?? undefined;
+          } catch {
+            // body wasn't JSON; still treat the 4xx as fatal
+          }
+          console.warn(
+            `[oauth] refresh failed with ${res.status} (${
+              errCode ?? 'no error code'
+            }) — wiping persisted tokens, user must re-auth`,
+          );
+          await this.logout();
+        } else {
+          console.warn(
+            `[oauth] refresh returned ${res.status} — transient, leaving tokens in place`,
+          );
+        }
+        return undefined;
+      }
       const json: any = await res.json();
       if (!json.access_token) return undefined;
       const tokenSet: TokenSet = {

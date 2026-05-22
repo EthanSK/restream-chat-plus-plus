@@ -2,9 +2,17 @@
  * Auth-flow guard helpers — pure, DOM-free, unit-testable.
  *
  * Sign-out is destructive (clears the OAuth token, forces re-auth on next
- * launch) so we gate it behind a native confirm dialog. The dialog itself
- * comes from `window.confirm` at runtime, but the gate logic lives here so
- * the cancel-path-does-not-clear behaviour can be tested without a DOM.
+ * launch) so we gate it behind a native confirm dialog.
+ *
+ * v0.1.52: confirmFn is now async — routed to `dialog.showMessageBox` in
+ * the main process via the AUTH_CONFIRM_LOGOUT IPC channel. The previous
+ * implementation used `window.confirm()` directly, which in Electron's
+ * BrowserWindow context was returning `false` without ever showing a
+ * dialog, causing the visible-bug "click Sign out and nothing happens".
+ * See `src/main/main.ts` AUTH_CONFIRM_LOGOUT handler for the why.
+ *
+ * The gate logic stays here so the cancel-path-does-not-clear behaviour
+ * stays unit-testable without a DOM. Tests pass an async stub.
  */
 
 /**
@@ -12,9 +20,14 @@
  * `false` if the user cancelled (or the env has no confirm primitive —
  * defensive default: do NOT log the user out).
  */
-export function shouldProceedWithSignOut(
-  confirmFn: ((message?: string) => boolean) | undefined,
-): boolean {
+export async function shouldProceedWithSignOut(
+  confirmFn: (() => Promise<boolean>) | undefined,
+): Promise<boolean> {
   if (typeof confirmFn !== 'function') return false;
-  return confirmFn("Sign out of Restream? You'll need to re-authenticate.");
+  try {
+    return await confirmFn();
+  } catch {
+    // Defensive: if the confirm transport throws, fail closed.
+    return false;
+  }
 }

@@ -22,6 +22,15 @@ const api = {
   authStart: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_START),
   authStatus: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_STATUS),
   authLogout: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_LOGOUT),
+  /**
+   * v0.1.52: ask main to show the native Sign Out confirmation dialog.
+   * Resolves to `true` if the user clicked "Sign out", `false` otherwise.
+   * The renderer must ONLY call `authLogout()` after this resolves true.
+   *
+   * See `IPC.AUTH_CONFIRM_LOGOUT` for why we route this through main.
+   */
+  authConfirmLogout: (): Promise<boolean> =>
+    ipcRenderer.invoke(IPC.AUTH_CONFIRM_LOGOUT),
   onAuthStatus: (cb: (s: AuthStatus) => void): Unsub => {
     const h = (_: unknown, s: AuthStatus) => cb(s);
     ipcRenderer.on(IPC.AUTH_STATUS, h);
