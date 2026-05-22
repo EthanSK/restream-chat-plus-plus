@@ -217,6 +217,28 @@ export class ChatClient extends EventEmitter {
   private connections = new Map<string, ChatConnection>();
 
   /**
+   * v0.1.50: per-socket terminal-event guard.
+   *
+   * The `ws` library can emit BOTH `'error'` and `'close'` for the same
+   * socket on a single failure (DNS failure, TCP RST mid-handshake, TLS
+   * abort — these typically fire `'error'` followed immediately by
+   * `'close'`). Without a guard, the first event runs `handleDisconnect`
+   * which arms the 5s retry timer; the second event re-enters
+   * `handleDisconnect` which calls `clearTimers()` FIRST THING, wiping
+   * the timer that was just armed AND consuming the one-shot retry
+   * budget (`initialRetryUsedThisSession=true`). The retry never fires
+   * and the user lands on `disconnected` — the exact case v0.1.49 was
+   * meant to fix.
+   *
+   * Solution: tag each ws instance the first time `handleDisconnect`
+   * runs for it. Subsequent terminal events from the same socket are
+   * no-ops. Manual reconnect / start / stop replace `this.ws` so the
+   * new socket starts fresh. A WeakSet means we don't leak references to
+   * closed sockets — they get GC'd as soon as no one holds them.
+   */
+  private handledSockets = new WeakSet<WebSocket>();
+
+  /**
    * The current Restream chat context — the `{showId, eventId, instant}`
    * triple-tagged union the chat backend uses to scope a `POST /client/reply`
    * to the right show/event/instant stream. Exactly one field is
@@ -324,8 +346,19 @@ export class ChatClient extends EventEmitter {
    * (main.ts IPC handler) is responsible for refreshing OAuth first if the
    * stored token is expired, then calling reconnect(). This keeps the WS
    * client free of credential-store / OAuth coupling.
+   *
+   * v0.1.50: accepts an optional `{preserveInitialBudget}` flag. The
+   * manual Reconnect button (default — flag omitted) resets the one-shot
+   * initial-retry budget so the new handshake gets its own retry chance.
+   * The provider-triggered retry path (`scheduleInitialConnectRetry` →
+   * `performFullReconnect` → here) MUST pass `preserveInitialBudget:
+   * true` — otherwise a retry handshake that ALSO fails before reaching
+   * `connected` would re-enter `handleDisconnect` with both flags reset
+   * and fire ANOTHER 5s retry, producing an infinite 5s polling loop.
+   * That regressed the v0.1.47 "no polling" guarantee in production; see
+   * Codex review of v0.1.49 + the regression tests in `ws-reconnect.test.ts`.
    */
-  reconnect() {
+  reconnect(options?: { preserveInitialBudget?: boolean }) {
     this.clearTimers();
     if (this.ws) {
       try {
@@ -342,12 +375,16 @@ export class ChatClient extends EventEmitter {
     }
     this.stopped = false;
     this.attempt = 0;
-    // v0.1.49: manual Reconnect is a fresh user-driven attempt. Reset
-    // the one-shot initial-retry tracking so the new handshake gets its
-    // own retry budget; the previous session's tracking shouldn't
-    // suppress recovery on a brand-new manual reconnect.
-    this.hasEverConnectedThisSession = false;
-    this.initialRetryUsedThisSession = false;
+    // v0.1.49 + v0.1.50: manual Reconnect (default — `preserveInitialBudget`
+    // omitted or false) is a fresh user-driven attempt and resets the
+    // one-shot tracking so the new handshake gets its own retry budget.
+    // The provider-triggered retry path passes `preserveInitialBudget:
+    // true` to KEEP `initialRetryUsedThisSession=true` so a second
+    // pre-`connected` failure doesn't fire yet another 5s retry.
+    if (!options?.preserveInitialBudget) {
+      this.hasEverConnectedThisSession = false;
+      this.initialRetryUsedThisSession = false;
+    }
     this.connect();
   }
 
@@ -540,15 +577,27 @@ export class ChatClient extends EventEmitter {
     });
 
     ws.on('close', (code, reason) => {
-      this.handleDisconnect(`close ${code} ${reason?.toString() ?? ''}`);
+      this.handleDisconnect(`close ${code} ${reason?.toString() ?? ''}`, ws);
     });
 
     ws.on('error', (err) => {
-      this.handleDisconnect(err.message || 'ws error');
+      this.handleDisconnect(err.message || 'ws error', ws);
     });
   }
 
-  private handleDisconnect(reason: string) {
+  private handleDisconnect(reason: string, source?: WebSocket) {
+    // v0.1.50: per-socket terminal-event guard. If `'error'` and `'close'`
+    // both fire for the same socket (common for DNS / TCP-RST / TLS-abort
+    // pre-handshake failures), only the first one drives the disconnect
+    // flow. The second would otherwise call `clearTimers()` first thing,
+    // wiping the just-armed 5s retry timer AND consuming the one-shot
+    // retry budget (`initialRetryUsedThisSession=true`) — leaving the
+    // user on `disconnected` with no recovery, the exact case v0.1.49
+    // was meant to fix. See `handledSockets` field comment for details.
+    if (source) {
+      if (this.handledSockets.has(source)) return;
+      this.handledSockets.add(source);
+    }
     this.clearTimers();
     if (this.stopped) return;
     this.attempt += 1;
