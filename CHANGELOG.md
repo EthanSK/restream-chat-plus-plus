@@ -56,3 +56,17 @@ default in v0.1.47 due to network-traffic concerns.
 Reverts v0.1.49, v0.1.50, v0.1.51, v0.1.52 — the post-v0.1.47 reconnect/auth patches all chased the wrong layer. The v0.1.52 boot path stopped calling `resumeAuth()` for users with a missing or rotated Keychain Safe Storage entry, leaving them silently stuck on "Idle" with no path forward. v0.1.47's auto-reconnect-disabled change is preserved (you can manually click Reconnect when needed).
 
 If you were stuck on Idle after updating to v0.1.49-v0.1.52: this restores the v0.1.48 connection + auth code path.
+
+## [0.1.54] - 2026-05-22
+
+### Kept (re-applied) — real fixes from v0.1.52
+
+- **Install Update banner error** ("update could not start"): re-entry guard + `downloadInFlight` / `updateDownloaded` flags.
+- **"Restart" button no-op**: `notifyUser: false` + `quitAndInstallStagedUpdate()` with deferred quit + 1.5s fallback `app.relaunch()`.
+- **Sign-out-on-every-update**: oauth `decryptTokenAsync` now distinguishes `'threw'` (preserve blob — transient Keychain prompt) from `'unparseable'` (wipe).
+- **Sign Out button doing nothing**: `window.confirm()` returns `false` synchronously in Electron BrowserWindow — replaced with native `dialog.showMessageBox` via new `AUTH_CONFIRM_LOGOUT` IPC channel.
+- **Refresh-token loop ("refresh-failed" cascades)**: coalesce concurrent `refresh()` calls behind `refreshPromise` (Restream rotates refresh tokens); 4xx response now triggers `logout()` so UI flips to the sign-in screen instead of silent Idle.
+
+### Dropped (still reverted from v0.1.49/v0.1.50/v0.1.51)
+
+- Pre-`open` retry budget + early-close 30s retry window — they patched the WS-retry layer when the actual user-facing bug was in boot/auth. Reverting these restores the v0.1.48 connection code path.
