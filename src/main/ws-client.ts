@@ -67,41 +67,6 @@ const AUTO_RETRY_INTERVAL_MS = 60_000;
 const INITIAL_CONNECT_RETRY_MS = 5_000;
 
 /**
- * v0.1.51: window during which a CONNECTED-then-CLOSED transition is
- * treated as an "early close" eligible for ONE retry.
- *
- * Ethan voice 3709: v0.1.50 update applied, still stuck on idle. The
- * earlier v0.1.49/v0.1.50 fixes covered the pre-`'open'` path (handshake
- * never completes). But the production failure mode we now see in logs
- * is **the WS opens successfully, frames flow for a second or two, then
- * the server fires `'close'`** — e.g. Restream sends `connection_replaced`
- * when another client (browser tab, `chat.restream.io` webchat, the prior
- * app instance still alive after a Sparkle update swap) connects with
- * the same token; or a server-side auth reject immediately post-handshake.
- *
- * Pre-v0.1.51 behaviour: `'open'` flips `hasEverConnectedThisSession=true`,
- * the subsequent close hits the v0.1.47 short-circuit (`autoReconnectEnabled=false`
- * AND `hasEverConnectedThisSession=true`) and goes straight to
- * `disconnected` — silently, with NO entry in `reconnect-events.jsonl`.
- *
- * v0.1.51 fix: if the close fires within `EARLY_CLOSE_WINDOW_MS` of the
- * `'open'` event, treat it like an initial-connect failure and schedule
- * exactly ONE retry via the unified-reconnect provider — same one-shot
- * budget as the v0.1.49 initial-retry, just gated on an EXTRA flag
- * (`earlyCloseRetryUsedThisSession`) so the two budgets don't collide.
- *
- * Picked at 30s: long enough to cover a `connection_replaced` from a
- * slow second client, short enough that genuine mid-session drops (an
- * hour-long stream that loses Wi-Fi) still go through the normal
- * "stay at disconnected, wait for manual button" path Ethan wants. The
- * 30s window is wall-clock from the `'open'` event, NOT cumulative
- * uptime, so a session that flapped open→close→open→close in <30s
- * each leg only consumes ONE retry total — the budget guard prevents
- * the 5s polling regression v0.1.50 fixed.
- */
-const EARLY_CLOSE_WINDOW_MS = 30_000;
-
-/**
  * Result returned by the `reconnectProvider` hook. `ok` indicates whether
  * the WS handshake will be attempted with a fresh token (i.e. OAuth refresh
  * succeeded if needed AND `chat.reconnect()` fired). When `ok: false`, the
@@ -235,22 +200,6 @@ export class ChatClient extends EventEmitter {
   private hasEverConnectedThisSession = false;
   private initialRetryUsedThisSession = false;
   /**
-   * v0.1.51: wall-clock timestamp (`Date.now()`) of the most recent
-   * successful `'open'` event in this session. Used to gate the
-   * "early close" one-shot retry — see `EARLY_CLOSE_WINDOW_MS` above.
-   * `undefined` means we've never reached `'open'` yet this session.
-   */
-  private lastOpenAtMs?: number;
-  /**
-   * v0.1.51: one-shot budget for the post-open "early close" retry.
-   * Separate from `initialRetryUsedThisSession` so a session that fails
-   * pre-open AND then post-open within 30s of a brief connect still
-   * gets at most ONE retry from each budget — total worst case two
-   * retries, then disconnected. Reset on `start()` and on manual
-   * `reconnect()` (default — `preserveInitialBudget` omitted).
-   */
-  private earlyCloseRetryUsedThisSession = false;
-  /**
    * Callback fired AFTER every auto-reconnect attempt (provider call) so
    * main.ts can write a structured entry to `reconnect-events.jsonl`. We
    * keep the file I/O OUT of this class to preserve the test-time
@@ -364,10 +313,6 @@ export class ChatClient extends EventEmitter {
     // session ended in `disconnected`.
     this.hasEverConnectedThisSession = false;
     this.initialRetryUsedThisSession = false;
-    // v0.1.51: also reset the post-open early-close budget for the new
-    // session — see `EARLY_CLOSE_WINDOW_MS` above for the rationale.
-    this.earlyCloseRetryUsedThisSession = false;
-    this.lastOpenAtMs = undefined;
     this.connect();
   }
 
@@ -389,10 +334,6 @@ export class ChatClient extends EventEmitter {
     this.setState({ status: 'disconnected', attempt: 0 });
     this.hasEverConnectedThisSession = false;
     this.initialRetryUsedThisSession = false;
-    // v0.1.51: reset early-close budget on `stop()` so the next `start()`
-    // (e.g. sign-out → sign-in) gets a clean slate.
-    this.earlyCloseRetryUsedThisSession = false;
-    this.lastOpenAtMs = undefined;
   }
 
   /**
@@ -443,14 +384,6 @@ export class ChatClient extends EventEmitter {
     if (!options?.preserveInitialBudget) {
       this.hasEverConnectedThisSession = false;
       this.initialRetryUsedThisSession = false;
-      // v0.1.51: manual Reconnect button also gets a fresh early-close
-      // budget — explicit user "try again" gesture matches the v0.1.50
-      // semantics for the other budgets. Provider path passes
-      // `preserveInitialBudget: true` and keeps the flag, so a retry
-      // handshake that ALSO has an early close goes straight to
-      // disconnected instead of looping.
-      this.earlyCloseRetryUsedThisSession = false;
-      this.lastOpenAtMs = undefined;
     }
     this.connect();
   }
@@ -543,11 +476,6 @@ export class ChatClient extends EventEmitter {
       // at `disconnected` until manual Reconnect). Only the
       // PRE-`connected` initial handshake gets the one-shot retry.
       this.hasEverConnectedThisSession = true;
-      // v0.1.51: stamp the open time so `handleDisconnect` can decide
-      // whether a subsequent close is "early" (within EARLY_CLOSE_WINDOW_MS)
-      // and therefore eligible for the post-open one-shot retry. See the
-      // file-level comment on EARLY_CLOSE_WINDOW_MS for the why.
-      this.lastOpenAtMs = Date.now();
       this.setState({ status: 'connected', attempt: 0 });
       this.startHeartbeat();
     });
@@ -717,33 +645,6 @@ export class ChatClient extends EventEmitter {
           lastError: reason,
         });
         this.scheduleInitialConnectRetry(reason);
-        return;
-      }
-      // v0.1.51: post-open "early close" one-shot retry — fix for Ethan
-      // voice 3709 ("v0.1.50 still stuck on idle"). The v0.1.49/v0.1.50
-      // retry covered ONLY the pre-`'open'` path. Production failure is
-      // the WS opens, briefly receives frames, then the server fires
-      // `'close'` (Restream's `connection_replaced` when a second client
-      // grabs the same token; or an immediate auth reject). Pre-v0.1.51
-      // that path landed silently on `disconnected` with NO entry in
-      // `reconnect-events.jsonl`. We now treat a close that fires within
-      // EARLY_CLOSE_WINDOW_MS of the open as eligible for ONE retry via
-      // the unified-reconnect provider — same one-shot budget shape as
-      // the initial-connect retry. After this one retry (regardless of
-      // outcome), or for any close outside the window, we fall through
-      // to the v0.1.47 default and stay on `disconnected`.
-      const earlyCloseEligible =
-        this.lastOpenAtMs !== undefined &&
-        Date.now() - this.lastOpenAtMs <= EARLY_CLOSE_WINDOW_MS &&
-        !this.earlyCloseRetryUsedThisSession;
-      if (earlyCloseEligible) {
-        this.earlyCloseRetryUsedThisSession = true;
-        this.setState({
-          status: 'reconnecting',
-          attempt: this.attempt,
-          lastError: reason,
-        });
-        this.scheduleInitialConnectRetry(`early-close:${reason}`);
         return;
       }
       this.setState({ status: 'disconnected', attempt: this.attempt, lastError: reason });
