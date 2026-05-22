@@ -48,3 +48,11 @@ connected` cycles.
 Auto-reconnect was rewritten to use the same OAuth-refresh + reconnect
 flow as the manual button, on a 60s cadence. Subsequently disabled by
 default in v0.1.47 due to network-traffic concerns.
+
+## [0.1.53] - 2026-05-22
+
+### Reverted
+
+Reverts v0.1.49, v0.1.50, v0.1.51, v0.1.52 — the post-v0.1.47 reconnect/auth patches all chased the wrong layer. The v0.1.52 boot path stopped calling `resumeAuth()` for users with a missing or rotated Keychain Safe Storage entry, leaving them silently stuck on "Idle" with no path forward. v0.1.47's auto-reconnect-disabled change is preserved (you can manually click Reconnect when needed).
+
+If you were stuck on Idle after updating to v0.1.49-v0.1.52: this restores the v0.1.48 connection + auth code path.
