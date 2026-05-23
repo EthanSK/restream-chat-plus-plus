@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatSendStatus } from '../shared/types';
+import { formatSendFailureTooltip } from './send-failure-copy';
 
 /**
  * v0.1.43 — pure reducers for the optimistic-send chat-message flow.
@@ -146,10 +147,5 @@ export function shouldTriggerSideEffects(
  * constructed from `reason` + `httpStatus`.
  */
 export function formatPendingError(status: ChatSendStatus): string {
-  if (status.error) return status.error;
-  if (status.reason) {
-    const httpSuffix = status.httpStatus ? ` HTTP ${status.httpStatus}` : '';
-    return `Send failed (${status.reason}${httpSuffix})`;
-  }
-  return 'Send failed.';
+  return formatSendFailureTooltip(status);
 }

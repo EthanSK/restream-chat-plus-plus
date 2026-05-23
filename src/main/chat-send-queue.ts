@@ -128,6 +128,11 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
           }
         } else {
           try {
+            // v0.1.63 audit: every `{ ok:false }` from `sendChatText`
+            // becomes a renderer-visible `failed` status, including
+            // preflight bails such as `no-session-cookies` where no HTTP
+            // request was attempted. This is the contract that prevents the
+            // optimistic placeholder from sitting on "sending" forever.
             opts.emitStatus({
               clientId: item.clientId,
               status: 'failed',

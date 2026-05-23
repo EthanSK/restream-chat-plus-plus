@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.1.63 — startup cookie repair + stuck-send guard
+
+Fixes the "send is broken after auto-update" bug that v0.1.62 only partly addressed.
+
+### The bug
+
+v0.1.62 added cookie-session repair after fresh sign-in, but users who updated in-app
+(token preserved) never hit the sign-in path — so their chat-session cookies stayed
+wiped. Every send silently bailed at the preflight check and the message sat forever
+with a sending spinner.
+
+### The fix
+
+- Cookie repair now also fires during startup whenever a stored token is restored,
+  not only on fresh sign-in. Both paths are covered.
+- Added a 15-second timeout on optimistic-send placeholders. If neither the echo nor
+  an explicit failure arrives in that window, the message flips to a red warning with
+  a clear tooltip — no more perpetually-sending UI.
+- Silent-fail audit: every send-pipeline failure now reaches the renderer.
+- Toast/banner now warns "Restream chat session expired. Please sign out and sign in again."
+  on cookie-bail, instead of a silent red icon.
+
+### Silent-fail audit
+
+- `resumeAuth()` was the missed startup path: stored-token resume and refresh-token
+  resume both started chat without hydrating chat.restream.io cookies. Both now repair
+  cookies after `chat.start()`.
+- `chat-send.ts` preflight bails (`empty-text`, `no-active-connections`,
+  `no-session-cookies` before cold-start, and `no-session-cookies` after the headless
+  provisioner still fails) all write `phase: "preflight"` rows to `chat-send.jsonl`.
+- `chat-send-queue.ts` already emitted `failed` for every `{ ok: false }` result and
+  for thrown sends; v0.1.63 keeps that contract and adds regression coverage for the
+  `no-session-cookies` preflight case.
+- `App.tsx` now has a renderer-side timeout for any future silent-bail path, including
+  swallowed fire-and-forget IPC failures where no queue status arrives.
+
+### New tests
+
+- Startup cookie repair fires when token is restored from disk.
+- Optimistic placeholder times out and transitions to failed after 15s.
+- Preflight bails are logged to chat-send.jsonl and surfaced to the renderer.
+
 ## v0.1.62 — fix broken sends post-v0.1.61 (split chat-partition auth after Developer ID signing)
 
 Critical hotfix for the regression Ethan reported 2026-05-23 right

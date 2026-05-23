@@ -32,8 +32,19 @@ import {
   pushOptimisticMessage,
   shouldTriggerSideEffects,
 } from './chat-message-reducers';
+import {
+  applyOptimisticSendTimeout,
+  optimisticSendTimeoutStatus,
+  OPTIMISTIC_SEND_TIMEOUT_MS,
+} from './optimistic-send-timeout';
+import { sendFailureNoticeText } from './send-failure-copy';
 
 const MAX_MESSAGES = 1000;
+
+interface SendNotice {
+  id: number;
+  text: string;
+}
 
 export function App(): React.ReactElement {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -44,12 +55,22 @@ export function App(): React.ReactElement {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [sendNotice, setSendNotice] = useState<SendNotice | null>(null);
   // Banner-dismiss is session-only by design (see UpdateBanner.tsx docstring) —
   // we want a soft nag, not a sticky one. The next launch re-checks and
   // re-shows the banner if the user hasn't actually installed the new build.
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const ttsRef = useRef<TtsEngineLike | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
+  // v0.1.63 — one timeout per renderer-minted optimistic send. The map lives
+  // in a ref because these handles are lifecycle bookkeeping, not render data:
+  // changing them should not re-render the chat feed. Every handle is cleared
+  // when the matching WS echo arrives, when the main-process queue reports an
+  // explicit failure, when chat is cleared, and on unmount.
+  const optimisticSendTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
+  const sendNoticeSeqRef = useRef(0);
   // v0.1.60 — id of the message we most recently triggered side effects
   // for (TTS speak + native notify). Used by the side-effect useEffect
   // below to skip both (a) optimistic-placeholder inserts that haven't
@@ -77,6 +98,57 @@ export function App(): React.ReactElement {
   useEffect(() => {
     notifIgnoreRef.current = notifIgnoreCompiled;
   }, [notifIgnoreCompiled]);
+
+  const showSendNotice = (text: string): void => {
+    // The id makes repeated identical failures visible as fresh state changes.
+    // Without it, two consecutive `no-session-cookies` bails would set the
+    // same string twice and React could preserve the previous dismissed banner.
+    sendNoticeSeqRef.current += 1;
+    setSendNotice({ id: sendNoticeSeqRef.current, text });
+  };
+
+  const clearOptimisticSendTimeout = (
+    clientId: string,
+    reason: 'echo' | 'failed-status' | 'replace' | 'clear-chat' | 'sign-out' | 'unmount',
+  ): void => {
+    const timeout = optimisticSendTimeoutsRef.current.get(clientId);
+    if (!timeout) return;
+    clearTimeout(timeout);
+    optimisticSendTimeoutsRef.current.delete(clientId);
+    // `reason` is deliberately part of the helper contract even though we
+    // don't log it today. It forces each caller to name the state-machine
+    // transition that retired the timer, which keeps future edits honest.
+    void reason;
+  };
+
+  const clearAllOptimisticSendTimeouts = (
+    reason: 'clear-chat' | 'sign-out' | 'unmount',
+  ): void => {
+    for (const clientId of optimisticSendTimeoutsRef.current.keys()) {
+      clearOptimisticSendTimeout(clientId, reason);
+    }
+  };
+
+  const scheduleOptimisticSendTimeout = (clientId: string): void => {
+    // Defensive replace: client ids are UUIDs, so a duplicate should not
+    // happen. If a future caller passes a reused id, replacing the old timer
+    // avoids two callbacks racing to mark the same placeholder failed.
+    clearOptimisticSendTimeout(clientId, 'replace');
+    const timeout = setTimeout(() => {
+      optimisticSendTimeoutsRef.current.delete(clientId);
+      // v0.1.63 stuck-send guard. This is deliberately a renderer-side
+      // safety net, not the primary send-failure path. The main process
+      // should emit `failed` for every `{ ok:false }` send result, and startup
+      // cookie repair should prevent the v0.1.62 cookie-bail path entirely.
+      // If either contract regresses, this timer turns the placeholder into
+      // `pendingSend: "failed"` after 15s so Ethan never stares at an
+      // indefinite "sending" state with no explanation.
+      setMessages((prev) => applyOptimisticSendTimeout(prev, clientId));
+      const notice = sendFailureNoticeText(optimisticSendTimeoutStatus(clientId));
+      if (notice) showSendNotice(notice);
+    }, OPTIMISTIC_SEND_TIMEOUT_MS);
+    optimisticSendTimeoutsRef.current.set(clientId, timeout);
+  };
 
   // Init: load auth + settings + current connection state, subscribe to events.
   useEffect(() => {
@@ -157,6 +229,12 @@ export function App(): React.ReactElement {
       // `reply_created` echo, normalised with `id === clientReplyUuid`).
       // If we already have a placeholder with this id, REPLACE it with
       // the echo so the feed shows the user's message exactly once.
+      //
+      // v0.1.63: clear the renderer-side stuck-send timeout at the same
+      // state-machine transition. The echo is the server-confirmed success
+      // path; leaving the timer armed would let a stale callback later repaint
+      // an already-confirmed message as failed.
+      clearOptimisticSendTimeout(flagged.id, 'echo');
       setMessages((prev) => dedupeOptimisticOnEcho(prev, flagged, MAX_MESSAGES));
     });
     // v0.1.43 — listen for queue lifecycle updates and flip the matching
@@ -167,7 +245,14 @@ export function App(): React.ReactElement {
     // small ⚠ + tooltip carrying the error.
     const offSendStatus = rcpp.onChatSendStatus((status) => {
       if (status.status !== 'failed') return;
+      // Explicit queue failures win over the timeout guard. The queue knows
+      // the real reason (`no-session-cookies`, `send-failed`, auth drift,
+      // thrown fetch, etc.), so cancel the generic 15s timer before painting
+      // the specific failure into the placeholder.
+      clearOptimisticSendTimeout(status.clientId, 'failed-status');
       setMessages((prev) => applyFailedSendStatus(prev, status));
+      const notice = sendFailureNoticeText(status);
+      if (notice) showSendNotice(notice);
     });
     const offMenu = rcpp.onMenuOpenSettings(() => setDrawerOpen(true));
     // "Clear chat" can be triggered from either the chat-feed right-click
@@ -176,6 +261,10 @@ export function App(): React.ReactElement {
     // one renderer-side listener that resets the buffer via the pure
     // `clearChatMessages` reducer. v0.1.18.
     const offClear = rcpp.onChatClear(() => {
+      // Clearing the feed is an explicit user action. Pending placeholders no
+      // longer exist after this reducer, so their timeout callbacks must not
+      // fire later and resurrect a confusing send-failed banner.
+      clearAllOptimisticSendTimeouts('clear-chat');
       setMessages((prev) => clearChatMessages(prev));
     });
     // Live update-check broadcasts — fires when the GH poller completes a
@@ -259,6 +348,7 @@ export function App(): React.ReactElement {
       offClear();
       offSettingsPush();
       offUpdate();
+      clearAllOptimisticSendTimeouts('unmount');
     };
   }, []);
 
@@ -280,6 +370,10 @@ export function App(): React.ReactElement {
       pendingSend: 'sending',
     };
     setMessages((prev) => pushOptimisticMessage(prev, optimistic, MAX_MESSAGES));
+    // Start the timer only after the placeholder exists locally. If the main
+    // process drops a preflight send without emitting `failed`, this callback
+    // is the UX backstop that flips the message to a red warning after 15s.
+    scheduleOptimisticSendTimeout(clientId);
     dispatchEnqueueChatSend(text, clientId);
   };
 
@@ -373,6 +467,7 @@ export function App(): React.ReactElement {
     if (!proceed) return;
     const s = await rcpp.authLogout();
     setAuth(s);
+    clearAllOptimisticSendTimeouts('sign-out');
     setMessages([]);
   };
 
@@ -405,6 +500,24 @@ export function App(): React.ReactElement {
         onStartDownload={() => rcpp.startUpdateDownload()}
         onRestart={() => void rcpp.quitAndInstall()}
       />
+      {sendNotice && (
+        <div
+          key={sendNotice.id}
+          className="send-notice"
+          role="alert"
+          aria-live="assertive"
+        >
+          <span className="send-notice-text">{sendNotice.text}</span>
+          <button
+            className="send-notice-dismiss"
+            type="button"
+            aria-label="Dismiss send warning"
+            onClick={() => setSendNotice(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />
         <span className="status-label">{statusLabel(conn, auth)}</span>

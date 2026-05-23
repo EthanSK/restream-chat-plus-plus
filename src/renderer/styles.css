@@ -62,6 +62,43 @@ body {
   background: var(--bg-1);
 }
 
+/* v0.1.63 — send-failure notice.
+ *
+ * This is intentionally separate from the update banner: update states are
+ * release-management events, while this strip is tied to the chat-send state
+ * machine. It appears only for failures where the inline red icon is too easy
+ * to miss (`no-session-cookies` and the renderer's 15s stuck-send timeout).
+ */
+.send-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: #3a1d1f;
+  color: #ffd7d7;
+  border-bottom: 1px solid rgba(248, 81, 73, 0.55);
+  font-size: 12px;
+}
+.send-notice-text {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+}
+.send-notice-dismiss {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 215, 215, 0.28);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffe1e1;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.send-notice-dismiss:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
 /* GH-Releases update banner — thin amber strip below the titlebar. */
 .update-banner {
   display: flex;

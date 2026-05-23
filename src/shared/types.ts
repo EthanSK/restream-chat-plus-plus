@@ -740,8 +740,14 @@ export interface ChatSendEnqueuePayload {
 export interface ChatSendStatus {
   clientId: string;
   status: 'pending' | 'sent' | 'failed';
-  /** When status==='failed', the reason code from SendTextResult. */
-  reason?: SendTextResult['reason'];
+  /**
+   * When status==='failed', the reason code from SendTextResult.
+   *
+   * v0.1.63 adds renderer-local `timeout`: this does not come from Restream
+   * or the main process. It is the second-line safety net when an optimistic
+   * placeholder receives neither a WS echo nor an explicit queue failure.
+   */
+  reason?: SendTextResult['reason'] | 'timeout';
   /** When status==='failed', a human-readable error string. */
   error?: string;
   /** When status==='failed', the HTTP status (if the failure was a non-2xx). */

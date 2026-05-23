@@ -20,6 +20,7 @@ import {
   type ChatContext,
 } from './chat-send';
 import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
+import { resumeAuthWithCookieRepair } from './startup-auth-resume';
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
@@ -1701,34 +1702,21 @@ app.on('ready', async () => {
   // the `startupAuthDone` Promise still gates the initial AUTH_STATUS
   // push so the user sees no "Sign in" flash before the refresh settles.
   const resumeAuth = async (): Promise<void> => {
-    try {
-      // First leg: see if the (possibly deferred) decrypted token is
-      // still within its access-token validity window. After the first
-      // tick this resolves to the cached value; the very first call per
-      // launch waits up to 2s for the decrypt timeout.
-      if (await oauth.isAuthenticatedAsync()) {
-        const t = (await oauth.getTokenAsync())!;
-        chat.setToken(t.accessToken);
-        chat.start();
-      } else {
-        // Either no token on disk (fresh install / post-logout) OR the
-        // access token expired OR ACL drift wiped the blob. Try a
-        // refresh-token round-trip — succeeds for the second case,
-        // returns undefined for the first/third (no refresh token to
-        // present), leaving the user on the sign-in screen.
-        const refreshed = await oauth.refresh();
-        if (refreshed) {
-          chat.setToken(refreshed.accessToken);
-          chat.start();
-        }
-      }
-    } catch (err) {
-      console.error('[main] startup auth resume failed', err);
-    } finally {
-      // Broadcast the final auth state and unblock did-finish-load.
-      pushAuthStatus();
-      resolveStartupAuth();
-    }
+    // v0.1.63: keep the resume state machine in a small helper so the
+    // startup-cookie-repair ordering is pinned by unit tests. The real
+    // dependencies stay here in `main.ts`: OAuth persistence, WS client,
+    // BrowserWindow parentage, and the startup auth latch are all owned by
+    // this `app.on('ready')` closure.
+    await resumeAuthWithCookieRepair({
+      oauth,
+      chat,
+      ensureRestreamChatCookies,
+      parentWindow: mainWindow,
+      pushAuthStatus,
+      resolveStartupAuth,
+      logWarn: console.warn,
+      logError: console.error,
+    });
   };
   // Fire-and-forget — do NOT await. The `ready` callback completes
   // immediately so Electron finishes window construction and the user
