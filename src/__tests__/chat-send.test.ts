@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { sendChatText, __test_internals, type ChatContext } from '../main/chat-send';
+import {
+  sendChatText,
+  ensureRestreamChatCookies,
+  __test_internals,
+  type ChatContext,
+} from '../main/chat-send';
 import type { ChatConnection } from '../shared/types';
 
 // We can't import electron's `session` in node-context tests, so we provide
@@ -640,5 +645,103 @@ describe('chat-send', () => {
     expect(result.status).toBe(429);
     expect(calls.length).toBe(1);
     expect(refreshCalls).toBe(0);
+  });
+
+  // --------------------------------------------------------------------
+  // v0.1.62: preflight diagnostic logging — `chat-send.jsonl` must
+  // capture failures BEFORE `performSend()` so the "v0.1.61 send broken
+  // post-install" split-auth bug is observable from disk.
+  // --------------------------------------------------------------------
+
+  it('v0.1.62: writes a preflight log row when no-session-cookies (analytics-only signature)', async () => {
+    const logRecords: Array<any> = [];
+    const result = await sendChatText({
+      text: 'hi',
+      connections: [makeConn('c1')],
+      context: { showId: 'show-1' },
+      parentWindow: null,
+      // Only analytics cookies — accessXsrfToken is missing. Mirrors the
+      // v0.1.62 split-auth signature: post-install sign-in writes _ga /
+      // _gid / etc but the chat-session cookies were wiped by the
+      // codesigning identity flip.
+      getSession: () =>
+        fakeSession([
+          { name: '_ga', value: 'GA1.x.y' },
+          { name: '_gid', value: 'GA1.x.z' },
+        ]),
+      skipColdStart: true,
+      fetchImpl: vi.fn() as any,
+      log: (r) => logRecords.push(r),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no-session-cookies');
+    // The diagnostic row makes the failure visible in chat-send.jsonl.
+    expect(logRecords.length).toBe(1);
+    expect(logRecords[0].phase).toBe('preflight');
+    expect(logRecords[0].reason).toBe('no-session-cookies');
+    expect(logRecords[0].coldStartAttempted).toBe(false);
+    expect(logRecords[0].hasXsrf).toBe(false);
+    expect(logRecords[0].cookieCount).toBe(2);
+    expect(logRecords[0].cookieNames).toEqual(['_ga', '_gid']);
+    expect(logRecords[0].connectionCount).toBe(1);
+  });
+});
+
+describe('ensureRestreamChatCookies', () => {
+  it('returns ok=true with reason "already-present" when accessXsrfToken cookie exists', async () => {
+    const result = await ensureRestreamChatCookies({
+      getSession: () =>
+        ({
+          cookies: {
+            get: async () => [
+              { name: 'accessXsrfToken', value: 'XSRF-XYZ' },
+              { name: 'refreshToken', value: 'rt-1' },
+            ],
+          },
+        }) as any,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBe('already-present');
+    expect(result.hasXsrf).toBe(true);
+    expect(result.cookieCount).toBe(2);
+  });
+
+  it('returns ok=false with reason "no-electron" when called outside Electron', async () => {
+    // No getSession injection — getRestreamSession will throw because
+    // the `electron` module isn't available in the vitest node env.
+    // This mirrors the production fall-through: ensureRestreamChatCookies
+    // is safe to call in environments where Electron isn't loaded (e.g.
+    // a Node-mode unit test of upstream auth code).
+    const result = await ensureRestreamChatCookies({});
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no-electron');
+  });
+
+  it('returns still-no-cookies when only analytics cookies are present (v0.1.62 split-auth signature, no interactive fallback)', async () => {
+    // Hidden helper path can't run in node-mode tests (no Electron), so
+    // we drive the same code path by NOT requesting `interactiveFallback`
+    // and giving the partition only analytics cookies. The function
+    // returns the diagnostic "still-no-cookies" reason — exactly what
+    // production callers should surface to the user.
+    //
+    // The hidden provisioner attempt fails fast (no electron module) and
+    // we fall through to the final read. That read reports the
+    // analytics cookies but no xsrf, which is the v0.1.62 signature.
+    const result = await ensureRestreamChatCookies({
+      getSession: () =>
+        ({
+          cookies: {
+            get: async () => [
+              { name: '_ga', value: 'GA1.x.y' },
+              { name: '_gid', value: 'GA1.x.z' },
+            ],
+          },
+        }) as any,
+      interactiveFallback: false,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('still-no-cookies');
+    expect(result.hasXsrf).toBe(false);
+    expect(result.cookieCount).toBe(2);
   });
 });

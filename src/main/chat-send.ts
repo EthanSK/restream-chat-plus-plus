@@ -94,6 +94,8 @@ function getElectron(): {
 
 const PARTITION = 'persist:restream-oauth';
 const RESTREAM_DOMAIN = '.restream.io';
+export const CHAT_PARTITION = PARTITION;
+export const CHAT_COOKIE_DOMAIN = RESTREAM_DOMAIN;
 /**
  * v0.1.34: corrected from `/api/v2/client/reply` (404 ghost route) to
  * `/api/client/reply` (the real path on Restream's chat backend, matching
@@ -191,6 +193,224 @@ async function provisionCookiesHeadless(
       // ignore
     }
   }
+}
+
+/**
+ * Spawn a VISIBLE Compose-style window pointed at https://chat.restream.io
+ * so the user can complete the chat-session cookie handshake interactively
+ * when the hidden provisioner failed to harvest an `accessXsrfToken`.
+ *
+ * v0.1.62 recovery path for the "v0.1.59 ad-hoc → v0.1.61 signed Developer ID"
+ * transition: signing the rebuild flipped the Electron bundle ID's identity,
+ * which wiped the `persist:restream-oauth` partition's chat-session cookies
+ * (the OAuth token was repaired by sign-in, but the chat partition's
+ * accessXsrfToken / refreshToken / refreshXsrfToken were not re-issued).
+ * From that point on every send returned `no-session-cookies` and nothing
+ * landed in chat-send.jsonl because the cookie check fires BEFORE the
+ * `performSend()` log-emitter.
+ *
+ * The window auto-closes once the cookie jar contains an `accessXsrfToken`,
+ * OR after `timeoutMs`, OR when the user closes it.
+ *
+ * Implementation notes:
+ *   - Title + size chosen so a user who minimised the main window still
+ *     notices the prompt (380×640 is taller than the headless provisioner
+ *     because the user actually needs to interact with the page).
+ *   - Polled rather than cookie-event-subscribed because Electron's
+ *     `session.cookies.on('changed')` only fires on writes from inside an
+ *     Electron BrowserWindow context — the rest of the chat-cookie suite
+ *     can be written by an XHR redirect chain too.
+ *   - Always destroys the window in `finally`; otherwise a Restream
+ *     server-side redirect loop could leave it open if Ethan dismissed
+ *     the parent app.
+ */
+async function provisionCookiesInteractive(
+  sess: Session,
+  parent: BrowserWindow | null,
+  timeoutMs: number,
+): Promise<{ cookieHeader: string; xsrf?: string; raw: Cookie[] } | undefined> {
+  const electron = getElectron();
+  if (!electron) return undefined;
+  const win = new electron.BrowserWindow({
+    show: true,
+    width: 460,
+    height: 640,
+    parent: parent ?? undefined,
+    title: 'Restream Chat++ — finish sign-in',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      session: sess,
+    },
+  });
+  // Surface a quick description in the dock so a user with multiple
+  // Restream windows can tell this one apart from the OAuth window.
+  let userClosed = false;
+  try {
+    win.on('closed', () => {
+      userClosed = true;
+    });
+  } catch {
+    // ignore
+  }
+  try {
+    void win.loadURL('https://chat.restream.io');
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !userClosed) {
+      await new Promise((r) => setTimeout(r, COLD_START_POLL_MS));
+      const next = await readRestreamCookies(sess);
+      if (next && next.xsrf) return next;
+    }
+    return await readRestreamCookies(sess);
+  } finally {
+    try {
+      if (!userClosed && !win.isDestroyed()) win.destroy();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * v0.1.62 — ensure the `persist:restream-oauth` Electron partition has a
+ * complete chat-session cookie handshake (specifically `accessXsrfToken`,
+ * which is the only chat cookie we read at send time — `refreshToken` /
+ * `refreshXsrfToken` are written alongside it by Restream's chat backend).
+ *
+ * Codex xhigh diagnosis (verbatim, 2026-05-23): the v0.1.59 ad-hoc → v0.1.61
+ * signed Developer ID transition split the app's auth state. OAuth token
+ * was repaired by the post-install sign-in (because the OAuth flow runs
+ * through a BrowserWindow with that partition and the token is persisted
+ * via `safeStorage`). The chat partition's session cookies — written by
+ * the chat.restream.io webchat itself — were wiped (codesigning a
+ * different identity flipped the partition's identity scope), and the
+ * fresh OAuth callback only wrote analytics cookies. Result: every send
+ * returned `no-session-cookies` at `chat-send.ts:529` and no log row was
+ * emitted (the JSONL writer lives inside `performSend()` at `:422`).
+ *
+ * Strategy:
+ *   1. Read the partition's `.restream.io` cookies. If an `accessXsrfToken`
+ *      is already present, we're done — no UI surfaced.
+ *   2. Otherwise run the existing headless provisioner (hidden BrowserWindow
+ *      → chat.restream.io). Most users hit this path on first sign-in or
+ *      after a session-cookie expiry.
+ *   3. If headless still didn't harvest an XSRF cookie AND
+ *      `interactiveFallback: true`, surface a visible window so the user
+ *      can complete the cookie handshake (e.g. re-accept a third-party
+ *      cookie permission prompt, dismiss a chat sidebar, etc).
+ *   4. Return the final state. Callers should treat `{ ok: false,
+ *      reason: ... }` as a "tell the user to sign in / restart" cue.
+ */
+export interface EnsureRestreamChatCookiesOptions {
+  /** Parent BrowserWindow for hidden / interactive helpers. Optional in tests. */
+  parentWindow?: BrowserWindow | null;
+  /**
+   * When `true`, surface a visible chat.restream.io window if the hidden
+   * provisioner can't harvest an XSRF cookie. When `false` (the default),
+   * give up after the hidden attempt and report `still-no-cookies`.
+   */
+  interactiveFallback?: boolean;
+  /**
+   * Total budget (ms) for the interactive fallback window to wait for an
+   * XSRF cookie before destroying itself. Default 60_000 (60s) — long
+   * enough for a user to click through a single Restream sign-in
+   * affordance but short enough that a forgotten window doesn't sit open
+   * forever.
+   */
+  interactiveTimeoutMs?: number;
+  /** Injected for unit tests. */
+  getSession?: () => Session;
+}
+
+export interface EnsureRestreamChatCookiesResult {
+  /** True iff the partition has `accessXsrfToken` after this call. */
+  ok: boolean;
+  /**
+   * Why ensuring failed (or `'already-present'` / `'headless'` /
+   * `'interactive'` on success).
+   *   - `already-present`: partition already had the XSRF cookie.
+   *   - `headless`: hidden provisioner harvested it.
+   *   - `interactive`: visible window harvested it.
+   *   - `still-no-cookies`: neither path harvested it; callers should
+   *     surface this to the user.
+   *   - `no-electron`: called outside an Electron main-process context.
+   */
+  reason:
+    | 'already-present'
+    | 'headless'
+    | 'interactive'
+    | 'still-no-cookies'
+    | 'no-electron';
+  cookieCount: number;
+  hasXsrf: boolean;
+}
+
+export async function ensureRestreamChatCookies(
+  opts: EnsureRestreamChatCookiesOptions = {},
+): Promise<EnsureRestreamChatCookiesResult> {
+  let sess: Session;
+  try {
+    sess = (opts.getSession ?? getRestreamSession)();
+  } catch {
+    return {
+      ok: false,
+      reason: 'no-electron',
+      cookieCount: 0,
+      hasXsrf: false,
+    };
+  }
+
+  const initial = await readRestreamCookies(sess);
+  if (initial && initial.xsrf) {
+    return {
+      ok: true,
+      reason: 'already-present',
+      cookieCount: initial.raw.length,
+      hasXsrf: true,
+    };
+  }
+
+  // Stage 2: hidden provisioner (same as the cold-start path inside
+  // sendChatText).
+  const headless = await provisionCookiesHeadless(
+    sess,
+    opts.parentWindow ?? null,
+  );
+  if (headless && headless.xsrf) {
+    return {
+      ok: true,
+      reason: 'headless',
+      cookieCount: headless.raw.length,
+      hasXsrf: true,
+    };
+  }
+
+  // Stage 3: interactive fallback (caller-opt-in).
+  if (opts.interactiveFallback) {
+    const interactive = await provisionCookiesInteractive(
+      sess,
+      opts.parentWindow ?? null,
+      opts.interactiveTimeoutMs ?? 60_000,
+    );
+    if (interactive && interactive.xsrf) {
+      return {
+        ok: true,
+        reason: 'interactive',
+        cookieCount: interactive.raw.length,
+        hasXsrf: true,
+      };
+    }
+  }
+
+  // Final read so the result reflects whatever IS present (analytics
+  // cookies, etc.) for diagnostics.
+  const final = await readRestreamCookies(sess);
+  return {
+    ok: false,
+    reason: 'still-no-cookies',
+    cookieCount: final?.raw.length ?? 0,
+    hasXsrf: false,
+  };
 }
 
 /**
@@ -323,8 +543,19 @@ export interface ChatSendOptions {
  * before this record is built (cookies → length only, x-axsrf-token →
  * SHA-256 hash) so the record can be flushed to disk without leaking
  * auth material.
+ *
+ * v0.1.62: extended to a discriminated union — `phase:"send"` records
+ * (the original shape) document POST round-trips, and `phase:"preflight"`
+ * records document failures BEFORE `performSend()` runs (e.g. cookie
+ * jar missing the `accessXsrfToken` after sign-in). Without preflight
+ * rows the v0.1.61 "send broken post-install" bug was invisible —
+ * `chat-send.jsonl` was empty because no POST ever fired.
  */
-export interface ChatSendLogRecord {
+export type ChatSendLogRecord = ChatSendPostLogRecord | ChatSendPreflightLogRecord;
+
+export interface ChatSendPostLogRecord {
+  /** Discriminator. `'send'` for legacy / POST-round-trip rows. */
+  phase?: 'send';
   /** `attempt:1` for the first send, `attempt:2` for the post-404 retry. */
   attempt: 1 | 2;
   url: string;
@@ -346,6 +577,48 @@ export interface ChatSendLogRecord {
    * refresh. False for `attempt:1`, true for `attempt:2`.
    */
   showIdRefreshed: boolean;
+}
+
+/**
+ * v0.1.62 diagnostic — written to `chat-send.jsonl` when `sendChatText`
+ * bails out BEFORE `performSend()`. The pre-v0.1.62 send path returned
+ * `{ ok:false, reason:"no-session-cookies" }` silently with no log row,
+ * making the "v0.1.61 broke sends" failure mode (split auth state:
+ * OAuth token present, chat partition cookies wiped) entirely
+ * unobservable from disk.
+ */
+export interface ChatSendPreflightLogRecord {
+  phase: 'preflight';
+  /**
+   * Why the send is aborting. Mirrors the `SendTextResult.reason`
+   * union we return to the renderer (`no-session-cookies` is the
+   * v0.1.62 split-auth case; `no-active-connections` and others may
+   * surface here in future refactors).
+   */
+  reason:
+    | 'no-session-cookies'
+    | 'no-active-connections'
+    | 'empty-text'
+    | string;
+  /**
+   * Whether the headless cookie-provisioning helper ran before bailing.
+   * `false` when callers pass `skipColdStart`. Helps distinguish
+   * "partition truly empty" from "helper ran and still couldn't harvest
+   * an XSRF cookie" (the v0.1.62 split-auth signature).
+   */
+  coldStartAttempted: boolean;
+  /** Total number of `.restream.io` cookies the partition reported. */
+  cookieCount: number;
+  /**
+   * Names (not values) of every cookie present. Helpful for spotting the
+   * v0.1.62 signature ("only analytics cookies, no XSRF tokens"). Cookie
+   * VALUES are never logged.
+   */
+  cookieNames: string[];
+  /** Whether `accessXsrfToken` was present (the v0.1.62 split-auth signal). */
+  hasXsrf: boolean;
+  /** Number of channels the renderer thinks are live. */
+  connectionCount: number;
 }
 
 /**
@@ -422,6 +695,7 @@ async function performSend(args: {
     if (log) {
       try {
         log({
+          phase: 'send',
           attempt,
           url,
           method: 'POST',
@@ -442,6 +716,7 @@ async function performSend(args: {
     if (log) {
       try {
         log({
+          phase: 'send',
           attempt,
           url,
           method: 'POST',
@@ -492,11 +767,55 @@ function isRouteNotFound(bodyText: string | undefined): boolean {
  * "no active show" error.
  */
 export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResult> {
+  // v0.1.62: helper that emits a preflight diagnostic row to
+  // `chat-send.jsonl` before we bail out of the send path. Mirrors the
+  // shape of POST-attempt records so log readers can `jq -s` over both.
+  // Errors thrown by `opts.log` are swallowed (logging must never break
+  // the send path).
+  const emitPreflight = (
+    reason: ChatSendPreflightLogRecord['reason'],
+    extras: {
+      coldStartAttempted: boolean;
+      cookieCount: number;
+      cookieNames: string[];
+      hasXsrf: boolean;
+    },
+  ): void => {
+    if (!opts.log) return;
+    try {
+      opts.log({
+        phase: 'preflight',
+        reason,
+        coldStartAttempted: extras.coldStartAttempted,
+        cookieCount: extras.cookieCount,
+        cookieNames: extras.cookieNames,
+        hasXsrf: extras.hasXsrf,
+        connectionCount: opts.connections.length,
+      });
+    } catch {
+      // ignore
+    }
+  };
+
   const text = (opts.text ?? '').trim();
-  if (!text) return { ok: false, reason: 'error', error: 'empty text' };
+  if (!text) {
+    emitPreflight('empty-text', {
+      coldStartAttempted: false,
+      cookieCount: 0,
+      cookieNames: [],
+      hasXsrf: false,
+    });
+    return { ok: false, reason: 'error', error: 'empty text' };
+  }
 
   const ids = selectConnectionIdentifiers(opts.connections);
   if (ids.length === 0) {
+    emitPreflight('no-active-connections', {
+      coldStartAttempted: false,
+      cookieCount: 0,
+      cookieNames: [],
+      hasXsrf: false,
+    });
     return { ok: false, reason: 'no-active-connections' };
   }
 
@@ -522,10 +841,29 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
   let cookies = await readRestreamCookies(sess);
   if (!cookies || !cookies.xsrf) {
     if (opts.skipColdStart) {
+      // v0.1.62 diagnostic: pre-`performSend` failure, document the
+      // cookie-jar state so chat-send.jsonl can show the split-auth
+      // signature (analytics cookies present, no XSRF). Without this
+      // the v0.1.61 "send broken post-install" bug was invisible.
+      emitPreflight('no-session-cookies', {
+        coldStartAttempted: false,
+        cookieCount: cookies?.raw.length ?? 0,
+        cookieNames: cookies?.raw.map((c) => c.name) ?? [],
+        hasXsrf: false,
+      });
       return { ok: false, reason: 'no-session-cookies' };
     }
     cookies = await provisionCookiesHeadless(sess, opts.parentWindow);
     if (!cookies || !cookies.xsrf) {
+      // v0.1.62 diagnostic — see comment above. Hit specifically when
+      // the hidden cookie-provisioner couldn't harvest an XSRF cookie
+      // either, which is the v0.1.62 split-auth signature.
+      emitPreflight('no-session-cookies', {
+        coldStartAttempted: true,
+        cookieCount: cookies?.raw.length ?? 0,
+        cookieNames: cookies?.raw.map((c) => c.name) ?? [],
+        hasXsrf: false,
+      });
       return { ok: false, reason: 'no-session-cookies' };
     }
   }

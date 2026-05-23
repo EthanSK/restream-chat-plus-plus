@@ -15,6 +15,7 @@ import { ChatClient } from './ws-client';
 import { createStore } from './store';
 import {
   sendChatText,
+  ensureRestreamChatCookies,
   type ChatSendLogRecord,
   type ChatContext,
 } from './chat-send';
@@ -692,6 +693,43 @@ app.on('ready', async () => {
   ipcMain.handle(IPC.AUTH_START, async () => {
     try {
       const tok = await oauth.authenticate();
+      // v0.1.62 — guarantee chat-partition cookies are present before
+      // declaring the app send-ready. The v0.1.59 ad-hoc → v0.1.61 signed
+      // Developer ID transition split the app's auth state: OAuth token
+      // got repaired by sign-in, but the `persist:restream-oauth`
+      // chat-partition cookies (`accessXsrfToken`, `refreshToken`,
+      // `refreshXsrfToken`) were wiped because codesigning a different
+      // identity flipped the partition's scope. From that point on every
+      // `sendChatText` hit the `no-session-cookies` bail-out at the
+      // pre-`performSend` cookie gate.
+      //
+      // The OAuth callback writes ONLY analytics cookies (the OAuth flow
+      // doesn't pass through chat.restream.io itself), so the hidden
+      // cookie-provisioner must run after every fresh sign-in to harvest
+      // the chat-session cookies from chat.restream.io. If the headless
+      // attempt fails we surface a visible window so the user can
+      // complete the handshake interactively — much better UX than the
+      // silent "everything looks signed in, every send fails" state Ethan
+      // hit on v0.1.61. Errors swallowed so a transient cookie hydration
+      // failure doesn't gate the auth path; the renderer can still try
+      // to send (and will get the `no-session-cookies` preflight log
+      // row if cookies still aren't there).
+      try {
+        const cookieState = await ensureRestreamChatCookies({
+          parentWindow: mainWindow,
+          interactiveFallback: true,
+        });
+        if (!cookieState.ok) {
+          console.warn(
+            '[main] ensureRestreamChatCookies after auth: ok=false reason=' +
+              cookieState.reason +
+              ' cookieCount=' +
+              cookieState.cookieCount,
+          );
+        }
+      } catch (cookieErr) {
+        console.error('[main] ensureRestreamChatCookies threw', cookieErr);
+      }
       chat.setToken(tok.accessToken);
       chat.start();
       const status: AuthStatus = {

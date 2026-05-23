@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.1.62 — fix broken sends post-v0.1.61 (split chat-partition auth after Developer ID signing)
+
+Critical hotfix for the regression Ethan reported 2026-05-23 right
+after manually installing the signed v0.1.61: every outgoing message
+silently failed, no errors in the UI, and `chat-send.jsonl` was empty
+so the failure was invisible from disk.
+
+**Codex xhigh diagnosis (root cause):** the v0.1.59 ad-hoc → v0.1.61
+signed Developer ID transition split the app's auth state. OAuth token
+was repaired by the post-install sign-in (the OAuth flow uses the
+`persist:restream-oauth` partition + `safeStorage`, which survived the
+identity flip). But the chat-session cookies that the
+chat.restream.io webchat itself writes into that partition —
+`accessXsrfToken`, `refreshToken`, `refreshXsrfToken` — were wiped,
+because codesigning a different identity flipped the partition's
+scope. The OAuth callback's redirect only writes analytics cookies (it
+never passes through chat.restream.io), so every send returned
+`no-session-cookies` at the pre-`performSend()` cookie gate. The JSONL
+writer lives inside `performSend()`, so zero rows were emitted.
+
+**Three deltas:**
+
+1. **`ensureRestreamChatCookies` helper** (`src/main/chat-send.ts`):
+   exported function that guarantees the chat partition has an
+   `accessXsrfToken` before declaring the app send-ready. Three-stage
+   strategy: (a) read the jar — already present → return; (b) run the
+   existing hidden cookie-provisioner (BrowserWindow → chat.restream.io,
+   harvests cookies via the live webchat boot); (c) if hidden fails and
+   `interactiveFallback: true`, surface a visible chat.restream.io
+   window so the user can complete the handshake interactively. Auto-
+   destroys after 60s or when the XSRF cookie appears.
+
+2. **Wired from `AUTH_START`** (`src/main/main.ts:692`): after
+   `oauth.authenticate()` succeeds, call `ensureRestreamChatCookies`
+   with `interactiveFallback: true` before `chat.setToken` / `chat.start`.
+   Errors swallowed so a transient hydration failure doesn't gate the
+   auth path — the renderer can still try to send and gets the
+   preflight log row below if cookies are still missing.
+
+3. **Preflight diagnostic logging** (`src/main/chat-send.ts:521 / 529`):
+   `chat-send.jsonl` now captures a `{phase:"preflight", reason, ...}`
+   row whenever `sendChatText` bails out before `performSend()` —
+   covering `no-session-cookies`, `no-active-connections`, and
+   `empty-text`. Records the cookie names (not values) so the v0.1.62
+   split-auth signature (analytics cookies present, no XSRF) is
+   instantly recognisable on disk. The existing POST records now carry
+   `phase: "send"` for unambiguous `jq` filtering.
+
+**Workaround if v0.1.62 doesn't catch your case:** fully sign out + sign
+in. The post-OAuth `ensureRestreamChatCookies` call will harvest the
+chat-session cookies. Worst case: quit + delete
+`~/Library/Application Support/Restream Chat Plus Plus/Partitions/restream-oauth/`
++ relaunch to force fresh cookie provisioning.
+
 ## v0.1.61 — visible feedback during update download + signature-mismatch error pane
 
 Fixes the silent-failure mode Ethan hit on 2026-05-23 (voice 13:31 BST):
