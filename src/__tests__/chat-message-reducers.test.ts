@@ -4,6 +4,7 @@ import {
   dedupeOptimisticOnEcho,
   formatPendingError,
   pushOptimisticMessage,
+  shouldTriggerSideEffects,
 } from '../renderer/chat-message-reducers';
 import type { ChatMessage, ChatSendStatus } from '../shared/types';
 
@@ -169,6 +170,120 @@ describe('applyFailedSendStatus', () => {
     // Other placeholder + the incoming message untouched.
     expect(after[1].pendingSend).toBe('sending');
     expect(after[2].id).toBe('m-1');
+  });
+});
+
+describe('shouldTriggerSideEffects (v0.1.60 — double-send-sound fix)', () => {
+  // The send-sound double-fire bug: every Enter played two sounds, one
+  // on optimistic insert and one on server echo. The dedupe replaces
+  // the placeholder in place, but BOTH state transitions change
+  // `messages` array identity, so App.tsx's side-effect useEffect
+  // re-fires for both. Without this gate, two TTS speak() calls per
+  // sent message.
+
+  it('returns false for an optimistic placeholder (pendingSend="sending")', () => {
+    expect(
+      shouldTriggerSideEffects(placeholder('local-x', 'spam test'), undefined),
+    ).toBe(false);
+  });
+
+  it('returns false for a failed-send placeholder (pendingSend="failed")', () => {
+    const failed: ChatMessage = {
+      ...placeholder('local-x'),
+      pendingSend: 'failed',
+      pendingError: 'send failed',
+    };
+    expect(shouldTriggerSideEffects(failed, undefined)).toBe(false);
+  });
+
+  it('returns true for a confirmed self-echo (no pendingSend)', () => {
+    expect(shouldTriggerSideEffects(wsEcho('local-x'), undefined)).toBe(true);
+  });
+
+  it('returns true for an incoming viewer message (no pendingSend)', () => {
+    expect(shouldTriggerSideEffects(incoming('m-1'), undefined)).toBe(true);
+  });
+
+  it('returns false when re-asked about the same id (no double-fire on dedupe-replace mid-array)', () => {
+    const echo = wsEcho('local-x');
+    expect(shouldTriggerSideEffects(echo, 'local-x')).toBe(false);
+  });
+
+  it('returns false for an empty feed', () => {
+    expect(shouldTriggerSideEffects(undefined, undefined)).toBe(false);
+  });
+
+  it('regression: simulate the full optimistic-send lifecycle and assert exactly ONE trigger', () => {
+    // App.tsx's useEffect re-runs every time the `messages` array
+    // reference changes. We simulate the exact sequence:
+    //
+    //   1. User hits Enter        → push placeholder (pendingSend='sending')
+    //   2. WS echo arrives        → dedupeOptimisticOnEcho replaces in place (pendingSend=undefined)
+    //
+    // The pre-v0.1.60 code fired the side effect on BOTH. After the
+    // gate, only step 2 should fire.
+    let messages: ChatMessage[] = [];
+    let lastProcessedId: string | undefined = undefined;
+    let triggerCount = 0;
+
+    const runSideEffect = (): void => {
+      if (messages.length === 0) return;
+      const m = messages[messages.length - 1];
+      if (!shouldTriggerSideEffects(m, lastProcessedId)) return;
+      lastProcessedId = m.id;
+      triggerCount += 1;
+    };
+
+    // Step 1: optimistic insert.
+    messages = pushOptimisticMessage(messages, placeholder('local-x', 'hi'));
+    runSideEffect();
+    expect(triggerCount).toBe(0); // placeholder is gated out
+
+    // Step 2: WS echo arrives.
+    messages = dedupeOptimisticOnEcho(messages, wsEcho('local-x', 'hi'));
+    runSideEffect();
+    expect(triggerCount).toBe(1); // echo fires exactly once
+
+    // Step 3: a hypothetical re-fire of the same useEffect (e.g. a
+    // descendant `setMessages` returning the same content) must NOT
+    // double-trigger.
+    runSideEffect();
+    expect(triggerCount).toBe(1);
+  });
+
+  it('regression: viewer-message-between-placeholder-and-echo does NOT re-fire on dedupe-replace', () => {
+    // Edge case worth guarding: while the placeholder is pending, an
+    // unrelated viewer message arrives and bumps past it as the new
+    // last element. We trigger for the viewer. Then the echo arrives
+    // and `dedupeOptimisticOnEcho` replaces the placeholder MID-ARRAY,
+    // so the last element doesn't change. Without the same-id guard,
+    // the useEffect would re-fire and re-speak the viewer message.
+    let messages: ChatMessage[] = [];
+    let lastProcessedId: string | undefined = undefined;
+    const triggered: string[] = [];
+
+    const runSideEffect = (): void => {
+      if (messages.length === 0) return;
+      const m = messages[messages.length - 1];
+      if (!shouldTriggerSideEffects(m, lastProcessedId)) return;
+      lastProcessedId = m.id;
+      triggered.push(m.id);
+    };
+
+    messages = pushOptimisticMessage(messages, placeholder('local-x', 'mine'));
+    runSideEffect();
+    expect(triggered).toEqual([]); // gated
+
+    messages = dedupeOptimisticOnEcho(messages, incoming('m-viewer', 'from a viewer'));
+    runSideEffect();
+    expect(triggered).toEqual(['m-viewer']);
+
+    // Echo of OUR message replaces the placeholder mid-array. Last
+    // element is still 'm-viewer' — the same-id guard prevents a
+    // double-speak.
+    messages = dedupeOptimisticOnEcho(messages, wsEcho('local-x', 'mine'));
+    runSideEffect();
+    expect(triggered).toEqual(['m-viewer']);
   });
 });
 

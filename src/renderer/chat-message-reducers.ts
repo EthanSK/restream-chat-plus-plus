@@ -95,6 +95,51 @@ export function applyFailedSendStatus(
 }
 
 /**
+ * v0.1.60 — decide whether a freshly-observed `lastMessage` should
+ * trigger one-shot side effects (TTS speak + native notification).
+ *
+ * Two failure modes this guards against:
+ *
+ *   1. Optimistic-insert dupe (the v0.1.60 bug). When the user hits
+ *      Enter, App.tsx synchronously inserts a placeholder with
+ *      `pendingSend: 'sending'`. The WS echo arrives ~50–500 ms later
+ *      and `dedupeOptimisticOnEcho` REPLACES the placeholder in place
+ *      with the real echo (no `pendingSend`). Both state transitions
+ *      change the `messages` array reference, so the App.tsx
+ *      side-effect useEffect re-fires for BOTH. Without this gate, the
+ *      send-sound plays twice: once on Enter (placeholder), once on
+ *      echo (confirmed sent). Voice 2026-05-23 — "I hear double
+ *      messages sent. One when I click enter, one when it's sent."
+ *
+ *      Fix: skip when `pendingSend !== undefined`. Only the confirmed
+ *      echo (which clears `pendingSend`) triggers the side effect.
+ *
+ *   2. Same-id reprocessing. The dedupe replacement keeps the same
+ *      `id`, and if an UNRELATED incoming message had bumped past the
+ *      placeholder before the echo arrived, the array's last element
+ *      doesn't change identity when the placeholder mid-array is
+ *      replaced — but the array reference still does, so the useEffect
+ *      re-fires and would re-speak that unrelated last message. Guard
+ *      by remembering the id of the last message we acted on.
+ *
+ * Returns `true` when the side effect should fire. `lastProcessedId`
+ * is the id we most-recently spoke (or `undefined` on first call).
+ */
+export function shouldTriggerSideEffects(
+  lastMessage: ChatMessage | undefined,
+  lastProcessedId: string | undefined,
+): boolean {
+  if (!lastMessage) return false;
+  // Optimistic placeholders (sending) or failed-send entries are not
+  // "actually-sent" — never speak them. Only confirmed echoes (no
+  // pendingSend) qualify.
+  if (lastMessage.pendingSend !== undefined) return false;
+  // Same-id reprocessing guard (see docstring case 2).
+  if (lastMessage.id === lastProcessedId) return false;
+  return true;
+}
+
+/**
  * Compose the tooltip text for a failed send. Prefers the queue's
  * `error` (which is the Restream response body excerpt for `send-failed`
  * + the reason code for `error`), falling back to a generic message

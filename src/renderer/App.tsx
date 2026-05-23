@@ -30,6 +30,7 @@ import {
   applyFailedSendStatus,
   dedupeOptimisticOnEcho,
   pushOptimisticMessage,
+  shouldTriggerSideEffects,
 } from './chat-message-reducers';
 
 const MAX_MESSAGES = 1000;
@@ -49,6 +50,13 @@ export function App(): React.ReactElement {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const ttsRef = useRef<TtsEngineLike | undefined>(undefined);
   const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
+  // v0.1.60 — id of the message we most recently triggered side effects
+  // for (TTS speak + native notify). Used by the side-effect useEffect
+  // below to skip both (a) optimistic-placeholder inserts that haven't
+  // been confirmed by the server yet, and (b) re-fires whose last
+  // element didn't actually change identity (e.g. a dedupe-replace
+  // mid-array). See `shouldTriggerSideEffects` for the full reasoning.
+  const lastSpokenIdRef = useRef<string | undefined>(undefined);
 
   // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
   // and stash both in refs so the mount-only `onChatMessage` subscription
@@ -279,8 +287,18 @@ export function App(): React.ReactElement {
   useEffect(() => {
     if (messages.length === 0) return;
     const m = messages[messages.length - 1];
+    // v0.1.60 — gate side effects (TTS + notification) to fire exactly
+    // once per logically-sent message. The optimistic-send flow inserts
+    // a `pendingSend: 'sending'` placeholder on Enter, then REPLACES it
+    // in place when the WS echo arrives. Both transitions change the
+    // `messages` array reference, so without this gate the send-sound
+    // would play twice (once on Enter, once on echo). Voice 2026-05-23:
+    // "I hear double messages sent. One when I click enter, one when
+    // it's sent. It should just be the one when it's sent now."
+    if (!shouldTriggerSideEffects(m, lastSpokenIdRef.current)) return;
     if (!settings.filter.platforms[m.platform]) return;
 
+    lastSpokenIdRef.current = m.id;
     if (settings.tts.enabled && !m.ignoredByTts) {
       ttsRef.current?.enqueue(m);
     }

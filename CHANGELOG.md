@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.1.60 — fix double send-sound (audio dupe sibling of v0.1.59)
+
+Fix the audio counterpart to the v0.1.59 visual-duplicate bug. After
+v0.1.59 the feed correctly showed one entry per sent message, but the
+TTS (and native notification) still played TWICE: once when the user
+hit Enter, once when the server echo arrived and the dedupe replaced
+the placeholder in place. Voice 2026-05-23: "In Restream Chat++, the
+newest version, I no longer see double messages sent, but I hear
+double messages sent. One when I click enter, one when it's sent."
+
+**Root cause:** App.tsx's side-effect useEffect was keyed on
+`[messages]` and treated EVERY array reference change as a fresh
+"new last message" to speak. The optimistic-send flow produces two
+such reference changes per sent message — placeholder insert, then
+echo dedupe-replace — and the useEffect dutifully spoke each one.
+The v0.1.59 visual fix made these two transitions converge on the
+same displayed entry, but the side-effect trigger still fired twice.
+
+**Fix:** new pure helper `shouldTriggerSideEffects` gates the useEffect
+on two conditions:
+
+1. `pendingSend === undefined` — never speak optimistic placeholders or
+   failed-send entries. Only confirmed echoes (and incoming messages)
+   qualify. This kills the Enter-press "first sound".
+2. `m.id !== lastSpokenIdRef.current` — defensive guard against
+   re-firing on the same id when a dedupe-replace mid-array doesn't
+   actually move the last element (e.g. a viewer message arrived
+   between the placeholder and the echo).
+
+App.tsx now stores the last spoken id in a ref and consults the helper
+before enqueueing TTS / dispatching `rcpp.notify`.
+
+- New `shouldTriggerSideEffects(lastMessage, lastProcessedId)` in
+  `src/renderer/chat-message-reducers.ts`.
+- Wired into App.tsx's existing side-effect useEffect; behind a single
+  early-return guard. No refactor of the surrounding logic.
+- Regression tests in `src/__tests__/chat-message-reducers.test.ts`
+  including a full optimistic-send lifecycle simulation that asserts
+  exactly ONE trigger per logically-sent message, plus the
+  viewer-message-between-placeholder-and-echo edge case.
+
 ## v0.1.59 — fix duplicate-message bug on send
 
 Fix the regression introduced in v0.1.43 where every message the user sent
