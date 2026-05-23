@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.1.61 — visible feedback during update download + signature-mismatch error pane
+
+Fixes the silent-failure mode Ethan hit on 2026-05-23 (voice 13:31 BST):
+clicking Install Update produced an "Installing…" spinner + a 3s toast
+that said "Downloading update…", then **dead air**. The download was
+actually failing 22 seconds later with `Code signature ... did not pass
+validation` (Squirrel rejected the ad-hoc → Developer-ID identity
+swap), but the renderer never heard about it because the `error` event
+in `src/main/updater.ts` only logged + reset internal state without
+broadcasting an `UpdateInfo` to the renderer.
+
+**Three deltas:**
+
+1. `triggerSquirrelDownload()` now broadcasts a `kind: 'downloading'`
+   payload IMMEDIATELY (before `autoUpdater.checkForUpdates()` fires)
+   so the banner flips out of `available` the moment the IPC round-
+   trip resolves. `checking-for-update` + `update-available` also
+   rebroadcast — the banner shows an indeterminate progress bar with
+   the version label ("Downloading Restream Chat++ v0.1.61…") until
+   Squirrel reports its first chunk.
+
+2. The Squirrel `error` event now broadcasts a `kind: 'error'`
+   `UpdateInfo` with three new fields:
+   - `errorCategory`: `signature-mismatch` | `network` | `staging` |
+     `unknown` — categorised by `categoriseUpdaterError()` so the
+     banner can pick the right user-facing wording.
+   - `errorReleaseUrl`: the GH releases URL the banner offers as the
+     manual-fallback "Open GitHub Releases" button.
+   - `error`: the raw Squirrel error string for the `unknown` branch.
+
+   The banner renders a persistent red error pane (not a transient
+   toast) with the categorised headline + recovery guidance + the
+   manual-fallback button. For signature mismatch specifically it
+   tells the user to reinstall from GitHub Releases.
+
+3. The `download-progress` event now forwards `bytesPerSecond` +
+   `total` + `transferred` (not just `percent`). The banner shows
+   concrete activity — bytes-downloaded / bytes-total / KB-or-MB-per-
+   second / elapsed time — instead of just an integer percent that may
+   sit at 0 for tens of seconds. Adds a "Squirrel hasn't reported
+   progress yet" hint after 30s of dead air so the user knows the
+   click did kick the pipeline.
+
+Also extended `UpdateInfo` with `downloadBytesTransferred`,
+`downloadBytesTotal`, `downloadBytesPerSecond`, `downloadStartedAt`,
+`errorCategory`, `errorReleaseUrl`. `BannerState` adds an `'error'`
+state.
+
+- `src/main/updater.ts` — new `categoriseUpdaterError`,
+  `rememberPendingDownloadVersion`, immediate `downloading` broadcast,
+  `error` event → renderer broadcast, extra bytes fields in
+  `download-progress` forwarder.
+- `src/main/github-update-check.ts` — calls
+  `rememberPendingDownloadVersion(tagName)` when GH says an update is
+  available, so subsequent Squirrel-side broadcasts carry the version
+  string (Squirrel itself doesn't know the version until
+  `update-downloaded` fires).
+- `src/renderer/UpdateBanner.tsx` — new `decideErrorCopy`, `formatBytes`,
+  `formatSpeed` pure helpers; `DownloadingPane` sub-component renders
+  bytes + speed + elapsed-time + stalled-hint; new `error` state
+  renders the persistent error pane.
+- `src/renderer/App.tsx` — resets `updateDismissed` on Squirrel-side
+  `error` payloads (carries `errorReleaseUrl`) so the error pane is
+  always visible on the new error broadcast.
+- `src/renderer/styles.css` — `.update-banner-error` red theme +
+  `.update-banner-progress-meta` row for bytes/speed/elapsed.
+- Regression tests in `src/__tests__/update-progress-feedback.test.ts`
+  (immediate-downloading broadcast, error-event broadcast,
+  category-recognition) and
+  `src/__tests__/update-banner-error-pane.test.tsx` (error-pane render,
+  downloading-pane bytes/speed display, formatBytes/formatSpeed
+  helpers).
+
 ## v0.1.60 — fix double send-sound (audio dupe sibling of v0.1.59)
 
 Fix the audio counterpart to the v0.1.59 visual-duplicate bug. After

@@ -233,7 +233,16 @@ export function App(): React.ReactElement {
           info.latestVersion !== prev.latestVersion;
         const stateProgressed =
           info.kind === 'downloading' || info.kind === 'ready-to-install';
-        if (newAvailable || stateProgressed) {
+        // v0.1.61 — also reset on Squirrel-side errors that carry an
+        // `errorReleaseUrl` (the only kind the banner actually shows for
+        // `error`). Without this, a user who dismissed the `available`
+        // banner and then clicked Install Update via the menu would
+        // never see the resulting failure surface in the UI.
+        const erroredVisibly =
+          info.kind === 'error' &&
+          typeof (info as { errorReleaseUrl?: string }).errorReleaseUrl ===
+            'string';
+        if (newAvailable || stateProgressed || erroredVisibly) {
           setUpdateDismissed(false);
         }
         return info;

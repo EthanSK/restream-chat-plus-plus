@@ -40,6 +40,7 @@ import { app, BrowserWindow } from 'electron';
 import log from 'electron-log/main';
 import { IPC, UpdateInfo } from '../shared/types';
 import { isNewerVersion } from '../shared/version';
+import { rememberPendingDownloadVersion } from './updater';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
 const RELEASES_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
@@ -216,6 +217,17 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
         checkedAt: now,
       };
       log.info('[updater-gh] update available', { tagName, currentVersion });
+      // v0.1.61 — seed the Squirrel-side cache so subsequent
+      // `download-progress` + `error` broadcasts can include the
+      // human-readable version string. Squirrel itself doesn't know the
+      // tag name until `update-downloaded` fires (which is the LAST
+      // event), so without this the banner header would render
+      // "Downloading update… 42%" with no version label.
+      try {
+        rememberPendingDownloadVersion(tagName);
+      } catch (err) {
+        log.warn('[updater-gh] rememberPendingDownloadVersion failed', err);
+      }
       broadcast(available);
       return available;
     }

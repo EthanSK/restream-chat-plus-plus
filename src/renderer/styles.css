@@ -223,6 +223,70 @@ body {
   display: inline-block;
 }
 
+/* v0.1.61 — downloading pane now shows bytes / speed / elapsed time
+ * underneath the progress bar so the user sees concrete activity. The
+ * banner switches from a tight single-row strip to a 2-row layout
+ * while downloading. */
+.update-banner.update-banner-downloading {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  align-items: center;
+}
+.update-banner-downloading-headline {
+  flex: 1 1 60%;
+  white-space: normal;
+}
+.update-banner-progress-meta {
+  flex: 1 1 100%;
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+.update-banner-meta-item {
+  white-space: nowrap;
+}
+.update-banner-stall-hint {
+  flex: 1 1 100%;
+  font-size: 11px;
+  opacity: 0.85;
+  white-space: normal;
+  line-height: 1.4;
+}
+
+/* v0.1.61 — error pane with manual-fallback action button. Red tint so
+ * the user can tell the auto-update path failed (distinct from the
+ * amber "downloading" and green "ready to install"). */
+.update-banner.update-banner-error {
+  background: #4a1414;
+  color: #fecaca;
+  border-bottom-color: #6b1c1c;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  align-items: flex-start;
+}
+.update-banner-error-body {
+  flex: 1 1 60%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.update-banner-error-headline {
+  font-weight: 600;
+  white-space: normal;
+}
+.update-banner-error-detail {
+  font-size: 11px;
+  opacity: 0.9;
+  white-space: normal;
+  line-height: 1.4;
+}
+
 .toolbar .status-dot {
   width: 10px;
   height: 10px;

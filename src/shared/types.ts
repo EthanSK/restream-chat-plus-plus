@@ -611,6 +611,48 @@ export interface UpdateInfo {
    * indeterminate state in that case.
    */
   downloadPercent?: number;
+  /**
+   * v0.1.61 — extra Squirrel `download-progress` fields. Populated when
+   * `kind === 'downloading'` if Squirrel.Mac emits them (older builds may
+   * only emit `percent`, so all of these stay optional). Surfaced in the
+   * banner as bytes-downloaded / bytes-total / KB/s so the user sees
+   * concrete activity (Voice 3760, 2026-05-23: "I get a snap about
+   * downloading update but then nothing happens. I need some feedback
+   * saying it's actually downloading still").
+   */
+  downloadBytesTransferred?: number;
+  downloadBytesTotal?: number;
+  downloadBytesPerSecond?: number;
+  /**
+   * v0.1.61 — epoch ms when the renderer first saw `downloadInFlight` go
+   * true (set in `triggerSquirrelDownload`). Lets the banner show
+   * elapsed time and detect "Squirrel hasn't reported any progress in N
+   * seconds → likely a silent failure" cases. Carried across every
+   * downloading-state broadcast so the banner doesn't need to track it.
+   */
+  downloadStartedAt?: number;
+  /**
+   * v0.1.61 — populated when `kind === 'error'`. Together with `error`
+   * the banner offers a 'Open GitHub Releases' button so the user can
+   * always finish a failed update manually.
+   */
+  errorReleaseUrl?: string;
+  /**
+   * v0.1.61 — coarse error category so the banner can pick the right
+   * user-facing wording without sniffing the raw `error` string at the
+   * render layer. Populated when `kind === 'error'`.
+   *
+   *   - 'signature-mismatch' → the staged bundle's code signature did
+   *     not satisfy the running app's designated requirement. Most
+   *     commonly fires when the running app is ad-hoc / development-
+   *     signed and the published release is Developer-ID signed (or
+   *     vice versa). Recovery is a manual reinstall.
+   *   - 'network'            → DNS, TLS, connection refused, 5xx, etc.
+   *   - 'staging'            → ShipIt staging dir errors (disk full,
+   *     permissions). Manual reinstall usually fixes.
+   *   - 'unknown'            → catch-all.
+   */
+  errorCategory?: 'signature-mismatch' | 'network' | 'staging' | 'unknown';
   /** Error message — populated when kind === 'error'. */
   error?: string;
   /** Epoch ms of when this check completed. */

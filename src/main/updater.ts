@@ -45,6 +45,19 @@ let updateDownloaded = false;
 // session is active. v0.1.52: tracked so the renderer "Install Update"
 // button can short-circuit instead of bouncing the error back to the UI.
 let downloadInFlight = false;
+// v0.1.61 — epoch ms of when the current download session armed. Forwarded
+// to the renderer in every `kind: 'downloading'` payload so the banner can
+// render elapsed time + "this download has been running for >2 min without
+// reported progress" warnings. Reset to undefined on terminal events
+// (`update-downloaded`, `error`).
+let downloadStartedAt: number | undefined;
+// v0.1.61 — most recent `latestVersion` resolved from GH Releases. The
+// Squirrel-side `download-progress` event doesn't carry the new version
+// string, so we cache it from the most recent `available` UpdateInfo
+// broadcast and include it on every `downloading` payload so the banner
+// can show "Downloading Restream Chat++ v0.1.61… 42%" instead of an
+// anonymous percentage.
+let pendingDownloadVersion: string | undefined;
 
 /**
  * Push an UpdateInfo payload to every live BrowserWindow via the existing
@@ -86,25 +99,122 @@ function broadcastSquirrelStatus(info: UpdateInfo): void {
  * banner's Restart button or the dialog's button; both call
  * `quitAndInstall()` in the end.
  */
+/**
+ * v0.1.61 — categorise the raw Squirrel/ShipIt error message so the
+ * renderer can pick the right user-facing wording + recovery action.
+ *
+ * The most-common silent-failure path on Ethan's MBP is the
+ * ad-hoc-signed → Developer-ID-signed transition (the user is running
+ * an ad-hoc build because Mini hadn't released signed builds yet; the
+ * staged Developer-ID bundle fails Squirrel's `SecCodeCheckValidity`
+ * against the running app's designated requirement, which is what
+ * surfaces as "Code signature at URL ... did not pass validation: code
+ * failed to satisfy specified code requirement(s)"). Without
+ * categorisation the renderer would show a raw codesign-API string;
+ * with categorisation we show "This update needs a manual reinstall"
+ * + a button to open the GitHub releases page.
+ */
+export function categoriseUpdaterError(
+  raw: unknown,
+): 'signature-mismatch' | 'network' | 'staging' | 'unknown' {
+  const msg =
+    typeof raw === 'string'
+      ? raw
+      : typeof (raw as Error | undefined)?.message === 'string'
+        ? (raw as Error).message
+        : String(raw ?? '');
+  const lc = msg.toLowerCase();
+  if (
+    lc.includes('code signature') ||
+    lc.includes('code requirement') ||
+    lc.includes('codesign') ||
+    lc.includes('team identifier') ||
+    lc.includes('not pass validation') ||
+    lc.includes('not signed') ||
+    lc.includes('signature is missing')
+  ) {
+    return 'signature-mismatch';
+  }
+  if (
+    lc.includes('shipit') ||
+    lc.includes('install failed') ||
+    lc.includes('no such file') ||
+    lc.includes('permission') ||
+    lc.includes('staging') ||
+    lc.includes('eperm') ||
+    lc.includes('enoent')
+  ) {
+    return 'staging';
+  }
+  if (
+    lc.includes('connect') ||
+    lc.includes('network') ||
+    lc.includes('timeout') ||
+    lc.includes('etimedout') ||
+    lc.includes('econnreset') ||
+    lc.includes('econnrefused') ||
+    lc.includes('enotfound') ||
+    lc.includes('socket') ||
+    lc.includes('tls') ||
+    lc.includes('certificate') ||
+    lc.includes('http') ||
+    lc.includes('dns')
+  ) {
+    return 'network';
+  }
+  return 'unknown';
+}
+
 function attachSquirrelProgressForwarders(): void {
   // `download-progress` isn't in Electron's `autoUpdater` d.ts (Squirrel
   // emits it internally). Cast through EventEmitter so we can subscribe
   // without TS complaining about the unknown event name. Runtime contract
   // from Squirrel: the callback receives a single
-  // `{ percent, bytesPerSecond?, total?, transferred? }` object.
+  // `{ percent, bytesPerSecond?, total?, transferred? }` object. v0.1.61
+  // forwards `bytesPerSecond` / `total` / `transferred` too so the banner
+  // can show concrete bytes + KB/s feedback rather than a bare percent
+  // that may stay at 0 for tens of seconds.
   (autoUpdater as unknown as NodeJS.EventEmitter).on(
     'download-progress',
-    (progress?: { percent?: number }) => {
+    (progress?: {
+      percent?: number;
+      bytesPerSecond?: number;
+      total?: number;
+      transferred?: number;
+    }) => {
       try {
         const raw = progress?.percent;
         const percent =
           typeof raw === 'number' && Number.isFinite(raw)
             ? Math.max(0, Math.min(100, raw))
             : undefined;
+        const bps =
+          typeof progress?.bytesPerSecond === 'number' &&
+          Number.isFinite(progress.bytesPerSecond) &&
+          progress.bytesPerSecond >= 0
+            ? progress.bytesPerSecond
+            : undefined;
+        const total =
+          typeof progress?.total === 'number' &&
+          Number.isFinite(progress.total) &&
+          progress.total >= 0
+            ? progress.total
+            : undefined;
+        const transferred =
+          typeof progress?.transferred === 'number' &&
+          Number.isFinite(progress.transferred) &&
+          progress.transferred >= 0
+            ? progress.transferred
+            : undefined;
         broadcastSquirrelStatus({
           kind: 'downloading',
           currentVersion: app.getVersion(),
+          latestVersion: pendingDownloadVersion,
           downloadPercent: percent,
+          downloadBytesPerSecond: bps,
+          downloadBytesTotal: total,
+          downloadBytesTransferred: transferred,
+          downloadStartedAt,
           checkedAt: Date.now(),
         });
       } catch (err) {
@@ -120,19 +230,69 @@ function attachSquirrelProgressForwarders(): void {
   // throw "The command is disabled and cannot be executed".
   autoUpdater.on('checking-for-update', () => {
     downloadInFlight = true;
+    // v0.1.61 — broadcast an early `downloading` payload (indeterminate
+    // bar, 0% known) so the banner transitions out of `available` state
+    // the moment Squirrel acknowledges the click. Without this the user
+    // sees the "Installing…" spinner for ~3s, then the toast auto-
+    // dismisses, then dead air until the (sometimes-omitted) first
+    // `download-progress` event lands — Ethan's exact "I see a snap
+    // about downloading update but then nothing happens" complaint
+    // (Voice 3760, 2026-05-23).
+    broadcastSquirrelStatus({
+      kind: 'downloading',
+      currentVersion: app.getVersion(),
+      latestVersion: pendingDownloadVersion,
+      downloadStartedAt,
+      checkedAt: Date.now(),
+    });
   });
   autoUpdater.on('update-available', () => {
     downloadInFlight = true;
+    // v0.1.61 — same intent as the `checking-for-update` rebroadcast,
+    // but this event fires AFTER Squirrel has confirmed there is in
+    // fact a newer bundle on the feed. The banner uses the second
+    // payload to flip from "indeterminate / waiting for first chunk"
+    // to "indeterminate / Squirrel says it's downloading" — even
+    // though both render identically today the disk log + telemetry
+    // separation makes future debugging easier.
+    broadcastSquirrelStatus({
+      kind: 'downloading',
+      currentVersion: app.getVersion(),
+      latestVersion: pendingDownloadVersion,
+      downloadStartedAt,
+      checkedAt: Date.now(),
+    });
   });
   autoUpdater.on('update-not-available', () => {
     downloadInFlight = false;
+    downloadStartedAt = undefined;
   });
   autoUpdater.on('error', (err) => {
-    // Reset on error so a transient network failure doesn't lock the user
-    // out of retrying. The next checkForUpdates() call will arm the state
-    // machine again from scratch.
+    // v0.1.61 — broadcast the error to the renderer so the banner can
+    // surface a persistent error pane with the manual-fallback link.
+    // Pre-v0.1.61 this handler only reset `downloadInFlight` and logged;
+    // the renderer never heard about the failure and the banner sat in
+    // `downloading` indeterminate forever (exactly the symptom Ethan
+    // reported on 2026-05-23 — Squirrel's signature-mismatch error
+    // fired after ~22s of "downloading" and the UI showed no signal).
     log.warn('[updater] autoUpdater error event', err);
     downloadInFlight = false;
+    downloadStartedAt = undefined;
+    try {
+      const message = String((err as Error)?.message ?? err ?? 'unknown');
+      const category = categoriseUpdaterError(err);
+      broadcastSquirrelStatus({
+        kind: 'error',
+        currentVersion: app.getVersion(),
+        latestVersion: pendingDownloadVersion,
+        error: message,
+        errorCategory: category,
+        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
+        checkedAt: Date.now(),
+      });
+    } catch (broadcastErr) {
+      log.error('[updater] error broadcast failed', broadcastErr);
+    }
   });
 
   autoUpdater.on(
@@ -141,13 +301,15 @@ function attachSquirrelProgressForwarders(): void {
       try {
         updateDownloaded = true;
         downloadInFlight = false;
+        downloadStartedAt = undefined;
         broadcastSquirrelStatus({
           kind: 'ready-to-install',
           currentVersion: app.getVersion(),
           // `releaseName` is the version string per Electron's autoUpdater
           // contract on macOS (Squirrel.Mac sets it to the new bundle's
           // CFBundleShortVersionString).
-          latestVersion: typeof releaseName === 'string' ? releaseName : undefined,
+          latestVersion:
+            typeof releaseName === 'string' ? releaseName : pendingDownloadVersion,
           checkedAt: Date.now(),
         });
         log.info('[updater] update downloaded, ready to install', { releaseName });
@@ -156,6 +318,24 @@ function attachSquirrelProgressForwarders(): void {
       }
     },
   );
+}
+
+/**
+ * v0.1.61 — cache the latest `latestVersion` resolved by the GH-Releases
+ * poller so the Squirrel-side progress/ready broadcasts can carry it.
+ * Squirrel itself doesn't know the human-readable tag name until
+ * `update-downloaded` fires (Squirrel.Mac's `releaseName` field is set
+ * during bundle staging), so without this cache the banner has no version
+ * string to show in the "Downloading Restream Chat++ v0.1.61…" header.
+ *
+ * Called from `github-update-check.ts` on every `available` broadcast.
+ * Idempotent / no-op when version is undefined (e.g. an `up-to-date`
+ * payload).
+ */
+export function rememberPendingDownloadVersion(version: string | undefined): void {
+  if (typeof version === 'string' && version.length > 0) {
+    pendingDownloadVersion = version;
+  }
 }
 
 /**
@@ -347,13 +527,47 @@ export function triggerSquirrelDownload(): StartDownloadResult {
   try {
     log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
     downloadInFlight = true;
+    downloadStartedAt = Date.now();
+    // v0.1.61 — broadcast a `downloading` payload IMMEDIATELY (before
+    // Squirrel even fires `checking-for-update`) so the banner flips
+    // away from `available` the moment the IPC round-trip resolves.
+    // Without this, on slow Squirrel start-ups the banner stays in
+    // `available` for several seconds while the Installing… toast
+    // auto-dismisses, leaving the user with no feedback at all. The
+    // banner renders an indeterminate progress bar in this state.
+    broadcastSquirrelStatus({
+      kind: 'downloading',
+      currentVersion: app.getVersion(),
+      latestVersion: pendingDownloadVersion,
+      downloadStartedAt,
+      checkedAt: Date.now(),
+    });
     autoUpdater.checkForUpdates();
     return { ok: true, reason: 'started', mode: 'squirrel' };
   } catch (err) {
     // Reset the flag — the throw means the check never actually started,
     // so re-entry would otherwise be incorrectly blocked on the next click.
     downloadInFlight = false;
+    downloadStartedAt = undefined;
     log.error('[updater] checkForUpdates() threw', err);
+    // v0.1.61 — also broadcast an `error` payload so the renderer can
+    // show a persistent error pane (matching the async error-event
+    // path). Without this the banner would briefly flip to `downloading`
+    // then sit there forever after the synchronous throw.
+    try {
+      const message = String((err as Error)?.message ?? err);
+      broadcastSquirrelStatus({
+        kind: 'error',
+        currentVersion: app.getVersion(),
+        latestVersion: pendingDownloadVersion,
+        error: message,
+        errorCategory: categoriseUpdaterError(err),
+        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
+        checkedAt: Date.now(),
+      });
+    } catch (broadcastErr) {
+      log.error('[updater] sync-throw error broadcast failed', broadcastErr);
+    }
     return {
       ok: false,
       reason: 'error',
