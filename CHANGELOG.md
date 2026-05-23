@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.1.59 — fix duplicate-message bug on send
+
+Fix the regression introduced in v0.1.43 where every message the user sent
+via the inline chat input rendered TWICE in the feed: once as the
+"sending…" optimistic placeholder, and once as the WebSocket `reply_created`
+echo. The placeholder's `pendingSend` flag never cleared and the user saw
+each message duplicated.
+
+**Root cause:** the renderer mints a `clientId` (uuid) when the user hits
+Enter, ships it down to Restream as `clientReplyUuid`, and assigns it as
+the optimistic placeholder's `id`. The WS echoes the reply back with BOTH
+`clientReplyUuid` (round-tripped from the POST) AND `replyUuid` (Restream's
+server-side reply id). The normaliser in `src/main/normalize.ts` preferred
+`replyUuid` first, so the surfaced ChatMessage's `id` was the server id —
+which did NOT match the placeholder's `clientReplyUuid`-based id. The
+`dedupeOptimisticOnEcho` reducer's `id` lookup missed, fell through to
+the append branch, and the echo joined the feed as a SECOND entry instead
+of replacing the placeholder.
+
+**Fix:** flip the priority in `normalize.ts` so `clientReplyUuid` wins when
+present, falling back to `replyUuid` only for replies that have no
+client-minted uuid (e.g. history replay, replies sent from the official
+Restream Chat webchat). End-to-end the echo's `id` now matches the
+optimistic placeholder's `id` and the dedupe replaces in place.
+
+- One-line change in `src/main/normalize.ts` (the `reply_created` id
+  resolution).
+- Updated `src/__tests__/normalize.test.ts` — flipped the existing
+  assertion to expect `clientReplyUuid` and added two new regression
+  tests: the duplicate-bug end-to-end case, and the webchat-only
+  `replyUuid`-fallback case.
+
 ## v0.1.48 — seed `^viewer$` into regex-ignore lists
 
 Add `^viewer$` (anchored, case-insensitive via the uniform `i` flag the

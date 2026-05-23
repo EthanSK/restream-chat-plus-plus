@@ -79,9 +79,27 @@ export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
         ? 'unknown'
         : guessPlatformFromConnectionIds(p.connectionIdentifiers));
     const ts = Date.now();
+    // v0.1.59 — dedupe bug fix. PREFER `clientReplyUuid` over `replyUuid`
+    // so the WS echo's normalised `id` matches the renderer-minted
+    // optimistic placeholder (`App.tsx` mints a uuid → posts it as
+    // `clientReplyUuid` → assigns it as the placeholder's `id`; see
+    // `chat-send-client.ts` + `main.ts` queue wiring with
+    // `uuid: () => item.clientId`).
+    //
+    // Pre-v0.1.59 priority was `replyUuid` first, which is Restream's
+    // SERVER-generated reply id and does NOT match the placeholder. That
+    // mismatch made `dedupeOptimisticOnEcho` fall through to the append
+    // branch, so every sent message appeared TWICE: once as the
+    // "sending…" placeholder (still pinned by clientId), once as the
+    // echo (pinned by replyUuid). Voice 22-05-2026 ("RC++ is sending
+    // duplicate messages").
+    //
+    // Falling back to `replyUuid` keeps history-replay / direct-echo
+    // paths working when the streamer's reply originated from the
+    // OFFICIAL Restream Chat webchat (no clientReplyUuid round-trip).
     const id =
-      (typeof p.replyUuid === 'string' && p.replyUuid) ||
       (typeof p.clientReplyUuid === 'string' && p.clientReplyUuid) ||
+      (typeof p.replyUuid === 'string' && p.replyUuid) ||
       `self-${ts}-${Math.random().toString(36).slice(2, 8)}`;
     return {
       message: {

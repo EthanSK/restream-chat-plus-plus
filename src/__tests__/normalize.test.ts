@@ -216,7 +216,13 @@ describe('normalizeRestreamEvent', () => {
       expect(m!.text).toBe('hi test');
       expect(m!.username).toBe('You');
       expect(m!.self).toBe(true);
-      expect(m!.id).toBe('reply-1');
+      // v0.1.59 — clientReplyUuid takes priority so the echo's id matches
+      // the renderer-minted optimistic placeholder (`App.tsx` mints a
+      // uuid → posts it as `clientReplyUuid` → assigns it as the
+      // placeholder's `id`). See `chat-message-reducers.ts`
+      // `dedupeOptimisticOnEcho`. Pre-v0.1.59 this asserted 'reply-1',
+      // which is why every sent message duplicated.
+      expect(m!.id).toBe('cli-1');
       // v0.1.40: common replies always render WITHOUT a platform badge —
       // 'unknown' is the marker the renderer uses to swap the label to
       // "via Restream" + drop the platform colour-coding.
@@ -266,6 +272,50 @@ describe('normalizeRestreamEvent', () => {
       expect(m?.platform).toBe('twitch');
       expect(m?.self).toBe(true);
       expect(m?.username).toBe('You');
+      // v0.1.59 regression — clientReplyUuid wins so renderer dedupe works.
+      expect(m?.id).toBe('cli-2');
+    });
+
+    it('v0.1.59: falls back to replyUuid when clientReplyUuid is absent (history replay / official webchat send)', () => {
+      // When a reply originates from the OFFICIAL Restream Chat webchat
+      // (not from RC++), the WS echo carries `replyUuid` only — there's
+      // no client-minted uuid to dedupe against (no optimistic
+      // placeholder was ever created). The normaliser must still surface
+      // a stable id so the message renders.
+      const m = normalizeRestreamEvent({
+        action: 'reply_created',
+        payload: {
+          connectionIdentifiers: ['5849342-twitch-1'],
+          eventSourceId: 2,
+          replyUuid: 'server-only-uuid',
+          text: 'sent from webchat',
+        },
+      });
+      expect(m?.id).toBe('server-only-uuid');
+      expect(m?.self).toBe(true);
+    });
+
+    it('v0.1.59: prevents duplicate-message bug — echo id matches placeholder id end-to-end', () => {
+      // Regression for the 22-05-2026 duplicate-send bug. The renderer
+      // mints `clientId = "my-uuid-123"`, ships it down as
+      // `clientReplyUuid`, and assigns it to the optimistic
+      // placeholder's `id`. When Restream echoes the reply back with
+      // BOTH `clientReplyUuid` (round-trip) AND `replyUuid` (server id),
+      // the normalised ChatMessage must use `clientReplyUuid` so
+      // `dedupeOptimisticOnEcho` finds the placeholder and replaces it
+      // in place — NOT appends a second entry.
+      const clientId = 'my-uuid-123';
+      const m = normalizeRestreamEvent({
+        action: 'reply_created',
+        payload: {
+          clientReplyUuid: clientId,
+          replyUuid: 'restream-server-id-456',
+          eventSourceId: 1,
+          connectionIdentifiers: ['5849342-twitch-1'],
+          text: 'spam test',
+        },
+      });
+      expect(m?.id).toBe(clientId);
     });
 
     it('drops reply_created without text', () => {
