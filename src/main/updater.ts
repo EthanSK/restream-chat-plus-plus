@@ -230,6 +230,12 @@ function attachSquirrelProgressForwarders(): void {
   // throw "The command is disabled and cannot be executed".
   autoUpdater.on('checking-for-update', () => {
     downloadInFlight = true;
+    // v0.1.64 — clear the cached error so a successful subsequent check
+    // doesn't surface a stale "last update failed" message via the MCP
+    // `update_download_status` tool. Without this reset the agent UI
+    // would keep showing the previous error even after recovery.
+    lastErrorMessage = undefined;
+    lastErrorCategory = undefined;
     // v0.1.61 — broadcast an early `downloading` payload (indeterminate
     // bar, 0% known) so the banner transitions out of `available` state
     // the moment Squirrel acknowledges the click. Without this the user
@@ -281,6 +287,11 @@ function attachSquirrelProgressForwarders(): void {
     try {
       const message = String((err as Error)?.message ?? err ?? 'unknown');
       const category = categoriseUpdaterError(err);
+      // v0.1.64 — persist error to module state so the MCP `update_download_status`
+      // tool can report WHY a previous download bailed without scraping the
+      // log file. Cleared in `checking-for-update` and `update-downloaded`.
+      lastErrorMessage = message;
+      lastErrorCategory = category;
       broadcastSquirrelStatus({
         kind: 'error',
         currentVersion: app.getVersion(),
@@ -302,6 +313,12 @@ function attachSquirrelProgressForwarders(): void {
         updateDownloaded = true;
         downloadInFlight = false;
         downloadStartedAt = undefined;
+        // v0.1.64 — successful download clears the cached error so the
+        // MCP `update_download_status` tool stops flagging a previous
+        // failure. The renderer banner is independent and already handles
+        // this via the `ready-to-install` broadcast.
+        lastErrorMessage = undefined;
+        lastErrorCategory = undefined;
         broadcastSquirrelStatus({
           kind: 'ready-to-install',
           currentVersion: app.getVersion(),
@@ -336,6 +353,131 @@ export function rememberPendingDownloadVersion(version: string | undefined): voi
   if (typeof version === 'string' && version.length > 0) {
     pendingDownloadVersion = version;
   }
+}
+
+/**
+ * v0.1.64 — coarse-grained download-state machine, exported so the
+ * in-process HTTP MCP can answer `update_download_status` without
+ * re-implementing the bookkeeping.
+ *
+ *   - 'idle'              → no check / download / staged update in flight.
+ *                           Default at boot.
+ *   - 'checking'          → Squirrel is talking to update.electronjs.org
+ *                           but the new-version probe hasn't resolved yet.
+ *                           Set by the `checking-for-update` event listener.
+ *   - 'downloading'       → Squirrel has confirmed there's a newer bundle
+ *                           and the zip is being pulled from GH releases.
+ *                           Set by `update-available` / `download-progress`.
+ *   - 'ready-to-install'  → Squirrel staged the bundle into ShipIt's
+ *                           working dir; calling `quitAndInstall` from
+ *                           here will swap the bundle and relaunch.
+ *   - 'error'             → Squirrel emitted an `error` event. The last
+ *                           error message is preserved on `lastErrorMessage`.
+ *
+ * This is a derived view of the existing module-level flags
+ * (`downloadInFlight`, `updateDownloaded`, etc.) rather than a separate
+ * state machine, so there is exactly one source of truth — the existing
+ * IPC broadcast path. Reading is O(1).
+ */
+export type UpdateDownloadState =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'ready-to-install'
+  | 'error';
+
+/**
+ * Last error message Squirrel surfaced. Reset to undefined the next time
+ * the autoUpdater enters `checking-for-update` (so subsequent successful
+ * runs don't keep showing a stale error). The MCP `update_download_status`
+ * tool exposes this so an agent can see why a previous download bailed
+ * without scraping the log file.
+ */
+let lastErrorMessage: string | undefined;
+let lastErrorCategory: 'signature-mismatch' | 'network' | 'staging' | 'unknown' | undefined;
+
+/**
+ * v0.1.64 — read the current Squirrel download state. Pure read; never
+ * touches any side effect. Designed for the MCP `update_download_status`
+ * tool but suitable for any in-process consumer (e.g. an About-window
+ * status line, future tray badge).
+ */
+export function getDownloadState(): {
+  state: UpdateDownloadState;
+  pendingVersion: string | undefined;
+  downloadStartedAt: number | undefined;
+  lastErrorMessage: string | undefined;
+  lastErrorCategory: typeof lastErrorCategory;
+} {
+  // Resolve to the most specific terminal state first. Order matters:
+  // `updateDownloaded` wins over `downloadInFlight` (Squirrel can briefly
+  // show both true between `update-downloaded` and the next state push,
+  // though our event handlers clear `downloadInFlight` immediately).
+  let state: UpdateDownloadState;
+  if (lastErrorMessage) {
+    state = 'error';
+  } else if (updateDownloaded) {
+    state = 'ready-to-install';
+  } else if (downloadInFlight) {
+    // `downloadInFlight` is set on both `checking-for-update` AND
+    // `update-available` / first `download-progress`. We can't easily
+    // distinguish the two without adding a second flag — for now anything
+    // in-flight surfaces as `downloading` since that's the user-actionable
+    // state (the difference between "Squirrel is talking to GH" and
+    // "Squirrel is pulling bytes" is invisible at the MCP layer). A
+    // future enhancement could split this if the renderer banner needs it.
+    state = 'downloading';
+  } else {
+    state = 'idle';
+  }
+  return {
+    state,
+    pendingVersion: pendingDownloadVersion,
+    downloadStartedAt,
+    lastErrorMessage,
+    lastErrorCategory,
+  };
+}
+
+/**
+ * v0.1.64 — exposed for the MCP `update_install_now` tool. Same guard
+ * semantics as `quitAndInstallStagedUpdate` (refuses if no update staged)
+ * but reachable as a named export from outside the IPC handler.
+ *
+ * This is just an alias — kept for naming clarity at the MCP boundary
+ * (`updateInstallNow()` reads more naturally than reusing the rendererfacing
+ * `quitAndInstallStagedUpdate`).
+ */
+export function triggerInstallNow(): { ok: boolean; reason?: string } {
+  return quitAndInstallStagedUpdate();
+}
+
+/**
+ * v0.1.64 — return a defensive snapshot of internal updater bookkeeping
+ * for unit tests. Not part of the MCP surface; exported so the
+ * Vitest suite can assert state transitions without spying on module
+ * internals.
+ */
+export function _getUpdaterInternalsForTest(): {
+  configured: boolean;
+  feedURLReady: boolean;
+  checkInFlight: boolean;
+  updateDownloaded: boolean;
+  downloadInFlight: boolean;
+  downloadStartedAt: number | undefined;
+  pendingDownloadVersion: string | undefined;
+  lastErrorMessage: string | undefined;
+} {
+  return {
+    configured,
+    feedURLReady,
+    checkInFlight,
+    updateDownloaded,
+    downloadInFlight,
+    downloadStartedAt,
+    pendingDownloadVersion,
+    lastErrorMessage,
+  };
 }
 
 /**
@@ -556,6 +698,9 @@ export function triggerSquirrelDownload(): StartDownloadResult {
     // then sit there forever after the synchronous throw.
     try {
       const message = String((err as Error)?.message ?? err);
+      // v0.1.64 — persist error to module state for the MCP status tool.
+      lastErrorMessage = message;
+      lastErrorCategory = categoriseUpdaterError(err);
       broadcastSquirrelStatus({
         kind: 'error',
         currentVersion: app.getVersion(),

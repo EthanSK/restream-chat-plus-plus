@@ -31,6 +31,12 @@ import { IPC, type Settings } from '../shared/types';
 import type { Store } from './store';
 import type { ChatClient } from './ws-client';
 import type { OAuthCoordinator } from './oauth';
+// v0.1.64 — wire the updater state machine into the MCP bridge so the
+// four new update-orchestration tools (update_check_now,
+// update_download_status, update_install_now, update_logs_tail) can read
+// + drive auto-update without scraping the renderer broadcast.
+import { getDownloadState, triggerInstallNow } from './updater';
+import { getLastUpdateInfo } from './github-update-check';
 
 export interface McpServerDeps {
   /** Reads + writes the LIVE Settings (the same path the renderer IPC uses). */
@@ -124,10 +130,18 @@ export async function startInProcessMcpServer(
     getRuntimeStatus: () => ({
       connectionStatus: deps.chat.getState(),
       connections: deps.chat.getConnections(),
-      // `latestUpdateInfo` + `voices` would need an extra round-trip via
-      // `executeJavaScript` (voices live in the renderer); leave null
-      // for now so we don't block on that.
-      latestUpdateInfo: null,
+      // v0.1.64 — wire latestUpdateInfo through the GH-Releases poller's
+      // last cached broadcast. Pre-v0.1.64 this returned `null`, which
+      // hid the (resolved!) v0.1.62→v0.1.63 update from any agent
+      // querying `get_status` over MCP — exactly the diagnostic gap
+      // surfaced by Ethan voice 3869 ("There should be MCP to update
+      // it. You should be able to update it over MCP properly and see
+      // it through."). `getLastUpdateInfo()` returns undefined if no
+      // check has ever completed; we coalesce to `null` for stable wire
+      // shape.
+      latestUpdateInfo: getLastUpdateInfo() ?? null,
+      // `voices` still requires renderer introspection (Web Speech API
+      // lives there); leave null until a future loopback IPC ships.
       voices: null,
     }),
     clearChat: () => {
@@ -139,6 +153,14 @@ export async function startInProcessMcpServer(
       }
     },
     checkForUpdatesNow: () => deps.checkForUpdatesNow(),
+    // v0.1.64 — expose Squirrel's coarse download-state machine + the
+    // last cached GH-Releases UpdateInfo + the install trigger so the
+    // four new update-orchestration tools can drive a complete update
+    // flow without IPC round-trips through the renderer. See
+    // `src/main/updater.ts:getDownloadState` for state semantics.
+    getUpdateDownloadState: () => getDownloadState(),
+    triggerInstallNow: () => triggerInstallNow(),
+    getLastUpdateInfo: () => getLastUpdateInfo(),
   };
 
   const ctx: ToolContext = {

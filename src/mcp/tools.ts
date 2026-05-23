@@ -129,6 +129,50 @@ export interface LiveSettingsBridge {
    * returns the legacy hint payload.
    */
   checkForUpdatesNow?: () => Promise<unknown>;
+  /**
+   * v0.1.64 — read the current Squirrel download state machine without
+   * relying on side-channel renderer broadcasts. Returns the same shape
+   * `getDownloadState()` does in `src/main/updater.ts`.
+   *
+   * Used by the MCP `update_download_status` tool so an external agent
+   * can poll while a download is in flight (e.g. wait until the bundle
+   * is staged then call `update_install_now`). Optional so the tool
+   * keeps working under the legacy `--mcp-stdio` path (returns the
+   * standard "GUI not introspectable" hint).
+   */
+  getUpdateDownloadState?: () => {
+    state: 'idle' | 'checking' | 'downloading' | 'ready-to-install' | 'error';
+    pendingVersion: string | undefined;
+    downloadStartedAt: number | undefined;
+    lastErrorMessage: string | undefined;
+    lastErrorCategory:
+      | 'signature-mismatch'
+      | 'network'
+      | 'staging'
+      | 'unknown'
+      | undefined;
+  };
+  /**
+   * v0.1.64 — programmatic equivalent of clicking the renderer
+   * UpdateBanner's "Restart to install" button. Returns the same shape
+   * `quitAndInstallStagedUpdate` does (`{ ok, reason }`). Refuses if
+   * no update has been staged — the caller is expected to poll
+   * `getUpdateDownloadState()` until `state === 'ready-to-install'`
+   * before invoking this.
+   *
+   * SAFETY: this will close the app and re-launch the new bundle —
+   * any unsaved renderer state will be lost. Voice 3869 (2026-05-23)
+   * authorised this; the agent decides when to install.
+   */
+  triggerInstallNow?: () => { ok: boolean; reason?: string };
+  /**
+   * v0.1.64 — return the last GH-Releases poller result. Same payload
+   * shape as the IPC `UPDATE_STATUS` push (the renderer's `UpdateInfo`).
+   * Used by the MCP `update_check_now` companion when an agent wants
+   * the CACHED (most recent) check result without forcing a fresh
+   * network round-trip.
+   */
+  getLastUpdateInfo?: () => unknown;
 }
 
 export interface ToolContext {
@@ -796,6 +840,285 @@ const signOut: ToolDefinition = {
 };
 
 // ---------------------------------------------------------------------------
+// v0.1.64 — update orchestration tools.
+// ---------------------------------------------------------------------------
+//
+// Ethan voice 3869 (2026-05-23): "There should be MCP to update it. You
+// should be able to update it over MCP properly and see it through."
+//
+// These four tools form a complete end-to-end update flow that an agent
+// can drive without touching the UI:
+//
+//   1. `update_check_now`        → force a GH-Releases poll; returns
+//                                  the resulting UpdateInfo so the agent
+//                                  knows if there's a newer version
+//                                  (kind === 'available') or not
+//                                  (kind === 'up-to-date').
+//   2. `update_download_status`  → coarse-grained download-state machine
+//                                  (idle / checking / downloading /
+//                                  ready-to-install / error) + version +
+//                                  elapsed time + last error if any.
+//                                  Poll this while a download is in
+//                                  flight.
+//   3. `update_install_now`      → install + relaunch when the state
+//                                  reaches 'ready-to-install'. Refuses
+//                                  if no bundle is staged. SAFETY: this
+//                                  WILL close the app and restart — any
+//                                  unsaved renderer state is lost.
+//   4. `update_logs_tail`        → return the last N lines of main.log
+//                                  filtered to updater events so the
+//                                  agent can investigate a stuck or
+//                                  failed download without leaving the
+//                                  MCP surface.
+//
+// All four are HTTP-MCP-only — they REQUIRE the in-process bridge
+// (`ctx.live`). The legacy `--mcp-stdio` path returns the standard
+// `guiNotIntrospectable` hint because file-only access can't reach the
+// running autoUpdater. v0.1.36+ ships with the HTTP MCP enabled by
+// default so this is not a regression for any deployed user.
+
+const updateCheckNowV2: ToolDefinition = {
+  name: 'update_check_now',
+  description:
+    'v0.1.64 — Force an immediate GitHub-Releases update check, bypassing ' +
+    'the autoCheck setting. Returns the full UpdateInfo payload (kind, ' +
+    'currentVersion, latestVersion, releaseUrl, error if any) so the agent ' +
+    'can decide whether to proceed to download. Companion to ' +
+    '`update_download_status`, `update_install_now`, and `update_logs_tail`. ' +
+    'This is the v0.1.64 replacement for `check_for_updates_now`; the older ' +
+    'tool stays for backwards compatibility but new agents should call this one.',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  handler: async (_args, ctx) => {
+    // The v0.1.64 tool surface deliberately mirrors the v0.1.36 one for
+    // backwards compatibility; we just route through the live bridge if
+    // available so the response shape matches the renderer's UpdateInfo.
+    if (ctx.live?.checkForUpdatesNow) {
+      const info = await ctx.live.checkForUpdatesNow();
+      const last = ctx.live.getLastUpdateInfo?.();
+      // Surface BOTH the fresh check result AND the last cached result.
+      // In practice they should be identical (the GH poller broadcasts on
+      // every check) but exposing them separately helps the agent debug
+      // a "I forced a check but state didn't change" scenario.
+      return { ok: true, updateInfo: info, lastBroadcast: last };
+    }
+    return {
+      ok: false,
+      guiNotIntrospectable: true,
+      hint:
+        'update_check_now requires the in-process HTTP MCP transport ' +
+        '(v0.1.36+). The legacy --mcp-stdio path cannot reach the running ' +
+        "autoUpdater. Open the Restream Chat++ GUI and try again.",
+    };
+  },
+};
+
+const updateDownloadStatus: ToolDefinition = {
+  name: 'update_download_status',
+  description:
+    "v0.1.64 — Return the current Squirrel auto-update download state " +
+    'machine. States: idle, checking, downloading, ready-to-install, error. ' +
+    'Includes pendingVersion (the tag being downloaded), downloadStartedAt ' +
+    '(epoch ms), elapsedSeconds (derived), lastErrorMessage, and ' +
+    'lastErrorCategory (signature-mismatch / network / staging / unknown). ' +
+    "Poll this in a loop while you've kicked a download via " +
+    '`update_check_now` until state==="ready-to-install", then call ' +
+    '`update_install_now`. Stable shape — safe for agent state machines.',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  handler: async (_args, ctx) => {
+    if (!ctx.live?.getUpdateDownloadState) {
+      return {
+        ok: false,
+        guiNotIntrospectable: true,
+        hint:
+          'update_download_status requires the in-process HTTP MCP transport ' +
+          '(v0.1.36+). Open the Restream Chat++ GUI and try again.',
+      };
+    }
+    const snap = ctx.live.getUpdateDownloadState();
+    // Derive elapsed time on the server side so the agent doesn't have to
+    // compute it (and so a network round-trip delay between snapshot capture
+    // and agent receipt doesn't skew its calculation).
+    const elapsedSeconds =
+      typeof snap.downloadStartedAt === 'number'
+        ? Math.max(0, Math.floor((Date.now() - snap.downloadStartedAt) / 1000))
+        : null;
+    // Also surface the LAST UpdateInfo broadcast (kind / latestVersion /
+    // download bytes / etc.) so a single MCP call gives the agent every
+    // piece of state it might need without a follow-up call. The
+    // UpdateInfo payload is the same shape the renderer sees; we route
+    // through `getLastUpdateInfo` so we don't fabricate fields.
+    const lastInfo = ctx.live.getLastUpdateInfo?.() ?? null;
+    return {
+      ok: true,
+      state: snap.state,
+      pendingVersion: snap.pendingVersion ?? null,
+      downloadStartedAt: snap.downloadStartedAt ?? null,
+      elapsedSeconds,
+      lastErrorMessage: snap.lastErrorMessage ?? null,
+      lastErrorCategory: snap.lastErrorCategory ?? null,
+      lastUpdateInfo: lastInfo,
+    };
+  },
+};
+
+const updateInstallNow: ToolDefinition = {
+  name: 'update_install_now',
+  description:
+    "v0.1.64 — Trigger the staged update install + relaunch. Equivalent to " +
+    "clicking the renderer 'Restart to install' button. SAFETY: this WILL " +
+    'close the app and restart — any unsaved renderer state is lost. ' +
+    "Refuses with reason='no-update-downloaded' if no bundle is staged; " +
+    'always call `update_download_status` first and verify ' +
+    'state==="ready-to-install" before invoking this. ' +
+    'Voice 3869 (2026-05-23) authorised the agent to drive update flow ' +
+    'end-to-end.',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  handler: async (_args, ctx) => {
+    if (!ctx.live?.triggerInstallNow) {
+      return {
+        ok: false,
+        guiNotIntrospectable: true,
+        hint:
+          'update_install_now requires the in-process HTTP MCP transport ' +
+          '(v0.1.36+). Open the Restream Chat++ GUI and try again.',
+      };
+    }
+    // `triggerInstallNow` schedules `autoUpdater.quitAndInstall()` on the
+    // next tick so the JSON-RPC response can land BEFORE the app starts
+    // tearing down (we copied this from the renderer Restart flow, which
+    // had the same race in v0.1.40). The shape matches
+    // `quitAndInstallStagedUpdate`.
+    const result = ctx.live.triggerInstallNow();
+    return result;
+  },
+};
+
+const updateLogsTail: ToolDefinition = {
+  name: 'update_logs_tail',
+  description:
+    'v0.1.64 — Return the last N lines of main.log filtered to updater ' +
+    "events ([updater], [updater-gh], Squirrel, download-progress, " +
+    'update-downloaded, signature, error). Lets an agent investigate why ' +
+    'a download stalled or failed without leaving the MCP surface. ' +
+    "Default `lines`=200, max=2000. Returns the matched lines as a single " +
+    'string (newline-joined) plus the absolute path of the log file so the ' +
+    "agent can reveal it manually if needed. macOS: ~/Library/Logs/" +
+    'Restream Chat++/main.log',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      lines: {
+        type: 'number',
+        description: 'Number of trailing lines to return after filtering (default 200, max 2000).',
+        minimum: 1,
+        maximum: 2000,
+      },
+    },
+    additionalProperties: false,
+  },
+  handler: async (args, ctx) => {
+    // Resolve the log file path. electron-log defaults to
+    // `${app.getPath('logs')}/main.log` — same as `safe.tail` in the Reveal
+    // Logs menu item. We use the live-bridge accessor if available, falling
+    // back to a best-effort guess so the test path (no Electron) still
+    // returns a useful answer.
+    const lines = typeof args.lines === 'number' ? Math.floor(args.lines) : 200;
+    const max = Math.max(1, Math.min(lines, 2000));
+    const candidates = resolveLogPathCandidates();
+    let resolvedPath: string | null = null;
+    let raw = '';
+    for (const c of candidates) {
+      try {
+        raw = fs.readFileSync(c, 'utf8');
+        resolvedPath = c;
+        break;
+      } catch {
+        // Try the next candidate.
+      }
+    }
+    if (resolvedPath === null) {
+      return {
+        ok: false,
+        hint:
+          'main.log not found at any of the standard electron-log paths. ' +
+          'On macOS the file should be at ~/Library/Logs/Restream Chat++/main.log. ' +
+          'Has the app ever been run? Try opening Restream Chat++ once.',
+        triedPaths: candidates,
+      };
+    }
+    // Filter to updater-relevant lines. We use a coarse OR over the names
+    // updater.ts + github-update-check.ts + Squirrel emit. This is the same
+    // pattern Ethan used manually when grepping the log (see the diagnosis
+    // session 2026-05-23).
+    const allLines = raw.split('\n');
+    const filterRe =
+      /\[updater\]|\[updater-gh\]|update-downloaded|update-not-available|update-available|download-progress|download-started|download stalled|Squirrel|ShipIt|code signature|quitAndInstall|checkForUpdates|autoUpdater/i;
+    const matched: string[] = [];
+    for (const ln of allLines) {
+      if (filterRe.test(ln)) matched.push(ln);
+    }
+    const tail = matched.slice(-max);
+    return {
+      ok: true,
+      logPath: resolvedPath,
+      lineCount: tail.length,
+      totalLogLines: allLines.length,
+      totalMatchedLines: matched.length,
+      lines: tail.join('\n'),
+    };
+  },
+};
+
+/**
+ * v0.1.64 helper for `update_logs_tail` — return an ordered list of likely
+ * main.log paths. We can't `import { app } from 'electron'` at module top
+ * (Vitest under plain Node has no electron module), so we resolve lazily
+ * and tolerate misses.
+ */
+function resolveLogPathCandidates(): string[] {
+  const candidates: string[] = [];
+  // 1. Electron's `app.getPath('logs')` — the canonical path, available
+  //    when running inside the packaged Electron process.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const electron = require('electron') as {
+      app?: { getPath?: (key: string) => string };
+    };
+    const dir = electron?.app?.getPath?.('logs');
+    if (typeof dir === 'string' && dir.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const path = require('node:path') as typeof import('node:path');
+      candidates.push(path.join(dir, 'main.log'));
+    }
+  } catch {
+    // not running under electron — fall through to platform defaults.
+  }
+  // 2. Platform-specific fallbacks. Mirrors electron-log defaults so
+  //    the tool still works under unit tests.
+  if (process.platform === 'darwin') {
+    const home = process.env.HOME ?? '';
+    if (home) {
+      // Use the productName from package.json — `Restream Chat++` (the
+      // npm name is `restream-chat-plus-plus`; productName is what
+      // electron-log uses for the directory).
+      candidates.push(`${home}/Library/Logs/Restream Chat++/main.log`);
+      candidates.push(`${home}/Library/Logs/Restream Chat Plus Plus/main.log`);
+    }
+  } else if (process.platform === 'linux') {
+    const home = process.env.HOME ?? '';
+    if (home) {
+      candidates.push(`${home}/.config/Restream Chat++/logs/main.log`);
+    }
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA ?? '';
+    if (appData) {
+      candidates.push(`${appData}\\Restream Chat++\\logs\\main.log`);
+    }
+  }
+  return candidates;
+}
+
+// ---------------------------------------------------------------------------
 // Tool registry — single source of truth used by the dispatcher.
 // ---------------------------------------------------------------------------
 
@@ -821,6 +1144,12 @@ export const TOOLS: ToolDefinition[] = [
   clearChat,
   checkForUpdatesNow,
   signOut,
+  // v0.1.64 update-orchestration tools. Listed AFTER the legacy
+  // `checkForUpdatesNow` to keep the order stable for snapshot tests.
+  updateCheckNowV2,
+  updateDownloadStatus,
+  updateInstallNow,
+  updateLogsTail,
 ];
 
 /**

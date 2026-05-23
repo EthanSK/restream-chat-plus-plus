@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.1.64 — MCP-driven update orchestration + download-state diagnostics
+
+Ethan voice 3869 (2026-05-23): "There should be MCP to update it. You
+should be able to update it over MCP properly and see it through."
+
+### What's new
+
+Four new MCP tools let an agent drive the auto-update flow end-to-end
+without touching the UI:
+
+- `update_check_now` — force a GH-Releases poll; returns the resulting
+  UpdateInfo so the agent knows if a newer version exists.
+- `update_download_status` — coarse download-state machine
+  (`idle` / `checking` / `downloading` / `ready-to-install` / `error`)
+  plus pending version, elapsed time, last error message, and last error
+  category (`signature-mismatch` / `network` / `staging` / `unknown`).
+- `update_install_now` — programmatic equivalent of clicking the
+  renderer's "Restart to install" button. Refuses unless a bundle is
+  staged.
+- `update_logs_tail` — return the last N lines of `main.log` filtered to
+  updater-relevant events. Lets an agent diagnose a stuck download
+  without leaving the MCP surface.
+
+### Phase 1 diagnosis (why v0.1.62 → v0.1.63 felt stuck)
+
+The download actually succeeded at 17:08:56 — `[updater] update
+downloaded, ready to install { releaseName: 'Restream Chat++ v0.1.63' }`
+fired and the renderer was sent `kind: 'ready-to-install'`. But:
+
+- The MCP `get_status` tool hardcoded `latestUpdateInfo: null`, so any
+  agent querying state from outside the UI couldn't see that the bundle
+  was staged. Fixed in v0.1.64 — the bridge now reads
+  `getLastUpdateInfo()` from the GH poller.
+- The hourly poll at 18:08 then re-kicked Squirrel which fired
+  `update-not-available` (no newer release exists), causing internal
+  state to ping-pong and giving the impression "the download was reset"
+  even though the staged bundle was still on disk.
+
+### Internal changes
+
+- `src/main/updater.ts` — new `getDownloadState()` accessor + persisted
+  `lastErrorMessage` / `lastErrorCategory` cleared on
+  `checking-for-update` and `update-downloaded`, set on `error` and
+  `triggerSquirrelDownload` synchronous throws.
+- `src/main/mcp-server.ts` — bridge wires `latestUpdateInfo` (was `null`),
+  `getUpdateDownloadState`, `triggerInstallNow`, `getLastUpdateInfo` into
+  the `LiveSettingsBridge`.
+- `src/mcp/tools.ts` — four new tools registered after the legacy
+  `check_for_updates_now` (kept for backwards compatibility).
+
+### Tests
+
+- New `src/__tests__/mcp-update-tools.test.ts` — covers all four tools
+  via the in-process bridge: idle state, downloading state, ready state,
+  error state, install-when-not-staged refusal, log-tail filtering.
+
 ## v0.1.63 — startup cookie repair + stuck-send guard
 
 Fixes the "send is broken after auto-update" bug that v0.1.62 only partly addressed.
