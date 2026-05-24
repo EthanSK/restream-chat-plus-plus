@@ -21,6 +21,17 @@ import {
 } from './chat-send';
 import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
 import { resumeAuthWithCookieRepair } from './startup-auth-resume';
+// v0.1.69 (voice 4015) — shared structured error log + the 7-day jsonl
+// prune step. `appendErrorLog` mirrors many of the existing console.error
+// sites into app-errors.jsonl; `pruneJsonlLogs` is run at startup and
+// every 24 h to keep the logs dir under the 7-day retention budget Ethan
+// explicitly asked for ("gets rid of the old ones after, like, a week").
+import {
+  appendErrorLog,
+  errorToString,
+  pruneJsonlLogs,
+  PRUNE_INTERVAL_MS,
+} from './structured-log';
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
@@ -747,9 +758,31 @@ app.on('ready', async () => {
               ' cookieCount=' +
               cookieState.cookieCount,
           );
+          // v0.1.69 (voice 4015): cookie repair returning ok=false after
+          // a fresh sign-in is the v0.1.62 split-auth signature in the
+          // making — record so we can spot post-Sparkle-update users who
+          // still need a manual cookie repair.
+          appendErrorLog({
+            subsystem: 'main',
+            phase: 'main.post-auth-cookie-not-ok',
+            errorMessage: `cookie repair after auth ok=false reason=${cookieState.reason}`,
+            context: {
+              reason: cookieState.reason,
+              cookieCount: cookieState.cookieCount,
+              hasXsrf: cookieState.hasXsrf,
+            },
+          });
         }
       } catch (cookieErr) {
         console.error('[main] ensureRestreamChatCookies threw', cookieErr);
+        // v0.1.69 (voice 4015): a thrown cookie-repair is rarer than a
+        // non-ok one but worth flagging — the user is "signed in" per
+        // OAuth but no send will work until they restart.
+        appendErrorLog({
+          subsystem: 'main',
+          phase: 'main.post-auth-cookie-threw',
+          errorMessage: errorToString(cookieErr),
+        });
       }
       chat.setToken(tok.accessToken);
       chat.start();
@@ -1550,6 +1583,15 @@ app.on('ready', async () => {
       return result;
     } catch (err) {
       console.error('[main] sendChatText failed', err);
+      // v0.1.69 (voice 4015): top-level handler catch. sendChatText is
+      // supposed to catch everything internally; if we end up here it's
+      // a genuine programming bug (or an OOM mid-await) and needs to be
+      // visible without DevTools open. Render-side sees `error` reason.
+      appendErrorLog({
+        subsystem: 'main',
+        phase: 'main.send-chat-text-handler-threw',
+        errorMessage: errorToString(err),
+      });
       return {
         ok: false,
         reason: 'error',
@@ -1636,6 +1678,20 @@ app.on('ready', async () => {
       sendQueue.enqueue({ clientId: payload.clientId, text });
     } catch (err) {
       console.error('[main] CHAT_SEND_ENQUEUE handler failed', err);
+      // v0.1.69 (voice 4015): IPC handler crash — the enqueue never made
+      // it to the queue. Renderer optimistically rendered a placeholder
+      // that will now sit forever. Best-effort failed-status below
+      // surfaces a ⚠, but the structured row tells us WHY (typically a
+      // bad payload shape from a renderer regression).
+      appendErrorLog({
+        subsystem: 'main',
+        phase: 'main.chat-send-enqueue-handler-failed',
+        errorMessage: errorToString(err),
+        context: {
+          clientId: payload?.clientId,
+          hasText: typeof payload?.text === 'string',
+        },
+      });
       // Best-effort: surface the failure as a failed status so the
       // renderer's ⚠ icon shows up rather than the message sitting in
       // "sending…" forever.
@@ -1671,6 +1727,13 @@ app.on('ready', async () => {
       appendChatSendLog(rec as unknown as ChatSendLogRecord);
     } catch (err) {
       console.error('[main] CHAT_SEND_LOG_EVENT handler failed', err);
+      // v0.1.69 (voice 4015): renderer-relayed log row was malformed.
+      // Worth knowing about but does NOT affect user-visible behavior.
+      appendErrorLog({
+        subsystem: 'main',
+        phase: 'main.chat-send-log-event-handler-failed',
+        errorMessage: errorToString(err),
+      });
     }
   });
 
@@ -1724,9 +1787,25 @@ app.on('ready', async () => {
       );
     } else {
       console.warn('[main] MCP HTTP server did not start (see prior log lines)');
+      // v0.1.69 (voice 4015): MCP server failed to bind. Some users
+      // rely on the MCP path (Claude Code clients reading/writing
+      // settings). The app keeps booting but those clients silently
+      // can't connect — worth surfacing.
+      appendErrorLog({
+        subsystem: 'mcp',
+        phase: 'mcp.startup-no-server',
+        errorMessage: 'MCP HTTP server did not start (port bind / userData lookup failure)',
+      });
     }
   } catch (err) {
     console.error('[main] MCP HTTP server start threw — continuing without MCP', err);
+    // v0.1.69 (voice 4015): MCP startup threw — explicit row so a
+    // chronic startup failure on a particular machine is grep-able.
+    appendErrorLog({
+      subsystem: 'mcp',
+      phase: 'mcp.startup-threw',
+      errorMessage: errorToString(err),
+    });
   }
 
   // Resume session if a valid token already exists.
@@ -1789,6 +1868,86 @@ app.on('ready', async () => {
   // immediately so Electron finishes window construction and the user
   // sees a UI even if Keychain decides to prompt.
   void resumeAuth();
+
+  // ----- v0.1.69 (voice 4015): 7-day jsonl log retention rotation -----
+  //
+  // Schedule the prune step ~5 seconds AFTER the window is shown so we
+  // don't compete with the boot critical path (Keychain decrypt, OAuth
+  // refresh, WS handshake, MCP server bind, GH update poll). Once that
+  // initial sweep settles, fire every 24 h via setInterval so a long-
+  // running session (Ethan streams for hours) also prunes — otherwise
+  // a multi-day uptime would accumulate logs past the 7-day window.
+  //
+  // Wrapped in try/catch: a prune failure must NEVER kill the app. Errors
+  // from the pruner itself are surfaced inside the jsonl (`log-prune.*`
+  // phases in app-errors.jsonl), so even prune-of-prune-errors is
+  // observable from disk.
+  //
+  // Why setTimeout-then-setInterval instead of just setInterval(0): boot
+  // already has enough fs IO competing for the disk; the 5s defer lets
+  // the user see chat messages before any log-rewrite IO kicks in.
+  setTimeout(() => {
+    void pruneJsonlLogs().catch((err) => {
+      console.error('[main] initial log prune failed', err);
+      appendErrorLog({
+        subsystem: 'log-prune',
+        phase: 'log-prune.initial-tick-threw',
+        errorMessage: errorToString(err),
+      });
+    });
+  }, 5_000);
+  const pruneInterval = setInterval(() => {
+    void pruneJsonlLogs().catch((err) => {
+      console.error('[main] periodic log prune failed', err);
+      appendErrorLog({
+        subsystem: 'log-prune',
+        phase: 'log-prune.periodic-tick-threw',
+        errorMessage: errorToString(err),
+      });
+    });
+  }, PRUNE_INTERVAL_MS);
+  // Clear on quit so the timer doesn't keep the event loop alive past
+  // shutdown (Node would otherwise wait the full 24 h before exiting).
+  app.on('before-quit', () => {
+    clearInterval(pruneInterval);
+  });
+});
+
+// ----- v0.1.69 (voice 4015): catch-all process-level error listeners -----
+//
+// Pre-v0.1.69 any unhandled promise rejection or synchronous throw
+// outside an Electron IPC handler vanished into Node's default warning
+// stream. With these listeners installed every such event becomes a row
+// in app-errors.jsonl so post-mortem can see "the renderer just stopped
+// receiving messages — was there an uncaught exception on the main
+// thread?".
+//
+// We deliberately do NOT call process.exit on either listener — Electron
+// already has its own crash handling, and aborting the process would
+// turn a recoverable async glitch into a hard quit the user has to
+// restart from. The structured row is the value here, not a behavior
+// change.
+process.on('unhandledRejection', (reason) => {
+  try {
+    appendErrorLog({
+      subsystem: 'main',
+      phase: 'main.unhandled-rejection',
+      errorMessage: errorToString(reason),
+    });
+  } catch {
+    // logging must never escalate a process-wide event
+  }
+});
+process.on('uncaughtException', (err) => {
+  try {
+    appendErrorLog({
+      subsystem: 'main',
+      phase: 'main.uncaught-exception',
+      errorMessage: errorToString(err),
+    });
+  } catch {
+    // see above
+  }
 });
 
 app.on('window-all-closed', () => {

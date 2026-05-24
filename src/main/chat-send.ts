@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { ChatConnection, SendTextResult } from '../shared/types';
+// v0.1.69 (voice 4015) — bridge cookie-read failures (previously
+// console.error only) into the shared app-errors.jsonl so the cookie
+// jar state is auditable from disk. Use lazy `require` for parity with
+// the existing `getElectron()` pattern — `structured-log.ts` is
+// VITEST-aware and self-no-ops outside Electron.
+import { appendErrorLog, errorToString } from './structured-log';
 
 // `electron` is resolved lazily so this module can be unit-tested under a
 // plain Node vitest environment. The runtime types are aliased to `any` to
@@ -136,6 +142,16 @@ async function readRestreamCookies(
     cookies = await sess.cookies.get({ domain: RESTREAM_DOMAIN });
   } catch (err) {
     console.error('[chat-send] cookie read failed', err);
+    // v0.1.69 (voice 4015): Electron session.cookies.get rarely throws,
+    // but when it does we hit `no-session-cookies` downstream with no
+    // signal as to why. Structured row pins the underlying error so
+    // post-mortem can distinguish "cookie partition missing" from
+    // "cookie read syscall threw".
+    appendErrorLog({
+      subsystem: 'chat-send',
+      phase: 'chat-send.cookie-read-failed',
+      errorMessage: errorToString(err),
+    });
     return undefined;
   }
   if (!cookies || cookies.length === 0) return undefined;

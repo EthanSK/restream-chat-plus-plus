@@ -1,4 +1,10 @@
 import { execFileSync } from 'node:child_process';
+// v0.1.69 (voice 4015) — surface Keychain read failures into the shared
+// error log. Pre-v0.1.69 every Keychain call had a bare `catch {} return
+// undefined` that disappeared silently if the user's Keychain was locked
+// or the entry didn't exist — leading to confusing "Missing Restream
+// credentials" errors with no signal as to why.
+import { appendErrorLog, errorToString } from './structured-log';
 
 // Read Restream OAuth credentials from macOS Keychain or env vars.
 // Never commit these. .env.example documents the layout.
@@ -30,7 +36,18 @@ function keychain(service: string, field: '-w' | '-g'): string | undefined {
       const m = out.match(/"acct"<blob>="([^"]+)"/);
       return m?.[1];
     }
-  } catch {
+  } catch (err) {
+    // v0.1.69 (voice 4015): emit a structured row so we know WHICH
+    // Keychain call failed. The exit code from `security` is the
+    // standard signal (44 = item not found, 51 = authentication
+    // failure, etc.). Without this, the upstream "Missing Restream
+    // credentials" error in oauth.ts is unattributable.
+    appendErrorLog({
+      subsystem: 'credentials',
+      phase: 'credentials.keychain-read-failed',
+      errorMessage: errorToString(err),
+      context: { service, field },
+    });
     return undefined;
   }
 }
@@ -49,7 +66,14 @@ function keychainAccount(service: string): string | undefined {
     );
     const m = res.match(/"acct"<blob>="([^"]+)"/);
     return m?.[1];
-  } catch {
+  } catch (err) {
+    // v0.1.69 (voice 4015): mirror — see keychain() above.
+    appendErrorLog({
+      subsystem: 'credentials',
+      phase: 'credentials.keychain-account-read-failed',
+      errorMessage: errorToString(err),
+      context: { service },
+    });
     return undefined;
   }
 }

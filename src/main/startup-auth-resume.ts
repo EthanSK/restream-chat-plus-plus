@@ -3,6 +3,11 @@ import type {
   EnsureRestreamChatCookiesOptions,
   EnsureRestreamChatCookiesResult,
 } from './chat-send';
+// v0.1.69 (voice 4015) — surface startup-resume failures (refresh threw,
+// cookie repair non-ok, top-level catch) into app-errors.jsonl. Startup
+// failures are the most user-visible category — they're what produces
+// "I open the app and it's signed out for no reason".
+import { appendErrorLog, errorToString } from './structured-log';
 
 type StartupWindow = EnsureRestreamChatCookiesOptions['parentWindow'];
 
@@ -75,6 +80,13 @@ export async function resumeAuthWithCookieRepair(
     }
   } catch (err) {
     error('[main] startup auth resume failed', err);
+    // v0.1.69 (voice 4015): top-level startup catch. Any throw here
+    // means the user lands on the sign-in screen with no diagnostic.
+    appendErrorLog({
+      subsystem: 'main',
+      phase: 'main.startup-auth-resume-threw',
+      errorMessage: errorToString(err),
+    });
   } finally {
     // This finally is the startup latch for the renderer. Even if token
     // decrypt, refresh, WebSocket start, or cookie repair fails, the renderer
@@ -126,8 +138,30 @@ async function repairStartupChatCookies(
           ' cookieCount=' +
           cookieState.cookieCount,
       );
+      // v0.1.69 (voice 4015): startup cookie repair returning non-ok is
+      // exactly the v0.1.62 / v0.1.63 split-auth signature in disguise.
+      // Worth pinning to disk so post-mortem can spot users who restored
+      // OAuth at boot but still need a fresh cookie handshake.
+      appendErrorLog({
+        subsystem: 'main',
+        phase: 'main.startup-cookie-not-ok',
+        errorMessage: `startup cookie repair ok=false reason=${cookieState.reason}`,
+        context: {
+          reason: cookieState.reason,
+          cookieCount: cookieState.cookieCount,
+          hasXsrf: cookieState.hasXsrf,
+        },
+      });
     }
   } catch (cookieErr) {
     error('[main] ensureRestreamChatCookies during startup resume threw', cookieErr);
+    // v0.1.69 (voice 4015): startup cookie repair threw. Rare — the
+    // function catches everything internally — but if it does happen
+    // the user is OAuth-signed-in but can't send. Pin to disk.
+    appendErrorLog({
+      subsystem: 'main',
+      phase: 'main.startup-cookie-threw',
+      errorMessage: errorToString(cookieErr),
+    });
   }
 }

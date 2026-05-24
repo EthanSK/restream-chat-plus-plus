@@ -41,6 +41,10 @@ import log from 'electron-log/main';
 import { IPC, UpdateInfo } from '../shared/types';
 import { isNewerVersion } from '../shared/version';
 import { rememberPendingDownloadVersion } from './updater';
+// v0.1.69 (voice 4015) — structured error log for GH-Releases fetch
+// failures (network blip, 4xx from GH API, schema regression). These
+// previously landed in main.log only.
+import { appendErrorLog, errorToString } from './structured-log';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
 const RELEASES_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
@@ -180,6 +184,17 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
         checkedAt: now,
       };
       log.warn('[updater-gh] non-2xx response', res.status);
+      // v0.1.69 (voice 4015): every non-2xx GH response gets a structured
+      // row so we can see if the hourly poll is flapping (rate-limit, GH
+      // outage, network blip). Useful when correlating across multiple
+      // users' logs in support.
+      appendErrorLog({
+        subsystem: 'github-update',
+        phase: 'github-update.non-2xx',
+        errorMessage: `GitHub API returned HTTP ${res.status}`,
+        httpStatus: res.status,
+        context: { url: RELEASES_URL },
+      });
       broadcast(errInfo);
       return errInfo;
     }
@@ -204,6 +219,15 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
         checkedAt: now,
       };
       log.warn('[updater-gh] malformed GH payload');
+      // v0.1.69 (voice 4015): GH schema regression is a rare-but-real
+      // event (they change the API once a decade); structured row pins
+      // the date so we know which day to look at GH's changelog if
+      // every user's update banner breaks at once.
+      appendErrorLog({
+        subsystem: 'github-update',
+        phase: 'github-update.missing-tag-name',
+        errorMessage: 'GitHub API response missing tag_name',
+      });
       broadcast(malformed);
       return malformed;
     }
@@ -243,6 +267,14 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
   } catch (err) {
     const message = String((err as Error)?.message ?? err);
     log.error('[updater-gh] check failed', message);
+    // v0.1.69 (voice 4015): network / abort / DNS fail. The structured
+    // row contains the error message so post-mortem can see if a chronic
+    // user is being blocked by a corp firewall, or a flaky home WiFi.
+    appendErrorLog({
+      subsystem: 'github-update',
+      phase: 'github-update.fetch-threw',
+      errorMessage: message,
+    });
     const failed: UpdateInfo = {
       kind: 'error',
       currentVersion,

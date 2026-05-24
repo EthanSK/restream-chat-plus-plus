@@ -1,5 +1,107 @@
 # Changelog
 
+## v0.1.69 — exhaustive error-path logging + 7-day jsonl retention (voice 4015)
+
+Ethan voice 4015 (2026-05-24, ~17:06 BST):
+> The easiest solution is you add proper logging, then you can investigate
+> exactly what the problem was. It should have all the information needed to
+> debug and diagnose every type of error. And feel free to have a buffer so
+> it gets rid of the old ones after, like, a week or something.
+
+v0.1.69 sweeps every error-producing call site in the main process and
+makes sure each one lands a structured row on disk. Pre-v0.1.69 entire
+categories of failure (OAuth refresh, Keychain ACL drift, WebSocket frame
+parse errors, Squirrel update errors, IPC handler crashes, MCP startup,
+GH update poll) only landed in volatile `console.error` — they vanished
+the moment the app quit, which made remote post-mortem essentially
+impossible. Now every catch site mirrors into the shared `app-errors.jsonl`
+file alongside its existing console output, and a 7-day prune step keeps
+the logs dir under budget.
+
+### What's new
+
+- **`app-errors.jsonl` — single grep-able error log across every subsystem.**
+  Lives at `~/Library/Logs/Restream Chat Plus Plus/app-errors.jsonl` on
+  macOS. Every row is `{ ts, subsystem, phase, errorMessage, httpStatus?,
+  context? }`. Subsystem identifiers: `oauth`, `ws`, `chat-send`,
+  `chat-send-queue`, `main`, `updater`, `github-update`, `mcp`,
+  `credentials`, `log-prune`.
+- **7-day jsonl retention.** A prune step runs ~5s after window-shown +
+  every 24 h thereafter. Walks every `*.jsonl` file under the app logs
+  dir; drops lines whose `ts` is older than 7 days; atomic rewrite via
+  `<file>.tmp` + rename so a mid-prune crash can't leave a truncated
+  file. Files smaller than 100 KiB are skipped (no IO on tiny logs).
+  Pruner's own runs / failures land back in `app-errors.jsonl` under
+  the `log-prune` subsystem so the rotation itself is auditable.
+- **Catch-all `unhandledRejection` + `uncaughtException` listeners.** Any
+  async glitch or sync throw outside an IPC handler now lands as
+  `main.unhandled-rejection` / `main.uncaught-exception` rows instead of
+  vanishing into Node's default warning stream.
+- **New `src/main/structured-log.ts` module** with `appendErrorLog`,
+  `appendJsonl`, `errorToString`, `pruneJsonlLogs`, `resolveLogPath`
+  helpers. All fail-soft — logging must never break the parent flow.
+
+### Subsystem audit — error paths newly covered
+
+- **`oauth.ts`** — `deferred-decrypt-threw`, `safe-storage-encrypt-failed`,
+  `safe-storage-decrypt-failed`, `safe-storage-decrypt-timeout`,
+  `decrypt-unparseable`, `wipe-token-enc-failed`, `refresh-fatal` (4xx
+  invalid_grant → wipe), `refresh-transient` (5xx → keep), `refresh-fetch-threw`,
+  `exchange-code-failed`, `exchange-code-no-access-token`. The
+  refresh-fatal row is the single most important OAuth diagnostic — it
+  pins WHY a previously-signed-in user is suddenly looking at the sign-in
+  screen.
+- **`ws-client.ts`** — `connect-no-token`, `frame-parse-error`,
+  `abnormal-close` (codes !== 1000/1001), `socket-error`, `stale-inbound`
+  (heartbeat timeout). Existing `raw-frames.jsonl` rows are preserved
+  alongside.
+- **`chat-send.ts`** — `cookie-read-failed`. The existing chat-send.jsonl
+  `preflight` / `send` / `send-failed-final` rows already covered the
+  hot path.
+- **`chat-send-queue.ts`** — `run-send-threw`, `emit-pending-failed`,
+  `emit-sent-failed` (new — pre-v0.1.69 only the `failed` IPC emit was
+  logged), `emit-failed-failed`. Mirrors continue into chat-send.jsonl's
+  `status-emit-failed` row for backward compat.
+- **`updater.ts`** — `squirrel-error-event` (with category tag),
+  `check-for-updates-threw`, `quit-and-install-threw`, `configure-failed`.
+- **`github-update-check.ts`** — `non-2xx`, `missing-tag-name`,
+  `fetch-threw`.
+- **`main.ts`** — `post-auth-cookie-not-ok`, `post-auth-cookie-threw`,
+  `send-chat-text-handler-threw`, `chat-send-enqueue-handler-failed`,
+  `chat-send-log-event-handler-failed`, `unhandled-rejection`,
+  `uncaught-exception`.
+- **`startup-auth-resume.ts`** — `startup-auth-resume-threw`,
+  `startup-cookie-not-ok`, `startup-cookie-threw`.
+- **`credentials.ts`** — `keychain-read-failed`, `keychain-account-read-failed`.
+  Keychain failures were previously caught with bare `catch {} return
+  undefined`, so the upstream "Missing Restream credentials" error had
+  no signal as to why.
+
+### Internal changes
+
+- `src/main/structured-log.ts` — new module (~280 lines) with
+  fail-soft jsonl appender + 7-day pruner.
+- All affected files import `{ appendErrorLog, errorToString }` and emit
+  rows alongside their existing `console.error` / `electronLog.error` /
+  `log.warn` calls — backward-compatible (no existing log paths removed).
+- `main.ts` wires the prune timer (`setTimeout(5s)` initial + `setInterval(24h)`),
+  clears the interval on `before-quit` so Node can exit cleanly,
+  installs `process.on('unhandledRejection')` and `process.on('uncaughtException')`.
+
+### Tests
+
+- No existing tests should regress — every new appendErrorLog call is
+  additive alongside the existing console paths.
+- The structured-log module is VITEST-aware: `tryGetLogsDir()` returns
+  undefined under Vitest so every appender is a silent no-op. This
+  matches the existing `tryGetElectronApp()` pattern in `ws-client.ts`.
+
+### Not in this release
+
+- No build / sign / notarize from MBP. Mini-CC will pick this up via
+  the release pipeline.
+- Codex review skipped per `feedback_codex_disabled.md` standing rule.
+
 ## v0.1.68 — chat-send.jsonl forensics + partial-success semantics (voice 4013)
 
 Ethan voice 4013 (2026-05-24) was explicit about two things: (1) keep

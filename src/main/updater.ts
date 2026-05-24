@@ -20,6 +20,13 @@ import log from 'electron-log/main';
 import { updateElectronApp, UpdateSourceType } from 'update-electron-app';
 import { IPC, UpdateInfo } from '../shared/types';
 import { performGithubUpdateCheck } from './github-update-check';
+// v0.1.69 (voice 4015) — structured error log. The updater already writes
+// to electron-log's main.log via `log.error/warn`, but main.log is plain
+// text and isn't grep-friendly across subsystems. Mirror the operational
+// failure paths (Squirrel error event, signature mismatch, sync throw
+// from checkForUpdates, quitAndInstall failures) into app-errors.jsonl
+// so a single structured-log walk covers updater + oauth + WS + send.
+import { appendErrorLog, errorToString } from './structured-log';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
 
@@ -282,6 +289,16 @@ function attachSquirrelProgressForwarders(): void {
     // reported on 2026-05-23 — Squirrel's signature-mismatch error
     // fired after ~22s of "downloading" and the UI showed no signal).
     log.warn('[updater] autoUpdater error event', err);
+    // v0.1.69 (voice 4015): every Squirrel.Mac error gets a structured row
+    // so the categorisation (signature-mismatch / network / staging /
+    // unknown) survives outside the rendered UpdateBanner state. Pre-
+    // v0.1.69 it only landed in main.log + as a renderer payload.
+    appendErrorLog({
+      subsystem: 'updater',
+      phase: 'updater.squirrel-error-event',
+      errorMessage: errorToString(err),
+      context: { category: categoriseUpdaterError(err) },
+    });
     downloadInFlight = false;
     downloadStartedAt = undefined;
     try {
@@ -544,6 +561,16 @@ export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
     return { ok: true };
   } catch (err) {
     log.error('[updater] quit-and-install threw', err);
+    // v0.1.69 (voice 4015): the user clicked Restart — if this throws
+    // they see nothing. Structured row so we can see post-install
+    // attempts that didn't make it past the sync entry point. Note
+    // most of the failure modes are in the DEFERRED setImmediate
+    // branch above; this catch is the early-return path.
+    appendErrorLog({
+      subsystem: 'updater',
+      phase: 'updater.quit-and-install-threw',
+      errorMessage: errorToString(err),
+    });
     return { ok: false, reason: String((err as Error)?.message ?? err) };
   }
 }
@@ -692,6 +719,16 @@ export function triggerSquirrelDownload(): StartDownloadResult {
     downloadInFlight = false;
     downloadStartedAt = undefined;
     log.error('[updater] checkForUpdates() threw', err);
+    // v0.1.69 (voice 4015): synchronous throw from autoUpdater is the
+    // less-common cousin of the async `error` event but they happen for
+    // similar reasons (feed URL race, sandbox restrictions). One row
+    // per occurrence makes both paths uniformly discoverable.
+    appendErrorLog({
+      subsystem: 'updater',
+      phase: 'updater.check-for-updates-threw',
+      errorMessage: errorToString(err),
+      context: { category: categoriseUpdaterError(err) },
+    });
     // v0.1.61 — also broadcast an `error` payload so the renderer can
     // show a persistent error pane (matching the async error-event
     // path). Without this the banner would briefly flip to `downloading`
@@ -763,6 +800,16 @@ export function configureAutoUpdater(): void {
     log.info('[updater] auto-update configured for', REPO);
   } catch (err) {
     log.error('[updater] failed to configure auto-update', err);
+    // v0.1.69 (voice 4015): configure failure is rare but completely
+    // disables the in-app updater for the session — `feedURLReady`
+    // stays false → every download click bails with 'feed-unavailable'.
+    // Worth a row so we can see if this happens repeatedly on a given
+    // user (unsigned build, network blip at boot, etc).
+    appendErrorLog({
+      subsystem: 'updater',
+      phase: 'updater.configure-failed',
+      errorMessage: errorToString(err),
+    });
   }
 }
 

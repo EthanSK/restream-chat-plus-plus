@@ -1,5 +1,9 @@
 import type { ChatSendStatus, SendTextResult } from '../shared/types';
 import type { ChatSendLogRecord } from './chat-send';
+// v0.1.69 (voice 4015) — structured error log for queue-internal failures
+// (runSend.threw catches an exception from `sendChatText`, pending/sent
+// emit catches an IPC failure). These were previously console.warn only.
+import { appendErrorLog, errorToString } from './structured-log';
 
 /**
  * v0.1.43 — FIFO send queue for the non-blocking inline chat input.
@@ -124,6 +128,18 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
             error: String((err as Error)?.message ?? err),
           };
           log('queue.send.threw', { clientId: item.clientId, error: result.error });
+          // v0.1.69 (voice 4015): `runSend` (== `sendChatText`) shouldn't
+          // throw — it catches everything internally and returns a result
+          // object. If we land here something unexpected happened (a
+          // programming error in chat-send.ts, a synthetic test throw, an
+          // OOM mid-fetch). Worth a structured row even though the
+          // existing console.warn-equivalent is also fired.
+          appendErrorLog({
+            subsystem: 'chat-send-queue',
+            phase: 'chat-send-queue.run-send-threw',
+            errorMessage: errorToString(err),
+            context: { clientId: item.clientId },
+          });
         }
         lastSentAt = Date.now();
         if (result.ok) {
@@ -135,6 +151,32 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
               phase: 'sent',
               error: String((err as Error)?.message ?? err),
             });
+            // v0.1.69 (voice 4015): IPC failure on the SUCCESS path is
+            // arguably worse than on the failure path — the renderer
+            // never gets the `sent` status so the placeholder stays in
+            // "sending" forever even though Restream accepted the post.
+            // We mirror to chat-send.jsonl (via logChatSend if wired)
+            // AND to app-errors.jsonl so it's grep-able both ways.
+            const errorMessage = String((err as Error)?.message ?? err);
+            appendErrorLog({
+              subsystem: 'chat-send-queue',
+              phase: 'chat-send-queue.emit-sent-failed',
+              errorMessage,
+              context: { clientId: item.clientId },
+            });
+            if (opts.logChatSend) {
+              try {
+                opts.logChatSend({
+                  phase: 'status-emit-failed',
+                  clientReplyUuid: item.clientId,
+                  reason: 'sent',
+                  httpStatus: null,
+                  errorMessage,
+                });
+              } catch {
+                // logging must never break the send path
+              }
+            }
           }
         } else {
           try {
@@ -162,6 +204,21 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
               clientId: item.clientId,
               phase: 'failed',
               error: errorMessage,
+            });
+            // v0.1.69 (voice 4015): mirror to app-errors.jsonl alongside
+            // the existing chat-send.jsonl status-emit-failed row so the
+            // catch-all error log shows IPC bridge failures from the
+            // queue without needing to know that chat-send.jsonl has
+            // its own dedicated phase for it.
+            appendErrorLog({
+              subsystem: 'chat-send-queue',
+              phase: 'chat-send-queue.emit-failed-failed',
+              errorMessage,
+              context: {
+                clientId: item.clientId,
+                resultReason: result.reason,
+                httpStatus: result.status ?? null,
+              },
             });
             if (opts.logChatSend) {
               try {
@@ -198,6 +255,16 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
           clientId: item.clientId,
           phase: 'pending',
           error: String((err as Error)?.message ?? err),
+        });
+        // v0.1.69 (voice 4015): even the harmless `pending` emit gets a
+        // row if it throws — the renderer would otherwise have no
+        // confirmation the enqueue landed, and worth knowing if the IPC
+        // bridge is broken at this stage too.
+        appendErrorLog({
+          subsystem: 'chat-send-queue',
+          phase: 'chat-send-queue.emit-pending-failed',
+          errorMessage: errorToString(err),
+          context: { clientId: item.clientId },
         });
       }
       // Kick the drain loop. We don't await — enqueue is sync from the

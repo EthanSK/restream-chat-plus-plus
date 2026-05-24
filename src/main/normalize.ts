@@ -105,7 +105,13 @@ export function normalizeRestreamEventDetailed(
           eventSourceId: p.eventSourceId,
         });
       } catch {
-        // logging must never break the WS message-handling path
+        // logging must never break the WS message-handling path.
+        // v0.1.69 (voice 4015): we deliberately do NOT add an
+        // appendErrorLog here because this catch fires on the LOG
+        // SINK itself throwing — adding a second log call inside the
+        // catch risks re-entering the same broken sink. The console
+        // path already gets noticed in dev mode; production silence
+        // is the safer default.
       }
     }
     // Platform inference for self replies:

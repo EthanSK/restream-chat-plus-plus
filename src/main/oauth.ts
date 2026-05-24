@@ -3,6 +3,13 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { loadRestreamCreds } from './credentials';
 import type { Store } from './store';
+// v0.1.69 (voice 4015) — structured error logging. Every previously-volatile
+// console.error in this file now ALSO lands in app-errors.jsonl so we can
+// reconstruct OAuth failures from disk without DevTools open. Voice 4015:
+// "It should have all the information needed to debug and diagnose every
+// type of error." The console.error calls are KEPT alongside the structured
+// rows so dev-mode tail-follow still works during local debugging.
+import { appendErrorLog, errorToString } from './structured-log';
 
 export interface TokenSet {
   accessToken: string;
@@ -163,7 +170,15 @@ export class OAuthCoordinator {
     if (!this.decryptPromise) {
       this.decryptPromise = this.runDeferredDecrypt(enc as string)
         .catch((err) => {
+          // v0.1.69 (voice 4015): mirror deferred-decrypt throws into
+          // app-errors.jsonl so post-mortem can spot Keychain crashes
+          // that previously vanished into console-only stderr.
           console.error('[oauth] deferred decrypt threw', err);
+          appendErrorLog({
+            subsystem: 'oauth',
+            phase: 'oauth.deferred-decrypt-threw',
+            errorMessage: errorToString(err),
+          });
           return undefined;
         })
         .finally(() => {
@@ -235,6 +250,15 @@ export class OAuthCoordinator {
         // Encryption blew up despite isEncryptionAvailable returning true
         // — fall through to the plain path so we don't lose the session.
         console.error('[oauth] safeStorage.encryptString failed', err);
+        // v0.1.69 (voice 4015): persist the encrypt failure to disk so
+        // we know when a user fell back to the plain-text path (which is
+        // a security degradation worth flagging in post-mortem).
+        appendErrorLog({
+          subsystem: 'oauth',
+          phase: 'oauth.safe-storage-encrypt-failed',
+          errorMessage: errorToString(err),
+          context: { fallbackToPlain: true },
+        });
       }
     }
     // Plain fallback.
@@ -289,6 +313,14 @@ export class OAuthCoordinator {
         json = safeStorage.decryptString(buf);
       } catch (err) {
         console.error('[oauth] safeStorage.decryptString failed', err);
+        // v0.1.69 (voice 4015): structured row for the Keychain-prompt-
+        // denied / ACL-drift case. Critical signal — this is the most
+        // common cause of "every update logs me out" symptom history.
+        appendErrorLog({
+          subsystem: 'oauth',
+          phase: 'oauth.safe-storage-decrypt-failed',
+          errorMessage: errorToString(err),
+        });
         return { kind: 'threw' };
       }
       try {
@@ -299,6 +331,14 @@ export class OAuthCoordinator {
         return { kind: 'ok', token: parsed };
       } catch (err) {
         console.error('[oauth] decrypted blob is not parseable JSON', err);
+        // v0.1.69 (voice 4015): genuine ciphertext corruption — wipe + re-
+        // auth is the recovery. Diagnostic row tells us if/when this is
+        // happening in the wild (should be rare; previously invisible).
+        appendErrorLog({
+          subsystem: 'oauth',
+          phase: 'oauth.decrypt-unparseable',
+          errorMessage: errorToString(err),
+        });
         return { kind: 'unparseable' };
       }
     };
@@ -330,6 +370,16 @@ export class OAuthCoordinator {
         console.warn(
           `[oauth] safeStorage.decryptString timed out after ${SAFE_STORAGE_DECRYPT_TIMEOUT_MS}ms — surfacing signed-out for this launch (NOT wiping tokenEnc)`,
         );
+        // v0.1.69 (voice 4015): timeout is operationally important — it
+        // means the SecurityAgent prompt is still in flight and the user
+        // hasn't clicked it yet. Persist so we can see if a user has a
+        // chronically slow Keychain (e.g. heavy Time Machine I/O at boot).
+        appendErrorLog({
+          subsystem: 'oauth',
+          phase: 'oauth.safe-storage-decrypt-timeout',
+          errorMessage: `decrypt timed out after ${SAFE_STORAGE_DECRYPT_TIMEOUT_MS}ms`,
+          context: { timeoutMs: SAFE_STORAGE_DECRYPT_TIMEOUT_MS },
+        });
         this.decryptDisabled = true;
         return undefined;
       }
@@ -379,6 +429,14 @@ export class OAuthCoordinator {
       this.store.delete('tokenEnc');
     } catch (err) {
       console.error('[oauth] failed to wipe tokenEnc after ACL drift', err);
+      // v0.1.69 (voice 4015): store.delete failures are extremely rare
+      // (electron-store wraps a synchronous JSON.write); when they DO
+      // happen the user gets stuck with a permanently-broken tokenEnc.
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.wipe-token-enc-failed',
+        errorMessage: errorToString(err),
+      });
     }
   }
 
@@ -610,11 +668,34 @@ export class OAuthCoordinator {
               errCode ?? 'no error code'
             }) — wiping persisted tokens, user must re-auth`,
           );
+          // v0.1.69 (voice 4015): the fatal-refresh row is the single most
+          // important OAuth diagnostic — it explains why a previously-
+          // signed-in user is suddenly looking at the sign-in screen.
+          // Captures both the HTTP status and Restream's error code so
+          // post-mortem can distinguish invalid_grant (rotated token raced)
+          // from access_denied (user revoked).
+          appendErrorLog({
+            subsystem: 'oauth',
+            phase: 'oauth.refresh-fatal',
+            errorMessage: `refresh-fatal status=${res.status} code=${errCode ?? 'unknown'}`,
+            httpStatus: res.status,
+            context: { errorCode: errCode ?? null, wipedTokens: true },
+          });
           await this.logout();
         } else {
           console.warn(
             `[oauth] refresh returned ${res.status} — transient, leaving tokens in place`,
           );
+          // v0.1.69 (voice 4015): 5xx is transient — but they still
+          // matter (we keep the tokens, so the renderer stays "signed in"
+          // but reconnect loops fail silently). Surfacing the row makes
+          // these visible without the user noticing anything's wrong.
+          appendErrorLog({
+            subsystem: 'oauth',
+            phase: 'oauth.refresh-transient',
+            errorMessage: `refresh-transient status=${res.status}`,
+            httpStatus: res.status,
+          });
         }
         return undefined;
       }
@@ -629,7 +710,18 @@ export class OAuthCoordinator {
       };
       this.persistToken(tokenSet);
       return tokenSet;
-    } catch {
+    } catch (err) {
+      // v0.1.69 (voice 4015): network / fetch-threw path was silently
+      // returning undefined pre-v0.1.69 — refresh fires from multiple
+      // call sites (WS reconnect loop, manual button, startup resume)
+      // and a flaky network would just look like "auth failed" with
+      // no signal on disk. Now every throw lands as a row so we can
+      // see "5 refresh fetches in a row threw" → ISP issue.
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.refresh-fetch-threw',
+        errorMessage: errorToString(err),
+      });
       return undefined;
     }
   }
@@ -652,10 +744,33 @@ export class OAuthCoordinator {
     });
     if (!res.ok) {
       const text = await res.text();
+      // v0.1.69 (voice 4015): structured row for failed code→token swap.
+      // Pre-v0.1.69 this just threw into the IPC handler; the renderer
+      // surfaced a generic error toast. Now post-mortem can see status +
+      // first chunk of Restream's response body to spot misconfigured
+      // client_id / expired auth code / Restream API outage.
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.exchange-code-failed',
+        errorMessage: `exchange-code-failed status=${res.status}`,
+        httpStatus: res.status,
+        context: { bodyExcerpt: text?.slice(0, 240) },
+      });
       throw new Error(`Token exchange failed: ${res.status} ${text}`);
     }
     const json: any = await res.json();
     if (!json.access_token) {
+      // v0.1.69 (voice 4015): Restream returned 2xx but no access_token —
+      // shape regression on their side. Critical signal because the IPC
+      // handler will throw with the full JSON, but on disk we want a
+      // concise row for grep.
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.exchange-code-no-access-token',
+        errorMessage: 'exchange returned 2xx without access_token',
+        httpStatus: res.status,
+        context: { responseKeys: Object.keys(json ?? {}) },
+      });
       throw new Error(`Token exchange returned no access_token: ${JSON.stringify(json)}`);
     }
     return {

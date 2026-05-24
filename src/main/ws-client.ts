@@ -14,6 +14,15 @@ import {
   normalizeRestreamEventDetailed,
   type NormalizeLogSink,
 } from './normalize';
+// v0.1.69 (voice 4015) — structured error log for WS failures (frame parse
+// errors, abnormal close codes, missing-token boot bails). Pre-v0.1.69
+// these landed in raw-frames.jsonl as kind:"parse-error" / "ws-close" /
+// "ws-error" rows — which is still preserved — but having them ALSO in
+// app-errors.jsonl means a forensics pass can grep ONE file across all
+// subsystems without needing to know WS uses its own log. Lazy require
+// guarded by VITEST env in `structured-log.ts` so tests don't pull in
+// the electron binary.
+import { appendErrorLog, errorToString } from './structured-log';
 
 /**
  * Resolve Electron's `app` lazily so this module can also be imported from
@@ -406,6 +415,15 @@ export class ChatClient extends EventEmitter {
   private connect() {
     if (!this.accessToken) {
       this.setState({ status: 'error', attempt: this.attempt, lastError: 'no token' });
+      // v0.1.69 (voice 4015): "no token" is an important diagnostic — it
+      // means main.ts tried to start the WS without resolving auth first.
+      // Should never happen in production but if it does, post-mortem
+      // needs the row to spot the race.
+      appendErrorLog({
+        subsystem: 'ws',
+        phase: 'ws.connect-no-token',
+        errorMessage: 'connect attempted without an access token set',
+      });
       return;
     }
     // Clear stale connections — Restream replays all current connection_info
@@ -444,6 +462,16 @@ export class ChatClient extends EventEmitter {
         parsed = JSON.parse(text);
       } catch (err) {
         this.appendRawLog({ kind: 'parse-error', text, err: String(err) });
+        // v0.1.69 (voice 4015): a frame that can't be parsed is a Restream-
+        // side regression. Mirror to app-errors.jsonl so it's visible
+        // alongside other anomalies without having to grep raw-frames.jsonl
+        // (which is large + noisy with healthy traffic).
+        appendErrorLog({
+          subsystem: 'ws',
+          phase: 'ws.frame-parse-error',
+          errorMessage: errorToString(err),
+          context: { textExcerpt: text.slice(0, 240) },
+        });
         return;
       }
       this.appendRawLog({ kind: 'frame', frame: parsed });
@@ -539,12 +567,33 @@ export class ChatClient extends EventEmitter {
     ws.on('close', (code, reason) => {
       const reasonText = reason?.toString() ?? '';
       this.appendRawLog({ kind: 'ws-close', code, reason: reasonText });
+      // v0.1.69 (voice 4015): abnormal close codes (1006 abnormal closure,
+      // 1011 server error, 4xxx Restream-custom) deserve their own row in
+      // app-errors.jsonl so we can spot pattern shifts (e.g. "10x 1011 in
+      // a row = Restream backend incident"). 1000/1001 are clean shutdowns
+      // and don't warrant the error row — those just appear in raw-frames.
+      if (code !== 1000 && code !== 1001) {
+        appendErrorLog({
+          subsystem: 'ws',
+          phase: 'ws.abnormal-close',
+          errorMessage: `close ${code} ${reasonText || 'no-reason'}`,
+          context: { code, reason: reasonText },
+        });
+      }
       this.handleDisconnect(`close ${code} ${reasonText}`);
     });
 
     ws.on('error', (err) => {
       const message = err.message || 'ws error';
       this.appendRawLog({ kind: 'ws-error', message });
+      // v0.1.69 (voice 4015): WS-level errors (handshake fail, TLS bork,
+      // ECONNRESET mid-stream) → structured row so we can correlate
+      // against auto-reconnect attempts in reconnect-events.jsonl.
+      appendErrorLog({
+        subsystem: 'ws',
+        phase: 'ws.socket-error',
+        errorMessage: errorToString(err),
+      });
       this.handleDisconnect(message);
     });
   }
@@ -767,6 +816,16 @@ export class ChatClient extends EventEmitter {
             kind: 'ws-stale',
             staleForMs,
             timeoutMs: STALE_INBOUND_TIMEOUT_MS,
+          });
+          // v0.1.69 (voice 4015): stale-inbound is a healthy-WS-gone-quiet
+          // signal — Restream's TCP didn't FIN, we just stopped hearing
+          // back. Worth its own row so we can correlate periods where
+          // many users hit stale simultaneously (= Restream backend hung).
+          appendErrorLog({
+            subsystem: 'ws',
+            phase: 'ws.stale-inbound',
+            errorMessage: `stale inbound ${staleForMs}ms (threshold ${STALE_INBOUND_TIMEOUT_MS}ms)`,
+            context: { staleForMs, thresholdMs: STALE_INBOUND_TIMEOUT_MS },
           });
           const staleWs = this.ws;
           this.ws = undefined;
