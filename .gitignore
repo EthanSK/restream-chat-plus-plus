@@ -91,3 +91,4 @@ typings/
 
 # Electron-Forge
 out/
+BUG_SWEEP_*.md

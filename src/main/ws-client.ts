@@ -10,7 +10,10 @@ import type {
   Platform,
 } from '../shared/types';
 import type { ChatContext } from './chat-send';
-import { normalizeRestreamEventDetailed } from './normalize';
+import {
+  normalizeRestreamEventDetailed,
+  type NormalizeLogSink,
+} from './normalize';
 
 /**
  * Resolve Electron's `app` lazily so this module can also be imported from
@@ -192,6 +195,14 @@ export class ChatClient extends EventEmitter {
    */
   private autoAttemptListener?: (entry: AutoReconnectAttempt) => void;
   /**
+   * v0.1.68 (voice 4013): optional sink for the `ws-echo-received`
+   * diagnostic row that fires on every accepted `reply_created` frame.
+   * Wired from main.ts to `appendChatSendLog`. Kept out of the WS class
+   * itself so we don't carry an Electron-side log dependency into the
+   * unit tests (same pattern as `autoAttemptListener`).
+   */
+  private normalizeLogSink?: NormalizeLogSink;
+  /**
    * Map of Restream connection_info entries keyed by connectionIdentifier.
    * Replaces on every fresh connection_info, deleted on connection_closed
    * matching the stored connectionUuid (per Restream's docs).
@@ -247,6 +258,15 @@ export class ChatClient extends EventEmitter {
    */
   setAutoAttemptListener(listener: ((entry: AutoReconnectAttempt) => void) | undefined) {
     this.autoAttemptListener = listener;
+  }
+
+  /**
+   * v0.1.68 (voice 4013): install the `ws-echo-received` log sink. Called
+   * by main.ts on app startup; tests don't need to wire it. Passing
+   * `undefined` clears the sink (used in unit tests + test teardown).
+   */
+  setNormalizeLogSink(sink: NormalizeLogSink | undefined) {
+    this.normalizeLogSink = sink;
   }
 
   /**
@@ -490,7 +510,10 @@ export class ChatClient extends EventEmitter {
         }
       }
 
-      const result = normalizeRestreamEventDetailed(parsed);
+      const result = normalizeRestreamEventDetailed(
+        parsed,
+        this.normalizeLogSink,
+      );
       if (result.message) {
         this.emit('message', result.message);
       } else if (result.drop) {

@@ -551,7 +551,13 @@ export interface ChatSendOptions {
  * rows the v0.1.61 "send broken post-install" bug was invisible —
  * `chat-send.jsonl` was empty because no POST ever fired.
  */
-export type ChatSendLogRecord = ChatSendPostLogRecord | ChatSendPreflightLogRecord;
+export type ChatSendLogRecord =
+  | ChatSendPostLogRecord
+  | ChatSendPreflightLogRecord
+  | ChatSendFinalFailureLogRecord
+  | ChatSendStatusEmitFailedLogRecord
+  | ChatSendOptimisticTimeoutLogRecord
+  | ChatSendWsEchoLogRecord;
 
 export interface ChatSendPostLogRecord {
   /** Discriminator. `'send'` for legacy / POST-round-trip rows. */
@@ -619,6 +625,98 @@ export interface ChatSendPreflightLogRecord {
   hasXsrf: boolean;
   /** Number of channels the renderer thinks are live. */
   connectionCount: number;
+}
+
+/**
+ * v0.1.68 (voice 4013) — diagnostic row written at the FINAL `send-failed`
+ * exit of `sendChatText`, i.e. the catch-all return after all retries are
+ * exhausted. Pre-v0.1.68 the only signal in `chat-send.jsonl` for this
+ * outcome was the last per-attempt `phase:"send"` row; correlating "the
+ * user saw a ⚠ on their placeholder" with "which send did that?" meant
+ * cross-referencing `clientReplyUuid` by hand. This row makes the FINAL
+ * failure explicit so a log reader can grep `phase:"send-failed-final"`
+ * to enumerate every send that surfaced as failed to the renderer.
+ *
+ * Captures the wall-clock elapsed-ms of the whole send (preflight +
+ * attempt 1 + optional attempt 2) so we can see how long the user
+ * actually waited before the ⚠ appeared — that's the number Ethan asks
+ * about when investigating "why did this send feel slow before failing".
+ */
+export interface ChatSendFinalFailureLogRecord {
+  phase: 'send-failed-final';
+  /** Renderer-minted UUID = optimistic placeholder id; lets us cross-ref the renderer's ⚠. */
+  clientReplyUuid: string;
+  /** Total wall-clock ms inside `sendChatText` (preflight + all attempts). */
+  elapsedMs: number;
+  /** True iff the retry-on-404 path actually fired (attempt 2 was made). */
+  retryAttempted: boolean;
+  /** HTTP status from the LAST attempt (null if fetch itself threw / no response). */
+  lastHttpStatus: number | null;
+  /** Best-effort error string from `SendTextResult.error` for the final failure. */
+  lastErrorMessage: string | null;
+}
+
+/**
+ * v0.1.68 (voice 4013) — diagnostic row written by `chat-send-queue.ts`
+ * when it tries to push a `ChatSendStatus` to the renderer but the IPC
+ * `emitStatus` callback throws. Pre-v0.1.68 this swallowed into
+ * `console.warn` ("queue.emit.threw") with no jsonl trace. The renderer
+ * never sees the status update so the placeholder sits forever — exactly
+ * the v0.1.63 stuck-send class of bug, just from the IPC bridge side. By
+ * mirroring it into `chat-send.jsonl` we can correlate against the WS
+ * echo to see whether the queue's `failed` status actually reached the
+ * renderer for any given clientReplyUuid.
+ */
+export interface ChatSendStatusEmitFailedLogRecord {
+  phase: 'status-emit-failed';
+  /** Renderer-minted UUID; same one the renderer used as the optimistic id. */
+  clientReplyUuid: string;
+  /** Which status the queue was trying to emit when the IPC failed. */
+  reason: string;
+  /** HTTP status carried with the failed status (when known). */
+  httpStatus?: number | null;
+  /** Best-effort serialised error from the IPC layer. */
+  errorMessage: string;
+}
+
+/**
+ * v0.1.68 (voice 4013) — diagnostic row written by the renderer-side
+ * stuck-send guard when its 30s timer fires (was 15s pre-v0.1.68). The
+ * renderer can't write directly to `chat-send.jsonl` (lives in node
+ * main); the row is forwarded over `CHAT_SEND_LOG_EVENT` IPC then
+ * appended by `appendChatSendLog`. This lets log-only forensics correlate
+ * a `optimistic-timeout` row against the matching `send-failed-final` (or
+ * lack thereof — the whole point of the renderer timeout is "neither
+ * `failed` nor the WS echo arrived in time", i.e. a silent main-process
+ * bail that's INVISIBLE in `chat-send.jsonl` otherwise).
+ */
+export interface ChatSendOptimisticTimeoutLogRecord {
+  phase: 'optimistic-timeout';
+  /** Renderer-minted UUID; same one used as the optimistic placeholder id. */
+  clientReplyUuid: string;
+  /** Wall-clock ms the timer waited before firing (== the constant at fire-time). */
+  elapsedMs: number;
+  /** Best-effort snapshot of renderer-known queue state at timeout. */
+  queueState?: string;
+}
+
+/**
+ * v0.1.68 (voice 4013) — diagnostic row written in `normalize.ts` on the
+ * `reply_created` branch (the streamer's own outgoing echo). Lets us
+ * correlate `optimistic-timeout` rows against eventual late-arriving WS
+ * echoes by `clientReplyUuid`. If the echo arrived AFTER the renderer's
+ * 30s timer fired, we'll see `optimistic-timeout` and then a much-later
+ * `ws-echo-received` for the same UUID — the smoking gun for "send went
+ * through fine, just slowly enough that the UI flagged it".
+ */
+export interface ChatSendWsEchoLogRecord {
+  phase: 'ws-echo-received';
+  /** Renderer-minted UUID echoed back by Restream; may be undefined for non-RC++ replies. */
+  clientReplyUuid?: string;
+  /** Restream's server-generated reply id (always present on a real echo). */
+  replyUuid?: string;
+  /** Source of the echo — `1` = "all connections" broadcast, other ids = per-platform. */
+  eventSourceId?: unknown;
 }
 
 /**
@@ -767,6 +865,45 @@ function isRouteNotFound(bodyText: string | undefined): boolean {
  * "no active show" error.
  */
 export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResult> {
+  // v0.1.68 (voice 4013): wall-clock starting point for the whole
+  // sendChatText run. Captured BEFORE any preflight checks so the
+  // `send-failed-final` row's `elapsedMs` reflects the user-perceived
+  // latency — preflight cookie probe + REST hydration + every POST
+  // attempt + retry wait, end to end. Used only on the final-failure
+  // diagnostic path; the per-attempt `phase:"send"` rows already include
+  // their own response/error info so we don't double-count there.
+  const startedAt = Date.now();
+
+  // v0.1.68: helper that emits the `send-failed-final` diagnostic row at
+  // the catch-all `{ ok:false, reason:"send-failed" }` return — i.e.
+  // after every retry is exhausted and we're about to hand a renderer-
+  // visible failure back to the queue. Adds a single, greppable row
+  // (`phase:"send-failed-final"`) per finally-failed send so log
+  // forensics no longer have to walk attempt rows by `clientReplyUuid`
+  // to find which one was the "final word". `lastHttpStatus` is null
+  // when fetch itself threw (network blip) so we can distinguish "we
+  // never got a response" from "Restream said no".
+  const emitFinalFailure = (args: {
+    clientReplyUuid: string;
+    retryAttempted: boolean;
+    lastHttpStatus: number | null;
+    lastErrorMessage: string | null;
+  }): void => {
+    if (!opts.log) return;
+    try {
+      opts.log({
+        phase: 'send-failed-final',
+        clientReplyUuid: args.clientReplyUuid,
+        elapsedMs: Date.now() - startedAt,
+        retryAttempted: args.retryAttempted,
+        lastHttpStatus: args.lastHttpStatus,
+        lastErrorMessage: args.lastErrorMessage,
+      });
+    } catch {
+      // logging must never break the send path
+    }
+  };
+
   // v0.1.62: helper that emits a preflight diagnostic row to
   // `chat-send.jsonl` before we bail out of the send path. Mirrors the
   // shape of POST-attempt records so log readers can `jq -s` over both.
@@ -914,6 +1051,19 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
     };
   }
   const firstRes = first.res!;
+  // v0.1.68 (voice 4013) — partial-success semantics. Any 2xx from
+  // `POST /api/client/reply` is a SUCCESS as far as RC++ is concerned,
+  // even when Restream's response body contains a `failures: [...]`
+  // array listing per-platform downstream errors (e.g. Twitter
+  // "internal_error", Discord "missing perms", Kick rate-limit). Those
+  // are platform-fan-out failures inside Restream's own broadcast
+  // infrastructure — they're surfaced in Restream's own dashboard /
+  // notifications, not RC++'s problem to bubble up. Bubbling them
+  // generated false ⚠ icons on messages that DID reach the streamer's
+  // actual viewers, and Ethan voice 4013 was explicit: "only show
+  // transport failures, not Restream's downstream-fan-out drama".
+  // The body excerpt is still captured in the per-attempt `phase:"send"`
+  // log row so post-hoc forensics can reconstruct partial fan-outs.
   if (firstRes.ok) return { ok: true };
 
   // v0.1.34: route-not-found 404s ("404 page not found" plain text) are
@@ -985,6 +1135,18 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
           'No active show — start streaming on Restream and try again.',
       };
     }
+    // v0.1.68 (voice 4013): one greppable diagnostic row marking the
+    // moment we hand a `send-failed` back to the queue after the retry
+    // path. `retryAttempted: true` here because we DID issue attempt #2;
+    // status is the LAST response we got from Restream.
+    emitFinalFailure({
+      clientReplyUuid,
+      retryAttempted: true,
+      lastHttpStatus: secondRes.status,
+      lastErrorMessage: second.bodyText
+        ? second.bodyText.slice(0, 240)
+        : null,
+    });
     return {
       ok: false,
       reason: 'send-failed',
@@ -1005,6 +1167,17 @@ export async function sendChatText(opts: ChatSendOptions): Promise<SendTextResul
       error: first.bodyText ? first.bodyText.slice(0, 240) : undefined,
     };
   }
+  // v0.1.68 (voice 4013): final-failure diagnostic on the no-retry path
+  // — either the first response wasn't a 404 (so we never invoked
+  // `refreshContext`), or `opts.refreshContext` wasn't wired in this
+  // session. Either way the renderer is about to surface a ⚠ from this
+  // single attempt's status, and the log row makes that explicit.
+  emitFinalFailure({
+    clientReplyUuid,
+    retryAttempted: false,
+    lastHttpStatus: firstRes.status,
+    lastErrorMessage: first.bodyText ? first.bodyText.slice(0, 240) : null,
+  });
   return {
     ok: false,
     reason: 'send-failed',

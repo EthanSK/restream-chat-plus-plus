@@ -1,4 +1,5 @@
 import type { ChatSendStatus, SendTextResult } from '../shared/types';
+import type { ChatSendLogRecord } from './chat-send';
 
 /**
  * v0.1.43 — FIFO send queue for the non-blocking inline chat input.
@@ -55,6 +56,15 @@ export interface ChatSendQueueOptions {
    * Defaults to a no-op.
    */
   log?: (event: string, data?: Record<string, unknown>) => void;
+  /**
+   * v0.1.68 (voice 4013) — optional sink for structured `chat-send.jsonl`
+   * rows so the queue can surface IPC-level failures (e.g. `emitStatus`
+   * throws) into the same disk log that `chat-send.ts` writes per-POST
+   * rows to. Wired to `appendChatSendLog` in main.ts. Tests can pass a
+   * spy or omit it (no-op). Errors from this callback are swallowed
+   * inside the queue — logging must never break the send pipeline.
+   */
+  logChatSend?: (record: ChatSendLogRecord) => void;
 }
 
 export interface ChatSendQueue {
@@ -141,11 +151,31 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
               httpStatus: result.status,
             });
           } catch (err) {
+            // v0.1.68 (voice 4013): mirror the IPC-emit failure into
+            // chat-send.jsonl so log forensics can correlate "renderer
+            // saw the placeholder stuck" against "the queue's `failed`
+            // status was lost en route to the renderer". Pre-v0.1.68
+            // this swallowed into a console.warn that never reached
+            // disk, so the smoking gun was invisible from log diffs.
+            const errorMessage = String((err as Error)?.message ?? err);
             log('queue.emit.threw', {
               clientId: item.clientId,
               phase: 'failed',
-              error: String((err as Error)?.message ?? err),
+              error: errorMessage,
             });
+            if (opts.logChatSend) {
+              try {
+                opts.logChatSend({
+                  phase: 'status-emit-failed',
+                  clientReplyUuid: item.clientId,
+                  reason: result.reason ?? 'unknown',
+                  httpStatus: result.status ?? null,
+                  errorMessage,
+                });
+              } catch {
+                // logging must never break the send path
+              }
+            }
           }
         }
       }

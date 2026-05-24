@@ -1498,6 +1498,23 @@ app.on('ready', async () => {
     }
   };
 
+  // v0.1.68 (voice 4013): install the WS-echo log sink on the ChatClient
+  // now that `appendChatSendLog` exists. Every accepted `reply_created`
+  // frame becomes a `ws-echo-received` row in chat-send.jsonl. We pair
+  // this with the per-attempt + final-failure + optimistic-timeout rows
+  // so log forensics can answer "did the user's send eventually echo
+  // back?" without needing the renderer DevTools open.
+  chat.setNormalizeLogSink({
+    onWsEchoReceived: (info) => {
+      appendChatSendLog({
+        phase: 'ws-echo-received',
+        clientReplyUuid: info.clientReplyUuid,
+        replyUuid: info.replyUuid,
+        eventSourceId: info.eventSourceId,
+      });
+    },
+  });
+
   ipcMain.handle(IPC.CHAT_SEND_TEXT, async (_evt, rawText: string): Promise<SendTextResult> => {
     try {
       // v0.1.38: async auth check — covers the race where the user types a
@@ -1597,6 +1614,12 @@ app.on('ready', async () => {
     minSpacingMs: 1000,
     log: (event, data) =>
       console.warn(`[main] chat-send-queue ${event}`, data ?? {}),
+    // v0.1.68 (voice 4013): give the queue the same chat-send.jsonl
+    // sink that the inline send path uses so `status-emit-failed`
+    // diagnostics land in the same file as the per-POST rows. Same
+    // log path, same redaction guarantees (preflight/post/final-failure
+    // rows already redact via chat-send.ts).
+    logChatSend: appendChatSendLog,
   });
   ipcMain.on(IPC.CHAT_SEND_ENQUEUE, (_evt, payload: ChatSendEnqueuePayload) => {
     try {
@@ -1624,6 +1647,30 @@ app.on('ready', async () => {
           error: String((err as Error)?.message ?? err),
         });
       }
+    }
+  });
+
+  // ----- v0.1.68 (voice 4013): renderer → main jsonl log relay --------
+  // The renderer-side optimistic-send timeout guard needs to land a row
+  // in chat-send.jsonl when it fires (so log-only forensics can see "the
+  // renderer gave up at 30s" alongside the main-process per-attempt
+  // rows). Renderer has no fs access via preload; we relay through here.
+  //
+  // Defensive validation — `phase` and `clientReplyUuid` must be present
+  // and string-typed. We do NOT trust arbitrary fields from the renderer
+  // to extend the discriminated union; the schema here matches what
+  // App.tsx sends (`phase:'optimistic-timeout'`) plus a permissive
+  // forward path so future renderer-side rows don't need a main rebuild.
+  ipcMain.on(IPC.CHAT_SEND_LOG_EVENT, (_evt, payload: unknown) => {
+    try {
+      if (!payload || typeof payload !== 'object') return;
+      const rec = payload as Record<string, unknown>;
+      if (typeof rec.phase !== 'string') return;
+      // Cast: appendChatSendLog accepts the discriminated union; the
+      // renderer-side caller is responsible for sending a valid shape.
+      appendChatSendLog(rec as unknown as ChatSendLogRecord);
+    } catch (err) {
+      console.error('[main] CHAT_SEND_LOG_EVENT handler failed', err);
     }
   });
 

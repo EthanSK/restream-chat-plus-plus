@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.1.68 — chat-send.jsonl forensics + partial-success semantics (voice 4013)
+
+Ethan voice 4013 (2026-05-24) was explicit about two things: (1) keep
+ignoring Restream's downstream platform-fan-out failures (Twitter
+`internal_error`, Discord missing perms, etc.) because they're not RC++'s
+problem to surface — Restream's own dashboard already does that — and
+(2) any future ⚠ icon on an outgoing message must be diagnosable from
+disk logs alone, without needing the renderer DevTools open. v0.1.68
+hardens the first contract with an explanatory code comment and beefs
+up `chat-send.jsonl` with four new row types so the second contract is
+actually possible.
+
+### What's new
+
+- **Optimistic-send timeout 15s → 30s.** The renderer-side stuck-send
+  guard now waits 30s before flagging a placeholder as failed. The old
+  15s value was tight enough that genuinely-slow-but-fine sends (cold
+  TLS resume after sign-in, slow Restream backend, REST hydration on a
+  flaky connection) could trip a false ⚠. 30s gives the whole pipeline
+  (preflight + REST hydration + attempt #1 + retry + Restream backend +
+  WS echo round-trip) enough headroom to complete on a sluggish link.
+- **Richer `chat-send.jsonl` logging on every ⚠ path.** Four new row
+  shapes land in the same file as the existing per-POST + preflight rows:
+  - `phase: "send-failed-final"` — written at the catch-all
+    `send-failed` exit of `sendChatText`. Captures `clientReplyUuid`,
+    `elapsedMs` (wall-clock end to end), `retryAttempted`,
+    `lastHttpStatus`, `lastErrorMessage`. One greppable row per fully-
+    failed send.
+  - `phase: "status-emit-failed"` — written by `chat-send-queue.ts`
+    when the IPC `emitStatus` callback throws while pushing a `failed`
+    status to the renderer. Pre-v0.1.68 these swallowed into
+    `console.warn`; now they reach disk so we can correlate against a
+    stuck placeholder.
+  - `phase: "optimistic-timeout"` — written by the renderer-side guard
+    when the 30s timer fires. Carries `clientReplyUuid`, `elapsedMs`,
+    and a best-effort `queueState`. Relayed over a new
+    `CHAT_SEND_LOG_EVENT` IPC because the renderer can't write files
+    directly.
+  - `phase: "ws-echo-received"` — written on every accepted
+    `reply_created` frame. Lets log forensics correlate
+    `optimistic-timeout` rows against eventual late-arriving echoes —
+    the smoking gun for "send went through fine, just slowly enough
+    that the UI flagged it" vs "send genuinely never arrived".
+- **Explanatory comment on the 2xx success path** in `chat-send.ts`
+  documenting why a `{ failures: [...] }` body inside a 2xx response is
+  still treated as success. No behavior change — just future-proofing
+  against someone reading the diff and "fixing" it.
+
+### Internal changes
+
+- `src/main/chat-send.ts` — extended `ChatSendLogRecord` discriminated
+  union with the four new row types; added `startedAt` wall-clock anchor
+  and `emitFinalFailure` helper; both `send-failed` returns now emit a
+  `send-failed-final` row before handing failure back to the queue.
+- `src/main/chat-send-queue.ts` — new `logChatSend` option threaded
+  through from main.ts; emit-failure branch now also writes a
+  `status-emit-failed` row alongside the existing console.warn.
+- `src/renderer/optimistic-send-timeout.ts` — bumped constant
+  15_000 → 30_000; added `logOptimisticSendTimeout()` that relays a row
+  via `window.rcpp.emitChatSendLogEvent`.
+- `src/main/normalize.ts` — added optional `NormalizeLogSink` param to
+  the pure function; existing callers unchanged. Fires
+  `onWsEchoReceived` once per accepted `reply_created` frame.
+- `src/main/ws-client.ts` — added `setNormalizeLogSink()` setter; the
+  WS message handler threads it into `normalizeRestreamEventDetailed`.
+- `src/main/main.ts` — wires `appendChatSendLog` into the queue's
+  `logChatSend` slot and the ChatClient's `setNormalizeLogSink`; adds
+  a `CHAT_SEND_LOG_EVENT` IPC handler that relays renderer-side rows
+  into the same file with phase + payload validation.
+- `src/preload.ts` — exposes `rcpp.emitChatSendLogEvent` so the
+  renderer can ship structured rows over IPC.
+- `src/shared/types.ts` — registers the new `CHAT_SEND_LOG_EVENT` IPC
+  channel.
+
+### Tests
+
+- `src/__tests__/optimistic-send-timeout.test.ts` — updated description
+  string from "15 seconds" → "30 seconds" to match the bumped constant.
+  No assertion changes needed (tests reference `OPTIMISTIC_SEND_TIMEOUT_MS`
+  by name, not the literal value).
+- Full vitest suite green (475 passing).
+
+### Not in this release
+
+- No build / sign / notarize from MBP. Mini-CC will pick this up via
+  the release pipeline when the bridge restores.
+- Codex review skipped per `feedback_codex_disabled.md` standing rule.
+
 ## v0.1.67 — revert v0.1.66 `keychain-access-groups` (launch-failed in production)
 
 Ethan voice 3995 follow-up #2 (2026-05-24): v0.1.66 shipped the

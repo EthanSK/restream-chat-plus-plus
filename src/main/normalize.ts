@@ -18,6 +18,35 @@ export interface NormalizeResult {
 }
 
 /**
+ * v0.1.68 (voice 4013) — optional sink invoked on the `reply_created`
+ * branch with the bits needed to correlate a WS echo against the
+ * renderer's optimistic placeholder and the disk-log row trail. Wired
+ * to `appendChatSendLog` in `ws-client.ts` so log forensics can match
+ * `optimistic-timeout` (renderer gave up) against an eventual
+ * `ws-echo-received` (the echo did eventually land) by `clientReplyUuid`.
+ *
+ * Pure-function contract preserved: the existing
+ * `normalizeRestreamEventDetailed(raw)` call sites continue to work
+ * unchanged because this parameter is optional and ignored when absent.
+ */
+export interface NormalizeLogSink {
+  /**
+   * Called exactly once per `reply_created` frame that we accept as a
+   * self-message. `clientReplyUuid` is the renderer-minted id Restream
+   * echoed back (may be undefined if the reply originated from
+   * chat.restream.io's webchat rather than RC++). `replyUuid` is
+   * Restream's server-side reply id. `eventSourceId` identifies which
+   * Restream channel the echo came from (`1` = broadcast / all
+   * connections, other ids = single platform).
+   */
+  onWsEchoReceived: (info: {
+    clientReplyUuid?: string;
+    replyUuid?: string;
+    eventSourceId?: unknown;
+  }) => void;
+}
+
+/**
  * Normalize a raw Restream WebSocket event into a ChatMessage, or return
  * a drop reason explaining why it didn't.
  *
@@ -41,7 +70,10 @@ export interface NormalizeResult {
  *            https://developers.restream.io/chat/events
  *            https://developers.restream.io/chat/reply
  */
-export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
+export function normalizeRestreamEventDetailed(
+  raw: unknown,
+  logSink?: NormalizeLogSink,
+): NormalizeResult {
   if (!raw || typeof raw !== 'object') return { drop: { reason: 'not-object' } };
   const r = raw as Record<string, any>;
 
@@ -53,6 +85,29 @@ export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
     const p = (r.payload ?? {}) as Record<string, any>;
     const text = typeof p.text === 'string' ? p.text : '';
     if (!text) return { drop: { reason: 'no-text' } };
+    // v0.1.68 (voice 4013): fire the WS-echo log sink BEFORE the rest of
+    // the normalisation. We deliberately pass through `eventSourceId` raw
+    // (not after platform-mapping) so the log row carries Restream's
+    // original id — easier to grep against when comparing against
+    // Restream's API docs. Logging fires on EVERY accepted echo,
+    // including history-replay echoes that don't carry a clientReplyUuid
+    // (the field is then undefined on the row, which is fine — we
+    // still get the `replyUuid` correlation handle).
+    if (logSink) {
+      try {
+        const clientReplyUuid =
+          typeof p.clientReplyUuid === 'string' ? p.clientReplyUuid : undefined;
+        const replyUuid =
+          typeof p.replyUuid === 'string' ? p.replyUuid : undefined;
+        logSink.onWsEchoReceived({
+          clientReplyUuid,
+          replyUuid,
+          eventSourceId: p.eventSourceId,
+        });
+      } catch {
+        // logging must never break the WS message-handling path
+      }
+    }
     // Platform inference for self replies:
     //
     // - eventSourceId !== 1 → direct reply to a specific destination
@@ -175,8 +230,11 @@ export function normalizeRestreamEventDetailed(raw: unknown): NormalizeResult {
 
 /** Thin wrapper that preserves the original undefined-or-message contract for callers
  * that don't care about drop reasons (e.g. the existing test suite). */
-export function normalizeRestreamEvent(raw: unknown): ChatMessage | undefined {
-  return normalizeRestreamEventDetailed(raw).message;
+export function normalizeRestreamEvent(
+  raw: unknown,
+  logSink?: NormalizeLogSink,
+): ChatMessage | undefined {
+  return normalizeRestreamEventDetailed(raw, logSink).message;
 }
 
 // Restream documents numeric eventTypeIds per platform.

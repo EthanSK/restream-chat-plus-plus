@@ -375,6 +375,20 @@ export const IPC = {
    */
   CHAT_SEND_STATUS: 'chat:send-status',
   /**
+   * v0.1.68 (voice 4013) — renderer → main fire-and-forget channel for
+   * pushing structured `chat-send.jsonl` rows that originate in the
+   * renderer process. Today it carries `optimistic-timeout` rows when
+   * the stuck-send guard fires (the only renderer-side diagnostic that
+   * needs to land in the unified disk log). The renderer cannot write
+   * the jsonl directly (no fs access via preload); main's
+   * `appendChatSendLog` is the single writer.
+   *
+   * Payload shape: see `ChatSendLogRecord` in `chat-send.ts`. Main is
+   * strict — non-object payloads or missing `phase` keys are dropped
+   * silently to keep an exploit-from-renderer worst case bounded.
+   */
+  CHAT_SEND_LOG_EVENT: 'chat:send-log-event',
+  /**
    * Renderer → main. Asks the main process to pop a native context menu
    * (Menu.buildFromTemplate + popup) anchored at the cursor. Currently the
    * only item is "Clear chat"; when clicked, main sends back `CHAT_CLEAR`

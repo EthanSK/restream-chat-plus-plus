@@ -34,6 +34,7 @@ import {
 } from './chat-message-reducers';
 import {
   applyOptimisticSendTimeout,
+  logOptimisticSendTimeout,
   optimisticSendTimeoutStatus,
   OPTIMISTIC_SEND_TIMEOUT_MS,
 } from './optimistic-send-timeout';
@@ -141,9 +142,17 @@ export function App(): React.ReactElement {
       // should emit `failed` for every `{ ok:false }` send result, and startup
       // cookie repair should prevent the v0.1.62 cookie-bail path entirely.
       // If either contract regresses, this timer turns the placeholder into
-      // `pendingSend: "failed"` after 15s so Ethan never stares at an
+      // `pendingSend: "failed"` after 30s so Ethan never stares at an
       // indefinite "sending" state with no explanation.
+      //
+      // v0.1.68 (voice 4013): timeout bumped 15s → 30s and we now write a
+      // structured `optimistic-timeout` row to chat-send.jsonl so log
+      // forensics can spot the renderer-side bail without needing the
+      // UI. Cross-references the placeholder's `clientReplyUuid` against
+      // any later `ws-echo-received` row to see whether the send DID
+      // actually land just too slowly for the guard to wait.
       setMessages((prev) => applyOptimisticSendTimeout(prev, clientId));
+      logOptimisticSendTimeout(clientId);
       const notice = sendFailureNoticeText(optimisticSendTimeoutStatus(clientId));
       if (notice) showSendNotice(notice);
     }, OPTIMISTIC_SEND_TIMEOUT_MS);

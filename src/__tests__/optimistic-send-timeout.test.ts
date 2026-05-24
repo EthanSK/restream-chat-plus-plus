@@ -51,7 +51,7 @@ describe('optimistic-send timeout guard (v0.1.63)', () => {
     vi.useRealTimers();
   });
 
-  it('transitions a still-sending placeholder to failed after 15 seconds', () => {
+  it('transitions a still-sending placeholder to failed after 30 seconds', () => {
     let messages: ChatMessage[] = [];
     messages = pushOptimisticMessage(messages, optimistic('local-timeout'));
 

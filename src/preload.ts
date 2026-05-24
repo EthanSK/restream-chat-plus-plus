@@ -116,6 +116,20 @@ const api = {
     }
   },
   /**
+   * v0.1.68 (voice 4013) — fire-and-forget structured log relay so the
+   * renderer can write a `chat-send.jsonl` row when its stuck-send guard
+   * fires. Renderer has no fs in preload; main owns the writer. The
+   * payload is a `ChatSendLogRecord`-shaped object (see chat-send.ts).
+   * Errors are swallowed — logging must NEVER break the renderer loop.
+   */
+  emitChatSendLogEvent: (record: Record<string, unknown>): void => {
+    try {
+      ipcRenderer.send(IPC.CHAT_SEND_LOG_EVENT, record);
+    } catch {
+      /* never let an IPC failure break the renderer's send loop */
+    }
+  },
+  /**
    * v0.1.43 — subscribe to lifecycle status events for queued sends.
    * Renderer keys updates by `clientId` to flip the per-message
    * "sending…" / sent / failed (⚠) state in the chat feed.
