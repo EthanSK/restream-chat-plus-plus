@@ -406,6 +406,48 @@ export class OAuthCoordinator {
     authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
     authUrl.searchParams.set('scope', SCOPES.join(' '));
 
+    // v0.1.65 — passkey support for Google sign-in (Ethan voice 3995, 2026-05-24).
+    //
+    // The Restream OAuth flow can redirect to accounts.google.com when Ethan
+    // chooses "Sign in with Google", and Google's sign-in page wants to start
+    // a WebAuthn ceremony so the user can authenticate with a macOS passkey.
+    // Two things stop that ceremony from finishing in a vanilla Electron
+    // BrowserWindow, and both need a fix:
+    //
+    //   1. Google sniffs the User-Agent string and refuses to start the
+    //      WebAuthn ceremony on any UA containing "Electron/<version>"
+    //      (their allow-list of WebAuthn-capable browsers excludes embedded
+    //      runtimes). Without the ceremony starting, the macOS passkey sheet
+    //      is never invoked, so Ethan sees the Google page just hang.
+    //   2. Even if Google DID try to start the ceremony, Electron's default
+    //      permission handler silently denies the unknown
+    //      `publickey-credentials-{get,create}` permissions, so the sheet
+    //      would still never appear.
+    //
+    // Fix:
+    //   1. Rewrite the BrowserWindow's UA to strip the `Electron/x.y.z` and
+    //      `restream-chat-plus-plus/x.y.z` tokens before the first navigation.
+    //      What's left is a normal Chrome/Safari UA string that Google accepts.
+    //   2. Install a permission-request handler on the OAuth window's session
+    //      that allow-lists ONLY the two passkey permissions, scoped to the
+    //      `persist:restream-oauth` partition so this can't leak to any other
+    //      BrowserWindow / webContents.
+    //
+    // Scoped to the OAuth window only because we don't want the UA rewrite or
+    // permission handler to affect the main renderer (chat UI), which has its
+    // own session and webPreferences.
+    const oauthSession = session.fromPartition('persist:restream-oauth');
+
+    // Allow-list passkey permissions for THIS partition only. The default
+    // handler denies any permission it doesn't recognize, which silently
+    // blocks WebAuthn. We accept get + create (sign-in + registration —
+    // Google may try either depending on whether Ethan has an existing
+    // passkey for his account).
+    oauthSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+      const allowed = ['publickey-credentials-get', 'publickey-credentials-create'];
+      callback(allowed.includes(permission));
+    });
+
     const win = new BrowserWindow({
       width: 520,
       height: 720,
@@ -413,9 +455,20 @@ export class OAuthCoordinator {
       webPreferences: {
         nodeIntegration: false,
         contextIsolation: true,
-        session: session.fromPartition('persist:restream-oauth'),
+        session: oauthSession,
       },
     });
+
+    // Strip the Electron + app-product tokens from the UA so Google's
+    // WebAuthn allow-list accepts us as a normal Chromium browser. The
+    // regex matches both `Electron/41.0.0` and `restream-chat-plus-plus/0.1.64`
+    // anywhere in the UA. Must happen BEFORE loadURL so the first request
+    // (which is what Google's bot detection scrapes) already has the clean UA.
+    const cleanUa = win.webContents
+      .getUserAgent()
+      .replace(/\s?(Electron|restream-chat-plus-plus)\/\S+/g, '');
+    win.webContents.setUserAgent(cleanUa);
+
     win.loadURL(authUrl.toString());
 
     let code: string;
