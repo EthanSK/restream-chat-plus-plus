@@ -602,6 +602,44 @@ app.on('ready', async () => {
   const chat = new ChatClient();
 
   app.setName('Restream Chat++');
+
+  // v0.1.66 — enable the macOS Touch ID / Secure Enclave platform
+  // authenticator so accounts.google.com's WebAuthn passkey sheet can
+  // actually appear during Google sign-in (Ethan voice 3995, 2026-05-24).
+  // Codex xhigh review on v0.1.65 flagged that without this call,
+  // `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
+  // returns `false` on Electron 42 and Google silently aborts the
+  // ceremony — no passkey sheet, sign-in hangs.
+  //
+  // `keychainAccessGroup` MUST match the `keychain-access-groups` entry
+  // in `build/entitlements.mac.plist`; the codesign-time entitlement is
+  // what actually authorises the app to read/write keychain items in
+  // that group. Drifting these two values from each other will break
+  // passkey storage AND credential lookup for any existing passkeys
+  // (device-bound, not iCloud-synced).
+  //
+  // Guarded on `process.platform === 'darwin'` because the API is
+  // documented as macOS-only (`@platform darwin`) and calling it on
+  // other platforms is a no-op at best / throw at worst across
+  // Electron versions.
+  if (process.platform === 'darwin') {
+    try {
+      app.configureWebAuthn({
+        touchID: {
+          keychainAccessGroup:
+            'T34G959ZG8.com.ethansk.restream-chat-plus-plus.webauthn',
+          promptReason: 'sign in to $1 with your passkey',
+        },
+      });
+    } catch (err) {
+      // Non-fatal: signed builds get full passkey support; unsigned dev
+      // builds (`npm run start` without certs) may throw on the
+      // keychain-access-group binding, but the rest of the app still
+      // works for Restream OAuth without Google passkey.
+      console.warn('[main] configureWebAuthn failed (non-fatal):', err);
+    }
+  }
+
   buildMenu(() => revealLogsInFinder(chat.getRawLogPath()));
   await createMainWindow();
 

@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.1.66 — Google passkey sign-in actually surfaces the macOS passkey sheet
+
+Ethan voice 3995 follow-up (2026-05-24): Codex xhigh review on v0.1.65
+caught that the previous fix was incomplete — Google's WebAuthn ceremony
+would still abort silently because Electron's macOS platform
+authenticator was never enabled, and the permission allow-list leaked to
+the chat-send partition.
+
+### Codex-flagged fixes (CONCERNS, all critical)
+
+1. **`app.configureWebAuthn({ touchID })` on `app.ready`** —
+   Without this call, Electron returns `false` from
+   `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`,
+   so Google's WebAuthn JS skips the platform-authenticator path
+   entirely and the macOS passkey sheet never appears. Added in
+   `src/main/main.ts` early in `app.on('ready')`, guarded on
+   `process.platform === 'darwin'`. Paired with a new
+   `keychain-access-groups` entry in `build/entitlements.mac.plist`
+   (`T34G959ZG8.com.ethansk.restream-chat-plus-plus.webauthn`) so the
+   signed app can actually read/write WebAuthn metadata in the
+   keychain.
+
+2. **Permission-handler scope leak** — `persist:restream-oauth` is
+   reused by `src/main/chat-send.ts`'s hidden cookie-provisioner +
+   interactive recovery windows. Electron returns the same `Session`
+   object for that partition string within a process, so the v0.1.65
+   handler auto-approved passkey requests for chat-send windows too.
+   Fixed by capturing the OAuth window's `webContents.id` at install
+   time and gating approval on `wc.id === oauthWebContentsId` inside
+   the handler closure. Everything else defaults to deny.
+
+3. **UA scoping** — switched from `setUserAgent()` (mutates the shared
+   Session) to `loadURL(url, { userAgent })` (scoped to this single
+   load). The `restream-chat-plus-plus/<ver>` token isn't actually in
+   the default Electron 42 UA per Codex's runtime probe, but the regex
+   keeps the alternation as defence-in-depth.
+
+### Notes
+
+- Passkey credentials are device-bound (Secure Enclave) and not synced
+  via iCloud Keychain. They live in the keychain access group named
+  above; changing team ID or bundle ID will invalidate any existing
+  passkey.
+- The `promptReason` shown in the Touch ID sheet is
+  `"sign in to <rpId> with your passkey"` where `<rpId>` is filled
+  in by macOS (`google.com` for the Google sign-in flow).
+
+## v0.1.65 — Google passkey sign-in unblocked (UA + permission handler)
+
+Ethan voice 3995 (2026-05-24): signing in to Google via Restream OAuth
+detects the WebAuthn ceremony but the macOS passkey sheet never appears.
+
+### Root causes (both fixed; v0.1.66 added a third)
+
+1. Google sniffs the UA and refuses to start a WebAuthn ceremony when
+   it sees `Electron/<ver>` — their allow-list excludes embedded
+   runtimes. Fixed by stripping the Electron product token from the
+   OAuth BrowserWindow's UA before the first navigation.
+
+2. Electron's default permission handler denies unknown permissions, so
+   even if Google had started the ceremony, `publickey-credentials-get`
+   and `publickey-credentials-create` were silently rejected. Fixed by
+   installing `setPermissionRequestHandler` on the OAuth window's
+   session that allow-lists only those two permissions.
+
+### Followed up by v0.1.66
+
+This release was shipped pending Codex xhigh review per voice 3995
+("Ask Codex as well"). Codex flagged 3 CONCERNS — see the v0.1.66
+entry above. The third root cause (missing `app.configureWebAuthn`)
+was identified there. v0.1.65 alone would have left the passkey sheet
+still not appearing in production; v0.1.66 is the actual shipping fix.
+
 ## v0.1.64 — MCP-driven update orchestration + download-state diagnostics
 
 Ethan voice 3869 (2026-05-23): "There should be MCP to update it. You

@@ -19,5 +19,29 @@
     <!-- Inbound localhost callback for OAuth redirect on port 8765 -->
     <key>com.apple.security.network.server</key>
     <true/>
+    <!--
+      v0.1.66 — keychain access group for WebAuthn / passkey credentials
+      (Ethan voice 3995, 2026-05-24). Codex xhigh review on the v0.1.65 fix
+      flagged that `app.configureWebAuthn({ touchID })` is required for the
+      macOS platform-authenticator (Touch ID / Secure Enclave) to surface
+      the passkey sheet on accounts.google.com — without it, Electron 42
+      returns `false` from `isUserVerifyingPlatformAuthenticatorAvailable()`
+      and Google's WebAuthn JS aborts the ceremony silently.
+
+      The `keychainAccessGroup` we pass to `app.configureWebAuthn` MUST
+      match a value present in this entitlement. Format per Apple docs is
+      `<TEAM_ID>.<BUNDLE_ID>.<arbitrary-suffix>`; we use the `.webauthn`
+      suffix to keep the group dedicated to WebAuthn (Electron 42 only
+      uses this for WebAuthn metadata + the per-session secret).
+
+      Team ID T34G959ZG8 is the Developer ID team used by RC++ signing;
+      bundle ID matches `appBundleId` in forge.config.ts. Changing either
+      will break passkey storage AND credential lookup for any existing
+      passkeys (device-bound, not iCloud-synced).
+    -->
+    <key>keychain-access-groups</key>
+    <array>
+      <string>T34G959ZG8.com.ethansk.restream-chat-plus-plus.webauthn</string>
+    </array>
   </dict>
 </plist>
