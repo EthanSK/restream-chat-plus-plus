@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.1.67 — revert v0.1.66 `keychain-access-groups` (launch-failed in production)
+
+Ethan voice 3995 follow-up #2 (2026-05-24): v0.1.66 shipped the
+Codex-suggested `app.configureWebAuthn({ touchID })` + paired
+`keychain-access-groups` entitlement, but installed-and-launched on
+Mini it died with:
+
+```
+launchd job spawn failed (NSPOSIXErrorDomain 162)
+taskgated-helper: Disallowing com.ethansk.restream-chat-plus-plus
+  because no eligible provisioning profiles found
+```
+
+On modern macOS, declaring `keychain-access-groups` in a Developer ID
+build REQUIRES bundling a Developer ID provisioning profile at
+`Contents/embedded.provisionprofile`. Without one, `taskgated-helper`
+refuses the launch outright — the app dies before any JS runs.
+
+### What was reverted
+
+- `build/entitlements.mac.plist`: removed the `keychain-access-groups`
+  array.
+- `src/main/main.ts`: removed the `app.configureWebAuthn({ touchID })`
+  call.
+
+### What stayed (still valuable independent of platform passkeys)
+
+- `src/main/oauth.ts`: the v0.1.65 UA strip + v0.1.66 permission-handler
+  scope fix + `loadURL(url, { userAgent })` scoping. These are correct
+  regardless of whether the macOS passkey sheet ever appears, because
+  Google may still surface security-key / cross-device-passkey flows
+  via the same WebAuthn API.
+
+### Next step for full platform-passkey support
+
+Provisioning-profile work needs to happen out-of-band:
+
+1. Apple Developer Portal: register a keychain-access-group for team
+   `T34G959ZG8` covering bundle `com.ethansk.restream-chat-plus-plus`.
+2. Generate + download a Developer ID Application provisioning profile
+   that includes that group.
+3. Bundle it as `Contents/embedded.provisionprofile` during electron-
+   forge packaging (via `packagerConfig.osxSign.optionsForFile` or a
+   custom `afterCopy` hook).
+4. Re-add the entitlement + the `configureWebAuthn` call.
+
+Tracked as a TODO; not blocking the v0.1.65 UA / permission-handler
+fix from shipping. Sign-in via password / 2FA / security key still
+works in v0.1.67.
+
 ## v0.1.66 — Google passkey sign-in actually surfaces the macOS passkey sheet
 
 Ethan voice 3995 follow-up (2026-05-24): Codex xhigh review on v0.1.65

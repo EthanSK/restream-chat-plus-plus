@@ -20,28 +20,35 @@
     <key>com.apple.security.network.server</key>
     <true/>
     <!--
-      v0.1.66 — keychain access group for WebAuthn / passkey credentials
-      (Ethan voice 3995, 2026-05-24). Codex xhigh review on the v0.1.65 fix
-      flagged that `app.configureWebAuthn({ touchID })` is required for the
-      macOS platform-authenticator (Touch ID / Secure Enclave) to surface
-      the passkey sheet on accounts.google.com — without it, Electron 42
-      returns `false` from `isUserVerifyingPlatformAuthenticatorAvailable()`
-      and Google's WebAuthn JS aborts the ceremony silently.
+      v0.1.67 — `keychain-access-groups` REMOVED (Ethan voice 3995, 2026-05-24).
+      v0.1.66 attempted to add `keychain-access-groups` to enable
+      `app.configureWebAuthn({ touchID })` per Codex xhigh review feedback,
+      but that entitlement requires a Developer ID provisioning profile
+      (`Contents/embedded.provisionprofile`) on modern macOS — without
+      one, `taskgated-helper` refuses to launch the app:
 
-      The `keychainAccessGroup` we pass to `app.configureWebAuthn` MUST
-      match a value present in this entitlement. Format per Apple docs is
-      `<TEAM_ID>.<BUNDLE_ID>.<arbitrary-suffix>`; we use the `.webauthn`
-      suffix to keep the group dedicated to WebAuthn (Electron 42 only
-      uses this for WebAuthn metadata + the per-session secret).
+          taskgated-helper: Disallowing com.ethansk.restream-chat-plus-plus
+          because no eligible provisioning profiles found
 
-      Team ID T34G959ZG8 is the Developer ID team used by RC++ signing;
-      bundle ID matches `appBundleId` in forge.config.ts. Changing either
-      will break passkey storage AND credential lookup for any existing
-      passkeys (device-bound, not iCloud-synced).
+      The v0.1.66 signed build launched-failed with `launchd job spawn
+      failed` (NSPOSIXErrorDomain 162) on macOS 25 — verified on the
+      release Mini before this revert.
+
+      Getting platform-authenticator (macOS passkey sheet) support back
+      requires:
+        1. Registering a keychain-access-group in App Store Connect for
+           the Developer ID team (T34G959ZG8).
+        2. Downloading the Developer ID Application provisioning profile
+           that includes the group + bundle ID.
+        3. Bundling that profile into `Contents/embedded.provisionprofile`
+           at packaging time (electron-forge can stage this via
+           `packagerConfig.osxSign.optionsForFile`).
+
+      Until that's in place, RC++'s OAuth window can still complete
+      Google sign-in via password / 2FA / security key — the passkey
+      sheet just won't appear. The UA-strip + permission-handler fixes
+      from v0.1.65 / v0.1.66 are still in place because they're useful
+      regardless; only the platform-passkey-specific bits were reverted.
     -->
-    <key>keychain-access-groups</key>
-    <array>
-      <string>T34G959ZG8.com.ethansk.restream-chat-plus-plus.webauthn</string>
-    </array>
   </dict>
 </plist>

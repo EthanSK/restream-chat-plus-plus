@@ -603,42 +603,24 @@ app.on('ready', async () => {
 
   app.setName('Restream Chat++');
 
-  // v0.1.66 — enable the macOS Touch ID / Secure Enclave platform
-  // authenticator so accounts.google.com's WebAuthn passkey sheet can
-  // actually appear during Google sign-in (Ethan voice 3995, 2026-05-24).
-  // Codex xhigh review on v0.1.65 flagged that without this call,
-  // `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
-  // returns `false` on Electron 42 and Google silently aborts the
-  // ceremony — no passkey sheet, sign-in hangs.
+  // v0.1.66 attempted to call `app.configureWebAuthn({ touchID: { ... } })`
+  // here to surface the macOS passkey sheet during Google sign-in (per
+  // Codex xhigh review of voice 3995). That call requires a paired
+  // `keychain-access-groups` entitlement in entitlements.mac.plist,
+  // which in turn requires a Developer ID provisioning profile
+  // (`Contents/embedded.provisionprofile`) on modern macOS —
+  // `taskgated-helper` refuses to launch any app that claims
+  // `keychain-access-groups` without a matching provisioning profile.
   //
-  // `keychainAccessGroup` MUST match the `keychain-access-groups` entry
-  // in `build/entitlements.mac.plist`; the codesign-time entitlement is
-  // what actually authorises the app to read/write keychain items in
-  // that group. Drifting these two values from each other will break
-  // passkey storage AND credential lookup for any existing passkeys
-  // (device-bound, not iCloud-synced).
+  // v0.1.67 REVERTS that approach because v0.1.66 launch-failed in
+  // production. Getting platform-passkey support back is a separate
+  // workstream — see the comment in build/entitlements.mac.plist for
+  // the App Store Connect / provisioning-profile steps required.
   //
-  // Guarded on `process.platform === 'darwin'` because the API is
-  // documented as macOS-only (`@platform darwin`) and calling it on
-  // other platforms is a no-op at best / throw at worst across
-  // Electron versions.
-  if (process.platform === 'darwin') {
-    try {
-      app.configureWebAuthn({
-        touchID: {
-          keychainAccessGroup:
-            'T34G959ZG8.com.ethansk.restream-chat-plus-plus.webauthn',
-          promptReason: 'sign in to $1 with your passkey',
-        },
-      });
-    } catch (err) {
-      // Non-fatal: signed builds get full passkey support; unsigned dev
-      // builds (`npm run start` without certs) may throw on the
-      // keychain-access-group binding, but the rest of the app still
-      // works for Restream OAuth without Google passkey.
-      console.warn('[main] configureWebAuthn failed (non-fatal):', err);
-    }
-  }
+  // The v0.1.65 OAuth-window fixes (UA strip + permission handler) are
+  // still in place in src/main/oauth.ts because they're useful for any
+  // future WebAuthn path (security key, cross-device passkey, etc.) and
+  // don't depend on platform-authenticator support.
 
   buildMenu(() => revealLogsInFinder(chat.getRawLogPath()));
   await createMainWindow();
