@@ -677,6 +677,30 @@ export interface AuthStatus {
   authenticated: boolean;
   scope?: string;
   expiresAt?: number;
+  /**
+   * v0.1.70 (sign-out diagnosis 2026-05-25): `tokenEnc` is still on disk
+   * AND the main process is in the transient-refresh-retry loop. The
+   * renderer should NOT render the bare "Sign in to Restream" CTA in
+   * this state — show a "Reconnecting…" banner with a "Retry now" button
+   * instead, so a single network blip never tricks the user into thinking
+   * they got signed out (the v0.1.67 → v0.1.70 bug).
+   *
+   * Pairs with `authenticated: false`: if authenticated is true, this
+   * field is irrelevant (the renderer's normal signed-in UI takes over).
+   */
+  tokenLikelyValid?: boolean;
+  /**
+   * v0.1.70 (sign-out diagnosis 2026-05-25): explicit signal that we're
+   * in a transient-failure self-healing state (refresh threw / 5xx, retry
+   * armed). Renderer uses this together with `tokenLikelyValid=true` to
+   * render the "Reconnecting — your session may resume automatically.
+   * <Retry now>" banner instead of the bare sign-in screen.
+   *
+   * Separated from `tokenLikelyValid` so the field's intent stays
+   * single-purpose: `tokenLikelyValid` = "don't show sign-in CTA",
+   * `reconnectingDueToTransient` = "show recovery affordance".
+   */
+  reconnectingDueToTransient?: boolean;
 }
 
 /**

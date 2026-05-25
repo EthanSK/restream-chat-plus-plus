@@ -21,6 +21,13 @@ import {
 } from './chat-send';
 import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
 import { resumeAuthWithCookieRepair } from './startup-auth-resume';
+// v0.1.70 (sign-out diagnosis 2026-05-25) — transient-refresh-retry
+// watchdog. Factored out of main.ts so the exponential-backoff state
+// machine can be pinned with unit tests (Vitest fake timers) without
+// booting Electron's `app.on('ready')` closure.
+import {
+  TransientRefreshRetryController,
+} from './transient-refresh-retry';
 // v0.1.69 (voice 4015) — shared structured error log + the 7-day jsonl
 // prune step. `appendErrorLog` mirrors many of the existing console.error
 // sites into app-errors.jsonl; `pruneJsonlLogs` is run at startup and
@@ -899,7 +906,137 @@ app.on('ready', async () => {
     } catch (err) {
       console.warn('[main] nativeTts.cancel on quit failed', err);
     }
+    // v0.1.70 (sign-out diagnosis 2026-05-25): tear down the
+    // transient-refresh retry timer on quit so it doesn't keep the
+    // event loop alive past the window close. The forward reference
+    // is fine — `cancelTransientRefreshRetry` is declared further down
+    // in the same closure but this callback fires later (on quit).
+    try {
+      cancelTransientRefreshRetry();
+    } catch (err) {
+      console.warn('[main] cancelTransientRefreshRetry on quit failed', err);
+    }
   });
+
+  // -------------------------------------------------------------------
+  // v0.1.70 (sign-out diagnosis 2026-05-25): transient-refresh-retry
+  // watchdog instance. The exponential-backoff state machine lives in
+  // src/main/transient-refresh-retry.ts (factored out so it can be
+  // unit-tested with Vitest fake timers). Here we just wire the hooks
+  // that drive Electron-specific side effects: renderer AUTH_STATUS
+  // pushes, chat.setToken/reconnect, structured logging.
+  //
+  // See `transient-refresh-retry.ts` for the full bug write-up + state
+  // machine documentation.
+  // -------------------------------------------------------------------
+  const transientRetry = new TransientRefreshRetryController({
+    // Tick action: refresh + classify into the controller's union.
+    refresh: async () => {
+      // Attempt the refresh. We don't gate on token expiry here — the
+      // user is in a known-stranded state, so a forced refresh is the
+      // recovery action even if `expiresAt` is technically still in
+      // the future (transient failures don't move expiresAt).
+      const refreshed = await oauth.refresh();
+      if (refreshed) return 'success';
+      const cls = oauth.getLastRefreshFailure();
+      if (cls === 'fatal') return 'fatal';
+      // Treat 'none' (no token / no creds — shouldn't happen here
+      // since the cycle is only armed after a prior transient failure
+      // with tokens still on disk) as transient: re-arm and try again.
+      return 'transient';
+    },
+    onSuccess: () => {
+      // ---- Recovery success ----
+      // Drive the same post-refresh side effects performFullReconnect
+      // would have done if the original refresh hadn't blown up:
+      // (1) push authenticated:true to flip renderer back to signed-in
+      // UI; (2) update the WS client's cached token; (3) trigger a
+      // fresh handshake so chat messages start flowing again.
+      const token = oauth.getToken();
+      if (token) {
+        mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+          authenticated: true,
+          scope: token.scope,
+          expiresAt: token.expiresAt,
+        } satisfies AuthStatus);
+        try {
+          chat.setToken(token.accessToken);
+          chat.reconnect();
+        } catch (chatErr) {
+          // chat.setToken / chat.reconnect failure here is rare and
+          // doesn't undo the recovery — the renderer is already back
+          // in signed-in state. Surface as a structured row so
+          // post-mortem can correlate, but don't re-arm the timer.
+          console.error('[main] transient-refresh-recovered chat handoff failed', chatErr);
+          appendErrorLog({
+            subsystem: 'oauth',
+            phase: 'oauth.transient-refresh-recovered-chat-failed',
+            errorMessage: errorToString(chatErr),
+          });
+        }
+      }
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.transient-refresh-recovered',
+        errorMessage: 'transient-refresh recovered',
+      });
+    },
+    onFatal: () => {
+      // ---- Give up: 4xx promotion to fatal ----
+      // refresh() already called logout() and wiped tokenEnc. The
+      // user truly does need to re-auth. Push the final signed-out
+      // state (NO tokenLikelyValid — we don't want the renderer to
+      // render the "Reconnecting…" banner because there's no recovery
+      // possible).
+      mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+        authenticated: false,
+      } satisfies AuthStatus);
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.transient-refresh-give-up',
+        errorMessage: 'transient-refresh escalated to fatal',
+      });
+    },
+    onTick: (info) => {
+      // Don't push a new AUTH_STATUS here — the renderer already has
+      // `authenticated: false, tokenLikelyValid: true,
+      // reconnectingDueToTransient: true` from the original
+      // performFullReconnect transient-branch push, so the banner
+      // stays up. Just log + bump.
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.transient-refresh-recovery-tick',
+        errorMessage: `still transient; next retry in ${info.nextDelayMs}ms (origin=${info.origin})`,
+        context: info,
+      });
+    },
+    onError: (err, origin) => {
+      console.error('[main] transient-refresh tick threw', err);
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.transient-refresh-tick-threw',
+        errorMessage: errorToString(err),
+        context: { origin },
+      });
+    },
+  });
+
+  // Closure-scoped facades — keep the existing call sites' contract
+  // (`armTransientRefreshRetry(origin)` / `cancelTransientRefreshRetry()`)
+  // stable so the diff stays focused on the state-machine extraction.
+  const armTransientRefreshRetry = (origin: string): void =>
+    transientRetry.arm(origin);
+  const cancelTransientRefreshRetry = (): void => transientRetry.cancel();
+
+  // v0.1.70 — make the watchdog reachable from startup-auth-resume.
+  // startup-auth-resume.ts runs BEFORE the renderer attaches its
+  // AUTH_STATUS listener, but it CAN observe `getLastRefreshFailure()`
+  // after its boot-time `refresh()` call returns undefined. If startup
+  // sees a transient failure, it should arm the watchdog so the user
+  // gets the self-healing experience on the very first launch after a
+  // network blip (e.g. wake-from-sleep into a still-handshaking VPN).
+  const armTransientRefreshRetryFromStartup = (): void =>
+    armTransientRefreshRetry('startup');
 
   // ----- v0.1.45: unified reconnect flow -----
   //
@@ -949,11 +1086,44 @@ app.on('ready', async () => {
             expiresAt: refreshed.expiresAt,
           } satisfies AuthStatus);
         } else {
-          // Refresh failed AND the token was already expired/about-to-expire.
-          // Reconnecting with this token would just produce a doomed handshake
-          // and a noisy reconnect loop. Surface the auth failure instead so
-          // the renderer can prompt re-auth via the existing AUTH_STATUS
-          // channel. Codex review (v0.1.7) flagged this as MUST-FIX.
+          // v0.1.70 (sign-out diagnosis 2026-05-25): discriminate
+          // transient vs fatal so a single network blip doesn't
+          // permanently strand the user on the sign-in screen.
+          //
+          // Pre-v0.1.70 every undefined-return from refresh() got the
+          // same `authenticated: false` push, even though `tokenEnc`
+          // was still on disk in the transient case (5xx / fetch threw)
+          // and a later retry could recover. The result: Ethan saw
+          // ONE `fetch threw` row in reconnect-events.jsonl, then
+          // 19 hours of sign-in screen with no recovery, despite the
+          // refresh-token still being valid.
+          const cls = oauth.getLastRefreshFailure();
+          if (cls === 'transient') {
+            // 5xx / fetch threw — tokenEnc still on disk. Hint the
+            // renderer this is recoverable + arm the periodic retry so
+            // the user doesn't have to manually re-auth when the
+            // network comes back. The renderer renders a
+            // "Reconnecting…" banner with a "Retry now" button instead
+            // of the bare sign-in CTA.
+            mainWindow?.webContents.send(IPC.AUTH_STATUS, {
+              authenticated: false,
+              tokenLikelyValid: true,
+              reconnectingDueToTransient: true,
+            } satisfies AuthStatus);
+            armTransientRefreshRetry('performFullReconnect');
+            appendErrorLog({
+              subsystem: 'oauth',
+              phase: 'oauth.transient-refresh-keep-trying',
+              errorMessage: 'refresh transient; armed retry loop, tokenEnc preserved',
+            });
+            return { ok: false, reason: 'refresh-failed' };
+          }
+          // Fatal — refresh() already called logout() and wiped the
+          // token. Reconnecting with this token would just produce a
+          // doomed handshake and a noisy reconnect loop. Surface the
+          // auth failure so the renderer can prompt re-auth via the
+          // existing AUTH_STATUS channel. Codex review (v0.1.7)
+          // flagged this as MUST-FIX.
           mainWindow?.webContents.send(IPC.AUTH_STATUS, {
             authenticated: false,
           } satisfies AuthStatus);
@@ -965,6 +1135,12 @@ app.on('ready', async () => {
       }
       chat.setToken(token.accessToken);
       chat.reconnect();
+      // v0.1.70: the token works again, so any prior transient-refresh
+      // retry cycle is moot. Cancel the timer + reset the backoff so the
+      // NEXT transient cycle (next time the user puts the laptop to
+      // sleep) starts fresh at 2m rather than wherever the previous
+      // cycle was capped.
+      cancelTransientRefreshRetry();
       return { ok: true };
     } catch (err) {
       console.error('[main] performFullReconnect failed', err);
@@ -1020,6 +1196,14 @@ app.on('ready', async () => {
   });
 
   ipcMain.handle(IPC.AUTH_LOGOUT, async () => {
+    // v0.1.70: user is explicitly signing out — cancel any armed
+    // transient-refresh retry BEFORE logout() wipes the token. Otherwise
+    // a pending timer would fire mid-logout, call refresh() against the
+    // (now-missing) refreshToken, get the no-token early return
+    // (classified as 'none' per refreshInner's reset), and push a
+    // weird `authenticated: true` to a renderer that was just told the
+    // user signed out. Race-free with this cancel-first ordering.
+    cancelTransientRefreshRetry();
     chat.stop();
     await oauth.logout();
     const status: AuthStatus = { authenticated: false };
@@ -1860,6 +2044,14 @@ app.on('ready', async () => {
       parentWindow: mainWindow,
       pushAuthStatus,
       resolveStartupAuth,
+      // v0.1.70 — boot-time transient-refresh recovery. If the very
+      // first oauth.refresh() at launch fails with a transient class
+      // (5xx / fetch threw — common after wake-from-sleep when the
+      // VPN / Wi-Fi handshake hasn't completed yet), arm the watchdog
+      // so the user gets the self-healing experience without manual
+      // intervention. Closure-captures armTransientRefreshRetry which
+      // is defined above in this same `app.on('ready')` callback.
+      armTransientRefreshRetry: armTransientRefreshRetryFromStartup,
       logWarn: console.warn,
       logError: console.error,
     });

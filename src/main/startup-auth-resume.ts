@@ -16,6 +16,16 @@ export interface StartupAuthResumeDeps {
     isAuthenticatedAsync: () => Promise<boolean>;
     getTokenAsync: () => Promise<TokenSet | undefined>;
     refresh: () => Promise<TokenSet | undefined>;
+    /**
+     * v0.1.70 (sign-out diagnosis 2026-05-25): expose the OAuth
+     * coordinator's last-refresh-failure classification so startup can
+     * distinguish "refresh-token genuinely dead, user has to re-auth"
+     * from "single network blip at boot, retry will recover". Optional
+     * for back-compat with existing test fakes that don't implement it
+     * — the resume helper falls back to "no transient signal" when
+     * absent.
+     */
+    getLastRefreshFailure?: () => 'none' | 'fatal' | 'transient';
   };
   chat: {
     setToken: (accessToken: string) => void;
@@ -27,6 +37,17 @@ export interface StartupAuthResumeDeps {
   parentWindow: StartupWindow;
   pushAuthStatus: () => void;
   resolveStartupAuth: () => void;
+  /**
+   * v0.1.70 — invoked when a boot-time `oauth.refresh()` returns
+   * undefined AND the classification is `'transient'`. The closure
+   * lives in main.ts and arms the periodic refresh-retry watchdog so
+   * the user gets the self-healing experience on the very first launch
+   * after a network blip (e.g. wake-from-sleep mid-VPN-handshake).
+   * Optional so existing tests that don't care about the watchdog can
+   * omit it; absent = no-op (boot stays signed-out for transient, same
+   * as pre-v0.1.70 behaviour).
+   */
+  armTransientRefreshRetry?: () => void;
   logWarn?: (message?: unknown, ...optionalParams: unknown[]) => void;
   logError?: (message?: unknown, ...optionalParams: unknown[]) => void;
 }
@@ -76,6 +97,24 @@ export async function resumeAuthWithCookieRepair(
         deps.chat.setToken(refreshed.accessToken);
         deps.chat.start();
         await repairStartupChatCookies(deps, warn, error);
+      } else if (
+        // v0.1.70 (sign-out diagnosis 2026-05-25): boot-time transient
+        // refresh failure. Pre-v0.1.70 this dropped the user straight to
+        // the sign-in screen on next launch even though the refresh
+        // token was still valid — exactly the "you got signed out
+        // overnight" bug. Now we hand off to the transient-refresh
+        // watchdog so the FIRST launch after a network blip self-heals
+        // on its own (2m / 4m / 8m… ladder).
+        //
+        // Guarded on optional capability so older tests that don't
+        // supply the deps stay green.
+        deps.armTransientRefreshRetry &&
+        deps.oauth.getLastRefreshFailure?.() === 'transient'
+      ) {
+        // Logged via appendErrorLog from the caller's arm-side log row;
+        // we keep this branch quiet here so we don't double-log the
+        // same recovery cycle.
+        deps.armTransientRefreshRetry();
       }
     }
   } catch (err) {

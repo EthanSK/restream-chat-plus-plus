@@ -527,6 +527,51 @@ export function App(): React.ReactElement {
           </button>
         </div>
       )}
+      {/*
+       * v0.1.70 (sign-out diagnosis 2026-05-25) — transient-refresh
+       * recovery banner.
+       *
+       * Renders when: NOT authenticated AND tokenLikelyValid is true
+       * (the main process flagged that `tokenEnc` is still on disk and
+       * we're inside the periodic refresh-retry watchdog loop). In this
+       * state the user has NOT been signed out — a single network blip
+       * tripped oauth.refresh() and the watchdog is retrying on a 2m →
+       * 4m → 8m … exponential ladder. The banner tells the user
+       * recovery is in progress and offers a manual "Retry now" button
+       * that invokes the same CONN_RECONNECT IPC the toolbar button
+       * uses — so an impatient user can force the next attempt instead
+       * of waiting for the next scheduled tick.
+       *
+       * Reuses the .send-notice class for visual consistency with the
+       * other transient-failure banner. Keeps the surface minimal:
+       * one sentence + one button, no dismiss (we WANT the user to
+       * know the app is mid-recovery — dismissing it would hide the
+       * fact that they're effectively offline).
+       */}
+      {!auth.authenticated && auth.tokenLikelyValid && (
+        <div
+          className="send-notice reconnecting-notice"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="send-notice-text">
+            Reconnecting — your session may resume automatically.
+          </span>
+          <button
+            className="send-notice-dismiss"
+            type="button"
+            aria-label="Retry reconnect now"
+            // Invokes the same IPC the toolbar Reconnect button uses,
+            // which goes through performFullReconnect → oauth.refresh()
+            // → on success, the main process pushes
+            // `authenticated: true` and this banner disappears.
+            onClick={() => void onReconnect()}
+            disabled={reconnecting}
+          >
+            {reconnecting ? 'Retrying…' : 'Retry now'}
+          </button>
+        </div>
+      )}
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />
         <span className="status-label">{statusLabel(conn, auth)}</span>

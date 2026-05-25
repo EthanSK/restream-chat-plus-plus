@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.1.70 — transient-refresh self-heal (sign-out diagnosis 2026-05-25)
+
+Ethan reported being unexpectedly signed out today. Disk forensics in
+`~/Library/Logs/Restream Chat++/reconnect-events.jsonl` showed a single
+`failureReason:refresh-failed` row at `2026-05-24T19:14:39Z` — one
+`fetch threw` in `oauth.refresh()` (almost certainly network sleep,
+given the `471944ms` stale-inbound that preceded it). The refresh
+token was STILL on disk and valid, but `performFullReconnect` saw
+`refresh()` returned undefined and pushed
+`AUTH_STATUS { authenticated: false }` to the renderer → renderer
+flipped to the bare sign-in screen. The WS auto-retry gave up after
+one attempt; nothing retried for 19 hours.
+
+v0.1.70 fixes this by discriminating transient (5xx / `fetch threw`)
+from fatal (4xx / invalid_grant) refresh failures and adding a
+periodic refresh-retry watchdog with exponential backoff that
+auto-recovers when the network comes back. A single transient blip
+never permanently signs the user out again.
+
+### What's new
+
+- **`OAuthCoordinator.getLastRefreshFailure()` — classify the last
+  refresh outcome.** Returns `'none' | 'fatal' | 'transient'`. The
+  4xx wipe branch sets `'fatal'`, the 5xx + fetch-threw branches set
+  `'transient'`, and the success path resets to `'none'`. Pre-v0.1.70
+  callers couldn't tell these apart (everything was `undefined`).
+- **Transient-refresh-retry watchdog (`src/main/transient-refresh-retry.ts`).**
+  Single-instance state machine with exponential 2m → 4m → 8m → 16m →
+  30m schedule (capped). Arm on a transient failure; cancel on
+  AUTH_LOGOUT / successful chat.reconnect / before-quit. Idempotent —
+  concurrent arm() calls coalesce onto one outstanding timer (so the
+  60s WS auto-retry doesn't stack parallel ladders).
+- **`AuthStatus` gains `tokenLikelyValid` + `reconnectingDueToTransient`.**
+  Set when the main process is in a recoverable transient-failure
+  state. Renderer keys off these to render a "Reconnecting — your
+  session may resume automatically. [Retry now]" banner instead of the
+  bare sign-in CTA.
+- **Boot-time recovery via startup-auth-resume.** If the very first
+  `oauth.refresh()` at launch fails transiently (common after
+  wake-from-sleep mid-VPN-handshake), the watchdog arms on first
+  launch so the user gets the self-healing experience even on a fresh
+  process.
+- **Structured logging.** New `app-errors.jsonl` phases:
+  `oauth.transient-refresh-keep-trying` (initial arming),
+  `oauth.transient-refresh-recovery-tick` (per-tick), and
+  `oauth.transient-refresh-recovered` / `oauth.transient-refresh-give-up`
+  (terminal).
+
+### Tests
+
+- `src/__tests__/oauth-refresh-failure.test.ts` — adds 5 cases pinning
+  `getLastRefreshFailure()` classification across all four outcomes
+  plus the transient→success reset.
+- `src/__tests__/transient-refresh-retry.test.ts` — new file pinning
+  the controller state machine: arms at 2m, doubles, caps at 30m,
+  recovery success path, fatal give-up path, coalescing of concurrent
+  arms, cancel teardown, defensive refresh-throws → re-arm.
+
 ## v0.1.69 — exhaustive error-path logging + 7-day jsonl retention (voice 4015)
 
 Ethan voice 4015 (2026-05-24, ~17:06 BST):

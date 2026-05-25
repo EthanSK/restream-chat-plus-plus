@@ -178,6 +178,115 @@ describe('OAuthCoordinator.refresh — v0.1.52 failure handling', () => {
     expect((data as any).token).toBeDefined();
   });
 
+  // -------------------------------------------------------------------
+  // v0.1.70 (sign-out diagnosis 2026-05-25) — `getLastRefreshFailure()`
+  // classification pin tests. The bug fixed in v0.1.70 was that callers
+  // couldn't distinguish a transient refresh failure (token still on
+  // disk, retry will recover) from a fatal one (token wiped, user must
+  // re-auth) — both surfaced as `undefined`. These tests pin the four
+  // post-refresh classifications so the watchdog + performFullReconnect
+  // branch correctly.
+  // -------------------------------------------------------------------
+
+  it('v0.1.70: classifies 4xx as fatal via getLastRefreshFailure()', async () => {
+    const { store, data } = makeStore();
+    (data as any).token = { ...SAMPLE_TOKEN };
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: 'invalid_grant' }),
+    } as Response) as any;
+
+    const oauth = new OAuthCoordinator(store);
+    expect(await oauth.refresh()).toBeUndefined();
+    expect(oauth.getLastRefreshFailure()).toBe('fatal');
+  });
+
+  it('v0.1.70: classifies 5xx as transient via getLastRefreshFailure()', async () => {
+    const { store, data } = makeStore();
+    (data as any).token = { ...SAMPLE_TOKEN };
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: 'service_unavailable' }),
+    } as Response) as any;
+
+    const oauth = new OAuthCoordinator(store);
+    expect(await oauth.refresh()).toBeUndefined();
+    expect(oauth.getLastRefreshFailure()).toBe('transient');
+  });
+
+  it('v0.1.70: classifies fetch-throw as transient via getLastRefreshFailure()', async () => {
+    const { store, data } = makeStore();
+    (data as any).token = { ...SAMPLE_TOKEN };
+    // Exact bug-of-the-week: fetch() threw mid-call (network sleep /
+    // VPN handoff / DNS hiccup). Pre-v0.1.70 this looked identical to
+    // an invalid_grant from the caller's perspective.
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('ECONNRESET')) as any;
+
+    const oauth = new OAuthCoordinator(store);
+    expect(await oauth.refresh()).toBeUndefined();
+    expect(oauth.getLastRefreshFailure()).toBe('transient');
+  });
+
+  it('v0.1.70: classifies success as none via getLastRefreshFailure()', async () => {
+    const { store, data } = makeStore();
+    (data as any).token = { ...SAMPLE_TOKEN };
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'fresh',
+        refresh_token: 'rotated',
+        token_type: 'Bearer',
+        scope: SAMPLE_TOKEN.scope,
+        expires_in: 3600,
+      }),
+    } as Response) as any;
+
+    const oauth = new OAuthCoordinator(store);
+    expect(await oauth.refresh()).toBeDefined();
+    // Cleared just before the return so the next reader sees a clean
+    // slate — important for the watchdog's recovery-success branch
+    // which reads this AFTER awaiting refresh().
+    expect(oauth.getLastRefreshFailure()).toBe('none');
+  });
+
+  it('v0.1.70: a transient failure followed by a success resets to none', async () => {
+    // Pins the watchdog's recovery-success state machine: after the
+    // initial transient failure (classification = 'transient'), the
+    // periodic retry tick eventually gets a 2xx, and that success
+    // path clears the classification to 'none' so subsequent reads
+    // (e.g. another tick somehow firing) don't see stale state.
+    const { store, data } = makeStore();
+    (data as any).token = { ...SAMPLE_TOKEN };
+    const oauth = new OAuthCoordinator(store);
+
+    // First attempt: 5xx → transient.
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: async () => ({}),
+    } as Response) as any;
+    await oauth.refresh();
+    expect(oauth.getLastRefreshFailure()).toBe('transient');
+
+    // Second attempt: 200 → none.
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'recovered',
+        refresh_token: 'rotated',
+        token_type: 'Bearer',
+        scope: SAMPLE_TOKEN.scope,
+        expires_in: 3600,
+      }),
+    } as Response) as any;
+    await oauth.refresh();
+    expect(oauth.getLastRefreshFailure()).toBe('none');
+  });
+
   it('on 200 success: rotates refresh-token and persists new pair', async () => {
     const { store, data } = makeStore();
     (data as any).token = { ...SAMPLE_TOKEN };

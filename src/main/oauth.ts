@@ -585,6 +585,54 @@ export class OAuthCoordinator {
   private refreshPromise?: Promise<TokenSet | undefined>;
 
   /**
+   * v0.1.70 (sign-out diagnosis 2026-05-25): classification of the most
+   * recent `refreshInner()` outcome. Existed implicitly before — the 4xx
+   * branch called `logout()` (wiped tokens) and the 5xx / fetch-threw
+   * branches just returned `undefined` leaving tokens on disk — but
+   * callers couldn't tell the two apart from the public surface
+   * (both returned `undefined`). performFullReconnect therefore treated
+   * EVERY undefined-result as fatal and pushed `authenticated: false`
+   * to the renderer, which permanently signed users out on a single
+   * transient network blip. Reconnect-events.jsonl showed exactly one
+   * `failureReason:refresh-failed` row preceded by a `471944ms`
+   * stale-inbound (laptop sleep), then the user sat on the sign-in
+   * screen for 19 hours despite `tokenEnc` still being on disk.
+   *
+   * This field lets callers (performFullReconnect, startup-auth-resume,
+   * the transient-refresh-retry watchdog) discriminate so they only
+   * wipe / re-auth on `'fatal'` and arm a recovery retry on `'transient'`.
+   *
+   * State transitions (all happen INSIDE refreshInner — read via the
+   * `getLastRefreshFailure()` getter):
+   *   - Initial value `'none'`. Set BEFORE any refresh call.
+   *   - On 2xx success → `'none'` (cleared just before returning the
+   *     new TokenSet so the next caller sees a clean slate).
+   *   - On 4xx (invalid_grant / invalid_client / etc — refresh token is
+   *     permanently dead, logout() already wiped state) → `'fatal'`.
+   *   - On 5xx (Restream side outage, token still valid) → `'transient'`.
+   *   - On fetch-threw catch (network sleep, DNS, ECONNRESET) → `'transient'`.
+   */
+  private lastRefreshFailure: 'none' | 'fatal' | 'transient' = 'none';
+
+  /**
+   * v0.1.70 — public getter for the classification field above. Callers
+   * read this IMMEDIATELY after awaiting `refresh()` to decide whether to
+   * (a) push `authenticated: false` to the renderer + give up, or (b) push
+   * `tokenLikelyValid: true, reconnectingDueToTransient: true` to keep
+   * the renderer in a self-healing "Reconnecting…" state and arm the
+   * periodic refresh-retry watchdog.
+   *
+   * IMPORTANT: only meaningful when the immediately-prior `refresh()` call
+   * returned `undefined`. If `refresh()` returned a TokenSet, this will
+   * read `'none'` (set just before the return). Don't rely on the value
+   * between calls — it's last-write-wins, single-flight by definition of
+   * the `refreshPromise` coalescer above.
+   */
+  getLastRefreshFailure(): 'none' | 'fatal' | 'transient' {
+    return this.lastRefreshFailure;
+  }
+
+  /**
    * If the access token is expired but a refresh token exists, refresh.
    * Returns the new token set or undefined if refresh failed / not possible.
    *
@@ -625,6 +673,13 @@ export class OAuthCoordinator {
   }
 
   private async refreshInner(): Promise<TokenSet | undefined> {
+    // v0.1.70: clear the prior-attempt classification BEFORE the work so
+    // the "no refresh token on disk" / "no creds" early-returns don't
+    // leave a stale 'transient'/'fatal' lying around for the next
+    // getLastRefreshFailure() reader. Those early returns are NOT errors
+    // — they mean "user is signed out, there's nothing to refresh" — so
+    // 'none' is the correct classification.
+    this.lastRefreshFailure = 'none';
     const existing = await this.getTokenAsync();
     if (!existing?.refreshToken) return undefined;
     const creds = loadRestreamCreds();
@@ -681,6 +736,10 @@ export class OAuthCoordinator {
             httpStatus: res.status,
             context: { errorCode: errCode ?? null, wipedTokens: true },
           });
+          // v0.1.70: classify as fatal BEFORE logout() so callers reading
+          // getLastRefreshFailure() after the awaited refresh() resolution
+          // see the right value. logout() does not touch this field.
+          this.lastRefreshFailure = 'fatal';
           await this.logout();
         } else {
           console.warn(
@@ -696,6 +755,12 @@ export class OAuthCoordinator {
             errorMessage: `refresh-transient status=${res.status}`,
             httpStatus: res.status,
           });
+          // v0.1.70: classify as transient. Token IS still on disk; the
+          // periodic refresh-retry watchdog armed by performFullReconnect
+          // will keep trying every 2m → 4m → 8m … until either Restream
+          // recovers (success path resets to 'none') or returns a 4xx
+          // (escalates to 'fatal' and finally signs the user out).
+          this.lastRefreshFailure = 'transient';
         }
         return undefined;
       }
@@ -709,6 +774,14 @@ export class OAuthCoordinator {
         expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000,
       };
       this.persistToken(tokenSet);
+      // v0.1.70: success path clears the failure classification BEFORE
+      // returning so the next caller that reads getLastRefreshFailure()
+      // sees a clean 'none' rather than a stale 'transient'/'fatal' from
+      // a previous attempt. Important: the recovery-success branch of the
+      // transient-refresh-retry watchdog reads this AFTER awaiting
+      // oauth.refresh() to know whether to reset its backoff and push
+      // `authenticated: true` to the renderer.
+      this.lastRefreshFailure = 'none';
       return tokenSet;
     } catch (err) {
       // v0.1.69 (voice 4015): network / fetch-threw path was silently
@@ -722,6 +795,12 @@ export class OAuthCoordinator {
         phase: 'oauth.refresh-fetch-threw',
         errorMessage: errorToString(err),
       });
+      // v0.1.70: fetch-throw is the EXACT signature of the bug we're
+      // fixing — laptop sleep / network drop / DNS hiccup. The token is
+      // still valid on disk; we just couldn't reach Restream right now.
+      // Classify as transient so the renderer stays in self-healing
+      // "Reconnecting…" mode instead of flipping to the sign-in screen.
+      this.lastRefreshFailure = 'transient';
       return undefined;
     }
   }
