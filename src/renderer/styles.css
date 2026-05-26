@@ -38,6 +38,82 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
+  /* v0.1.71 — relative positioning so .auth-boot-overlay can anchor
+     itself via `position: absolute; inset: 0` and cover the whole app
+     surface (including the toolbar Sign In button) during cold-start
+     auth resolution. */
+  position: relative;
+}
+
+/* v0.1.71 cold-start auth-resolution spinner (voice 4198, 2026-05-26).
+ *
+ * Renders as a centered card over the full app surface (including the
+ * toolbar) so a mis-click on the "Sign in to Restream" button can't
+ * reach the underlying handler during the ~1-2s window between renderer
+ * mount and the first AUTH_STATUS arrival. Stays visible through the
+ * `'checking'` → `'checking-slow'` transition (5s) and the
+ * `'checking-slow'` → `'verify_failed'` escalation (15s); disappears
+ * the moment a real AUTH_STATUS lands.
+ *
+ * Visual tier:
+ *   - Dimmed semi-transparent background so the underlying UI is still
+ *     faintly visible (signal that the app is up, just busy) but
+ *     pointer events are absorbed.
+ *   - Centered card with spinner + "Checking sign-in…" + optional
+ *     "Still checking…" subtitle for the slow-tier state.
+ *   - Retry button on the `verify_failed` state, no spinner.
+ */
+.auth-boot-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(13, 17, 23, 0.94);
+  color: var(--text-1);
+  /* Block clicks even on transparent corners — the overlay's job is to
+     swallow stray pointer events targeting the toolbar Sign In button. */
+  pointer-events: auto;
+  /* Soft fade-in so the overlay doesn't pop in jarringly if the cold
+     start happens to be ~10ms (which we'd then immediately tear down). */
+  animation: auth-boot-fade-in 120ms ease-out;
+}
+
+@keyframes auth-boot-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.auth-boot-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  /* Reuse the existing `spin` keyframes defined further down in this
+     file. Thicker border than the .update-banner-spinner so the
+     centered cold-start spinner is visually distinct. */
+  border: 2.5px solid var(--text-3);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+.auth-boot-message {
+  font-size: 14px;
+  color: var(--text-0);
+  font-weight: 500;
+}
+
+.auth-boot-subtitle {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* No spinner on the verify_failed state — the visual change from
+   "spinning" to "retry button" signals the state escalation. */
+.auth-boot-overlay.auth-boot-verify_failed .auth-boot-spinner {
+  display: none;
 }
 
 .titlebar {

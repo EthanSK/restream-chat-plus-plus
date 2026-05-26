@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { rcpp } from './api';
 import {
+  AuthBootState,
   AuthStatus,
   ChatConnection,
   ChatMessage,
@@ -10,6 +11,16 @@ import {
   Settings,
   UpdateInfo,
 } from '../shared/types';
+import {
+  AUTH_BOOT_FAIL_THRESHOLD_MS,
+  AUTH_BOOT_SLOW_THRESHOLD_MS,
+  initialAuthBootState,
+  isAuthBootPending,
+  reduceAuthBootOnFailTimeout,
+  reduceAuthBootOnSlowTimeout,
+  reduceAuthBootOnStatus,
+  shouldRenderBootOverlay,
+} from './auth-bootstate';
 import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
@@ -50,6 +61,33 @@ interface SendNotice {
 export function App(): React.ReactElement {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [auth, setAuth] = useState<AuthStatus>({ authenticated: false });
+  // v0.1.71 cold-start flicker fix (voice 4198, 2026-05-26).
+  //
+  // Tracks whether we've heard from the main process about the user's
+  // auth state yet. Initial value is 'checking' — the renderer
+  // DELIBERATELY does NOT trust its synchronous `auth` default (which
+  // is `{ authenticated: false }` purely because that's the only safe
+  // shape for `useState`'s initialiser). Until we observe a real
+  // AUTH_STATUS via either the initial pull (`rcpp.authStatus()`
+  // resolving) OR the deferred push (`onAuthStatus` firing), we render
+  // a centered "Checking sign-in…" spinner overlay that blocks ALL
+  // toolbar clicks — including the Sign In button. This stops Ethan
+  // from accidentally re-OAuthing during the ~1-2s cold-start window
+  // where the renderer is up but the main process hasn't yet decrypted
+  // the stored OAuth token. See `auth-bootstate.ts` for the full
+  // explanation + state-machine definition.
+  const [authBoot, setAuthBoot] = useState<AuthBootState>(initialAuthBootState);
+  // Refs to the slow + fail timeout handles so we can cancel them as
+  // soon as a real AUTH_STATUS lands (otherwise the spinner would still
+  // escalate to "Still checking…" mid-render even though we already
+  // resolved). Bookkeeping data — lives in refs because changing the
+  // handle shouldn't re-render the chat feed.
+  const authBootSlowTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const authBootFailTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const [conn, setConn] = useState<ConnectionState>({ status: 'idle', attempt: 0 });
   const [connections, setConnections] = useState<ChatConnection[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -159,13 +197,75 @@ export function App(): React.ReactElement {
     optimisticSendTimeoutsRef.current.set(clientId, timeout);
   };
 
+  // v0.1.71 — single helper invoked by every AUTH_STATUS source (initial
+  // pull, push channel, sign-in result, sign-out result, retry). Updates
+  // BOTH the existing `auth` shape AND the cold-start `authBoot`
+  // discriminator atomically, and cancels the slow/fail timers so the
+  // spinner overlay teardown happens exactly when the first real status
+  // lands. Calling this multiple times is safe — the timer-clear helpers
+  // are idempotent and the reducer keeps signed_in/signed_out in sync.
+  const applyAuthStatus = (next: AuthStatus): void => {
+    setAuth(next);
+    setAuthBoot((prev) => reduceAuthBootOnStatus(prev, next));
+    if (authBootSlowTimerRef.current) {
+      clearTimeout(authBootSlowTimerRef.current);
+      authBootSlowTimerRef.current = undefined;
+    }
+    if (authBootFailTimerRef.current) {
+      clearTimeout(authBootFailTimerRef.current);
+      authBootFailTimerRef.current = undefined;
+    }
+  };
+
+  // v0.1.71 — retry button on the verify_failed overlay state. Re-runs
+  // the initial AUTH_STATUS pull and re-arms the spinner state machine
+  // so a network hiccup that pushed us into the 15s timeout can self-
+  // recover without forcing the user to relaunch the app.
+  const retryAuthCheck = async (): Promise<void> => {
+    setAuthBoot('checking');
+    // Re-arm both timers from scratch — the previous instances were
+    // cleared the moment they fired, so this is a clean start.
+    authBootSlowTimerRef.current = setTimeout(() => {
+      setAuthBoot((prev) => reduceAuthBootOnSlowTimeout(prev));
+    }, AUTH_BOOT_SLOW_THRESHOLD_MS);
+    authBootFailTimerRef.current = setTimeout(() => {
+      setAuthBoot((prev) => reduceAuthBootOnFailTimeout(prev));
+    }, AUTH_BOOT_FAIL_THRESHOLD_MS);
+    try {
+      const a = await rcpp.authStatus();
+      applyAuthStatus(a);
+    } catch (err) {
+      console.error('[App] auth retry failed', err);
+      // Leave the spinner up; the fail timer will eventually re-escalate
+      // back to verify_failed and the user can try again.
+    }
+  };
+
   // Init: load auth + settings + current connection state, subscribe to events.
   useEffect(() => {
     let alive = true;
+    // v0.1.71 — arm the slow + fail timers BEFORE we await the initial
+    // `rcpp.authStatus()`. If the main process is healthy, the await
+    // resolves within ~1-2s and `applyAuthStatus` clears both timers
+    // before the 5s slow threshold fires. If the main process is slow
+    // (network, OAuth refresh in flight), the spinner adds the "Still
+    // checking…" subtitle at 5s. If it never responds (main stuck), we
+    // escalate to the retry affordance at 15s.
+    authBootSlowTimerRef.current = setTimeout(() => {
+      if (!alive) return;
+      setAuthBoot((prev) => reduceAuthBootOnSlowTimeout(prev));
+    }, AUTH_BOOT_SLOW_THRESHOLD_MS);
+    authBootFailTimerRef.current = setTimeout(() => {
+      if (!alive) return;
+      setAuthBoot((prev) => reduceAuthBootOnFailTimeout(prev));
+    }, AUTH_BOOT_FAIL_THRESHOLD_MS);
     (async () => {
       const a = await rcpp.authStatus();
       if (!alive) return;
-      setAuth(a);
+      // applyAuthStatus replaces setAuth + clears the boot timers — DO
+      // NOT call setAuth(a) directly here, that would leave the spinner
+      // overlay stuck on screen until the next push.
+      applyAuthStatus(a);
       const s = await rcpp.getSettings();
       if (!alive) return;
       setSettings(s);
@@ -215,7 +315,10 @@ export function App(): React.ReactElement {
       }
     })();
 
-    const offAuth = rcpp.onAuthStatus(setAuth);
+    // v0.1.71 — push channel goes through applyAuthStatus too so the
+    // very FIRST AUTH_STATUS (whichever source wins the race — initial
+    // pull or did-finish-load push) tears down the cold-start spinner.
+    const offAuth = rcpp.onAuthStatus(applyAuthStatus);
     const offConn = rcpp.onConnectionState(setConn);
     const offConnections = rcpp.onConnections(setConnections);
     const offChat = rcpp.onChatMessage((m) => {
@@ -358,6 +461,16 @@ export function App(): React.ReactElement {
       offSettingsPush();
       offUpdate();
       clearAllOptimisticSendTimeouts('unmount');
+      // v0.1.71 — drop cold-start spinner timers on unmount so they
+      // can't fire setState after we've torn down (React would warn).
+      if (authBootSlowTimerRef.current) {
+        clearTimeout(authBootSlowTimerRef.current);
+        authBootSlowTimerRef.current = undefined;
+      }
+      if (authBootFailTimerRef.current) {
+        clearTimeout(authBootFailTimerRef.current);
+        authBootFailTimerRef.current = undefined;
+      }
     };
   }, []);
 
@@ -452,7 +565,10 @@ export function App(): React.ReactElement {
   const onSignIn = async () => {
     try {
       const s = await rcpp.authStart();
-      setAuth(s);
+      // v0.1.71 — route through applyAuthStatus so the boot-state
+      // discriminator stays in sync (an explicit sign-in click after
+      // a cold-start verify_failed should also clear the spinner).
+      applyAuthStatus(s);
     } catch (e) {
       // The main process will surface the error in the next CONN_STATE update;
       // we just keep the UI responsive.
@@ -475,7 +591,9 @@ export function App(): React.ReactElement {
     const proceed = await shouldProceedWithSignOut(rcpp.authConfirmLogout);
     if (!proceed) return;
     const s = await rcpp.authLogout();
-    setAuth(s);
+    // v0.1.71 — applyAuthStatus instead of bare setAuth so the boot
+    // discriminator transitions signed_in → signed_out cleanly.
+    applyAuthStatus(s);
     clearAllOptimisticSendTimeouts('sign-out');
     setMessages([]);
   };
@@ -495,9 +613,77 @@ export function App(): React.ReactElement {
     }
   };
 
+  // v0.1.71 — derive both booleans once per render so the JSX below stays
+  // readable. `bootPending` gates the auth-keyed UI (toolbar Sign In, chat
+  // input, chat feed CTA). `overlayVisible` controls the spinner cover.
+  const bootPending = isAuthBootPending(authBoot);
+  const overlayVisible = shouldRenderBootOverlay(authBoot);
+
   return (
     <div className="app">
       <div className="titlebar">Restream Chat++</div>
+      {/*
+       * v0.1.71 cold-start spinner overlay (voice 4198, 2026-05-26).
+       *
+       * Renders ABOVE the toolbar so it physically blocks any click on
+       * the "Sign in to Restream" button during the cold-start window
+       * (~1-2s in the happy case, up to 15s in the degraded case). The
+       * overlay is full-app width but only covers the upper portion of
+       * the viewport so the user can still see we haven't crashed.
+       *
+       * Three visual states keyed off `authBoot`:
+       *   - 'checking'      → spinner + "Checking sign-in…"
+       *   - 'checking-slow' → spinner + "Checking sign-in…" + subtitle
+       *                       "Still checking…"
+       *   - 'verify_failed' → no spinner; "Couldn't verify sign-in" copy
+       *                       + Try again button that calls
+       *                       `retryAuthCheck` and re-arms the state
+       *                       machine.
+       *
+       * The overlay uses `pointer-events: auto` on its content but
+       * `pointer-events: none` on its outer corners is NOT enough — we
+       * need the entire surface to absorb clicks so a mis-aim on the
+       * "Sign in" button can't fall through. CSS uses `position:
+       * absolute; inset: 0; z-index: 50` to cover everything including
+       * the toolbar.
+       */}
+      {overlayVisible && (
+        <div
+          className={`auth-boot-overlay auth-boot-${authBoot}`}
+          role="status"
+          aria-live="polite"
+          // Block ANY click that aims at the toolbar Sign In button by
+          // absorbing the event at the overlay layer. Belt-and-braces
+          // because the toolbar is hidden under the overlay AND the
+          // toolbar's auth-keyed buttons are themselves gated on
+          // `!bootPending`, but a stray pointer event landing on either
+          // surface stays harmless.
+          onClick={(e) => e.stopPropagation()}
+        >
+          {authBoot === 'verify_failed' ? (
+            <>
+              <div className="auth-boot-message">
+                Couldn&rsquo;t verify sign-in — try again
+              </div>
+              <button
+                className="btn primary"
+                type="button"
+                onClick={() => void retryAuthCheck()}
+              >
+                Try again
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="auth-boot-spinner" aria-hidden="true" />
+              <div className="auth-boot-message">Checking sign-in&hellip;</div>
+              {authBoot === 'checking-slow' && (
+                <div className="auth-boot-subtitle">Still checking&hellip;</div>
+              )}
+            </>
+          )}
+        </div>
+      )}
       <UpdateBanner
         info={updateInfo}
         dismissed={updateDismissed}
@@ -574,7 +760,18 @@ export function App(): React.ReactElement {
       )}
       <div className="toolbar">
         <span className={`status-dot ${conn.status}`} />
-        <span className="status-label">{statusLabel(conn, auth)}</span>
+        {/*
+         * v0.1.71 — while bootState is still resolving, the status label
+         * reads "Checking sign-in…" instead of the misleading "Not signed
+         * in" default. Once we have a real AUTH_STATUS, statusLabel takes
+         * over and reflects the actual conn/auth state. (The overlay
+         * sitting on top of the toolbar covers this anyway, but the
+         * `aria-live="polite"` overlay text is what a screen reader picks
+         * up; the toolbar label stays accurate underneath.)
+         */}
+        <span className="status-label">
+          {bootPending ? 'Checking sign-in…' : statusLabel(conn, auth)}
+        </span>
         {auth.authenticated && (
           <button
             className={`btn icon ghost reconnect-btn${reconnecting ? ' spinning' : ''}`}
@@ -619,6 +816,14 @@ export function App(): React.ReactElement {
               Sign out
             </button>
           </>
+        ) : bootPending ? (
+          // v0.1.71 — defence-in-depth. The overlay covers the toolbar
+          // already, but we ALSO suppress the bare Sign In button so a
+          // bug in the overlay's z-index/positioning can't expose a
+          // clickable Sign In during the cold-start window. The overlay
+          // is the user-facing affordance; the absence of any toolbar
+          // CTA here is purely a safety net.
+          null
         ) : (
           <button className="btn primary" onClick={onSignIn}>
             Sign in to Restream

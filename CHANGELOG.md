@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.1.71 — cold-start auth flicker fix (voice 4198, 2026-05-26)
+
+Ethan voice 4198 (2026-05-26):
+> The Restream Chat plus plus app, when I first opened it, it said I was
+> signed out. But then it signed in, and there needs to be some loading.
+> Yeah, I accidentally signed in while it's loading.
+
+On cold start the renderer's `useState<AuthStatus>({ authenticated: false })`
+defaulted to a synchronously-rendered "signed out" UI: the toolbar
+showed the "Sign in to Restream" button before the main process had
+finished its async `oauth.getTokenAsync()` decrypt (~1-2s on cold
+start). During that window a click on Sign In kicked off a fresh
+OAuth round-trip the user did NOT want.
+
+v0.1.71 fixes this with a separate `AuthBootState` discriminator that
+starts in `'checking'` and only transitions to `'signed_in'` /
+`'signed_out'` once the renderer has observed a real AUTH_STATUS
+from the main process (either via the initial `rcpp.authStatus()`
+pull OR the deferred `onAuthStatus` push, whichever wins).
+
+### What's new
+
+- **Cold-start spinner overlay.** While `authBoot` is `'checking'` or
+  `'checking-slow'`, a centered card with a spinner + "Checking
+  sign-in…" message covers the full app surface (z-index above the
+  toolbar). The toolbar's Sign In button is ALSO suppressed at the JSX
+  layer as a defence-in-depth — overlay covers it visually, JSX gate
+  blocks the click handler entirely.
+- **Slow + fail tiers.** At 5s elapsed the spinner gains a "Still
+  checking…" subtitle (so the user doesn't think the app is hung). At
+  15s with still no AUTH_STATUS the overlay flips to a "Couldn't
+  verify sign-in — try again" affordance with a retry button that
+  re-runs `rcpp.authStatus()` and re-arms the state machine.
+- **AuthBootState type.** Five-state discriminator
+  (`'checking' | 'checking-slow' | 'signed_in' | 'signed_out' | 'verify_failed'`)
+  plus pure reducers in `src/renderer/auth-bootstate.ts`. Single helper
+  `applyAuthStatus()` in `App.tsx` is the only call site that mutates
+  both `auth` + `authBoot` together so every AUTH_STATUS source (initial
+  pull, push, sign-in result, sign-out result, retry) goes through one
+  path.
+
+### Tests
+
+- `src/__tests__/auth-bootstate.test.ts` — 25 cases pinning every
+  reducer transition (including the timer-race safety case where a
+  late slow/fail timer fires after `applyAuthStatus` has already
+  resolved). All 530 tests across the repo pass.
+
+### Notes
+
+- The v0.1.70 transient-refresh banner (mid-session refresh failure)
+  is orthogonal and unchanged. v0.1.70 = "we WERE signed in, hit a
+  blip, recovering"; v0.1.71 = "we don't know yet, please wait". The
+  v0.1.71 spinner only renders during cold-start; once we've resolved
+  once, the v0.1.70 banner takes over for mid-session blips.
+
 ## v0.1.70 — transient-refresh self-heal (sign-out diagnosis 2026-05-25)
 
 Ethan reported being unexpectedly signed out today. Disk forensics in

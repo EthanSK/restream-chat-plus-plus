@@ -673,6 +673,52 @@ export interface UpdateInfo {
   checkedAt: number;
 }
 
+/**
+ * v0.1.71 (cold-start flicker fix — voice 4198, 2026-05-26).
+ *
+ * Tracks the renderer's view of "have we resolved the user's auth state yet?"
+ *
+ * BUG IT FIXES: pre-v0.1.71 the renderer's `auth` state defaulted to
+ * `{ authenticated: false }` synchronously at mount, BEFORE the main process
+ * had finished its async `oauth.getTokenAsync()` decrypt + the deferred
+ * `pushAuthStatus()` (~1-2 sec on cold start). During that window the
+ * toolbar rendered the "Sign in to Restream" button. The user could (and
+ * did, on 2026-05-26) accidentally click it and kick off a fresh OAuth
+ * round-trip they didn't want.
+ *
+ * Fix: the renderer's UI now keys off this discriminator. While we're in
+ * `'checking'`, we render a centered spinner overlay that blocks the
+ * Sign In button (and any other auth-keyed UI). The very first
+ * AUTH_STATUS we observe — whether from the initial `await rcpp.authStatus()`
+ * pull OR the deferred `onAuthStatus` push — transitions us to
+ * `'signed_in'` or `'signed_out'` and the spinner disappears.
+ *
+ * State values:
+ *   - `'checking'`           — initial; main process hasn't told us yet.
+ *   - `'checking-slow'`      — same as `'checking'` but >5s elapsed. UI
+ *                              adds a "Still checking…" subtitle so the
+ *                              user doesn't think the app is hung.
+ *   - `'signed_in'`          — terminal; first AUTH_STATUS had
+ *                              `authenticated: true`.
+ *   - `'signed_out'`         — terminal; first AUTH_STATUS had
+ *                              `authenticated: false`.
+ *   - `'verify_failed'`      — 15s elapsed with NO AUTH_STATUS. UI offers
+ *                              a "Couldn't verify sign-in — try again"
+ *                              affordance with a retry button that
+ *                              re-runs `rcpp.authStatus()`.
+ *
+ * Pairs with `tokenLikelyValid` / `reconnectingDueToTransient` for the
+ * orthogonal mid-session refresh case (v0.1.70). Those handle "we WERE
+ * signed in, hit a network blip, recovering"; this handles "we don't
+ * know yet, please wait".
+ */
+export type AuthBootState =
+  | 'checking'
+  | 'checking-slow'
+  | 'signed_in'
+  | 'signed_out'
+  | 'verify_failed';
+
 export interface AuthStatus {
   authenticated: boolean;
   scope?: string;
