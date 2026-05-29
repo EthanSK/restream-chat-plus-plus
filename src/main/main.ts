@@ -1179,6 +1179,19 @@ app.on('ready', async () => {
     });
   });
 
+  // v0.1.73 (Ethan voice 4364, 2026-05-28) — re-enable the v0.1.45
+  // 60s auto-reconnect timer at app boot. The field-default in
+  // ws-client.ts stays `false` so unit tests keep deterministic
+  // control; the SHIPPING app opts in here.
+  //
+  // CRITICAL ORDER: this MUST be called AFTER `setReconnectProvider`
+  // above. The provider is what the auto-tick runs (`performFullReconnect`
+  // → OAuth refresh + chat.reconnect); without it the tick would fall
+  // back to the legacy bare-WS reconnect which doesn't refresh the
+  // OAuth token first. See `ws-client.ts` AUTO_RETRY_INTERVAL_MS
+  // comment block for the full why (v0.1.47 disable → v0.1.73 re-enable).
+  chat.setAutoReconnectEnabled(true);
+
   // ----- IPC: force reconnect (renderer "Reconnect" toolbar button) -----
   // Wires the manual button to the SAME performFullReconnect function
   // the auto-retry path uses. v0.1.45.

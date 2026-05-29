@@ -55,18 +55,38 @@ const RAW_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB before rotating
  * v0.1.45: introduced — every 60s while disconnected, run the same flow
  * as the manual Reconnect button (OAuth refresh → chat.reconnect).
  *
- * v0.1.47: **auto-reconnect is DISABLED by default** (Ethan voice 3630 —
+ * v0.1.47: **auto-reconnect was DISABLED by default** (Ethan voice 3630 —
  * the 60s loop and the legacy exponential-backoff path were both
  * generating constant network traffic against api.restream.io that
  * Ethan suspected was clogging his Wi-Fi / ISP). On any disconnect we
- * now flip to `disconnected` and stay there until the user manually
- * clicks Reconnect (which goes through `performFullReconnect()` →
- * `chat.reconnect()` and is unaffected by this change). The interval
- * constant + `setReconnectProvider` / `setAutoAttemptListener` API
- * surface are kept so the v0.1.45 unit tests can still opt-in via
- * `setAutoReconnectEnabled(true)`, but the default for the shipped app
- * is OFF. To restore the old behaviour app-wide, set
- * `client.setAutoReconnectEnabled(true)` from main.ts.
+ * flipped to `disconnected` and stayed there until the user manually
+ * clicked Reconnect.
+ *
+ * v0.1.73: **re-enabled by default** (Ethan voice 4364, 2026-05-28 —
+ *   "let's just turn it back on. The re auto reconnect thing. It's
+ *    too important.").
+ *
+ *   Two things changed in the meantime that make this safe again:
+ *
+ *   1. v0.1.70's TransientRefreshRetryController (the 2m → 4m → ... →
+ *      30m capped backoff for 5xx / fetch-throw refresh failures) is
+ *      now the primary "wait it out" mechanism for transient network
+ *      issues — see `src/main/transient-refresh-retry.ts`. The 60s
+ *      auto-reconnect loop sits on top of that, but in practice the
+ *      transient-refresh layer absorbs most brief blips BEFORE the
+ *      WS auto-reconnect ever fires.
+ *
+ *   2. The exponential WS backoff (BASE_BACKOFF_MS doubling to
+ *      MAX_BACKOFF_MS cap = 60s) means worst-case steady-state traffic
+ *      is ~1 reconnect attempt per minute once the disconnection
+ *      becomes persistent — which is the same cadence as the v0.1.45
+ *      auto-retry, NOT the runaway loop Ethan was worried about.
+ *
+ *   Flip is done at main.ts startup via
+ *   `chat.setAutoReconnectEnabled(true)` so the field-default stays
+ *   `false` and the unit tests keep deterministic control over the
+ *   flag. To turn the auto-loop back off for triage, comment out that
+ *   single line in main.ts — no other changes needed.
  */
 const AUTO_RETRY_INTERVAL_MS = 60_000;
 /**
@@ -168,13 +188,22 @@ export class ChatClient extends EventEmitter {
    */
   private providerInFlight = false;
   /**
-   * v0.1.47: Master switch for the auto-reconnect timer. Default OFF
-   * (see file-level comment on `AUTO_RETRY_INTERVAL_MS` — Ethan voice
-   * 3630). When false, `handleDisconnect` flips state to `disconnected`
-   * and does NOT schedule any retry timer. Manual `reconnect()` (the
+   * v0.1.47: Master switch for the auto-reconnect timer. Field-default
+   * stays FALSE so unit tests get deterministic control without having
+   * to remember to reset it.
+   *
+   * v0.1.73 (Ethan voice 4364, 2026-05-28): the SHIPPING app re-enables
+   * this at boot via `chat.setAutoReconnectEnabled(true)` in main.ts
+   * (after `setReconnectProvider` is installed so the very first auto
+   * tick runs through the unified `performFullReconnect()` path, not a
+   * bare reconnect). See the file-level `AUTO_RETRY_INTERVAL_MS`
+   * comment block for the rationale (TransientRefreshRetryController
+   * now absorbs transient blips; the 60s cap caps worst-case traffic).
+   *
+   * When false, `handleDisconnect` flips state to `disconnected` and
+   * does NOT schedule any retry timer. Manual `reconnect()` (the
    * toolbar button) is unaffected because it bypasses
-   * `handleDisconnect`. Tests can set this to true to exercise the
-   * v0.1.45 unified-provider behaviour.
+   * `handleDisconnect`.
    */
   private autoReconnectEnabled = false;
   /**

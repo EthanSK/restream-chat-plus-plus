@@ -611,9 +611,81 @@ export interface TtsLogEvent {
     | 'native_speak_end'
     | 'native_speak_error'
     | 'native_speak_killed'
-    | 'native_queue_size';
+    | 'native_queue_size'
+    // v0.1.73 (Ethan voice 4364, 2026-05-28) — explicit decision-gate
+    // logging. EVERY message that flows through the App.tsx side-effect
+    // useEffect now emits one of these rows BEFORE the engine is called
+    // (or BEFORE the skip is taken). The `data` payload always carries
+    // `{ messageId, username, platform, decision, reason }` plus path-
+    // specific extras (regex source line for content-regex / username-
+    // regex hits, etc). The two paths are logged INDEPENDENTLY so a
+    // message that's TTS-skipped but notification-allowed shows two
+    // rows with different `decision` fields — that's the contract.
+    //
+    // Why this matters: before v0.1.73 the only TTS log row was the
+    // engine-level `speak_called`. If a message was filtered out
+    // upstream (regex, hidden user, self-ignore, disabled, etc) there
+    // was NO row indicating "we saw this message and decided not to
+    // speak it" — so a user reporting "this didn't get read aloud"
+    // couldn't be answered by grepping the log. Voice 4364 explicitly
+    // called this out: "Is there something indicating it was read
+    // aloud? If not, we need to add that to the logs, but, like,
+    // that's fucked."
+    | 'tts_decision'
+    | 'notification_decision';
   data?: Record<string, unknown>;
 }
+
+/**
+ * v0.1.73 — decision-gate reason taxonomy. Stable lowercase identifiers so
+ * `tts-events.jsonl` rows can be grouped by reason for forensic analysis.
+ *
+ * `read` / `notify` is the single success-path reason emitted alongside
+ * `decision: 'read'` (TTS) or `decision: 'notify'` (notifications). All
+ * other reasons fire with `decision: 'skip'`.
+ *
+ * Keep this union in lock-step with the literals emitted from
+ * `decideSideEffects` in src/renderer/side-effect-decision.ts.
+ */
+export type TtsDecisionReason =
+  // SUCCESS — emit alongside `decision: 'read'` (TTS path) only.
+  | 'read'
+  // SKIP reasons (in roughly the order they're checked):
+  // - 'pending-send': optimistic placeholder, not the WS-confirmed echo
+  // - 'same-id-reprocess': useEffect re-fire for an already-spoken id
+  // - 'self': v0.1.72 self-ignore — local user's own outgoing message
+  // - 'platform-disabled': settings.filter.platforms[m.platform] === false
+  // - 'hidden-user': username in settings.hiddenUsers
+  // - 'engine-disabled': settings.tts.enabled === false
+  // - 'content-regex': matched a ttsIgnoreRegex / content axis
+  // - 'username-regex': matched a ttsIgnoreUsernameRegex / username axis
+  | 'pending-send'
+  | 'same-id-reprocess'
+  | 'self'
+  | 'platform-disabled'
+  | 'hidden-user'
+  | 'engine-disabled'
+  | 'content-regex'
+  | 'username-regex';
+
+/**
+ * v0.1.73 — same shape as TtsDecisionReason but for the native-notification
+ * side-effect path. The two paths have distinct enabled-flags + distinct
+ * regex axes, so we keep the type unions separate even though the literals
+ * overlap. `rate-limited` is unique to the notification path (the renderer
+ * RateLimiter caps `maxPerMinute`).
+ */
+export type NotificationDecisionReason =
+  | 'notify'
+  | 'pending-send'
+  | 'same-id-reprocess'
+  | 'self'
+  | 'platform-disabled'
+  | 'hidden-user'
+  | 'engine-disabled'
+  | 'content-regex'
+  | 'username-regex'
+  | 'rate-limited';
 
 /**
  * Result of an update check, broadcast over IPC.UPDATE_STATUS / returned

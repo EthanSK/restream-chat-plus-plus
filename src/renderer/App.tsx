@@ -44,8 +44,17 @@ import {
   applyFailedSendStatus,
   dedupeOptimisticOnEcho,
   pushOptimisticMessage,
-  shouldTriggerSideEffects,
 } from './chat-message-reducers';
+// v0.1.73 — decision-gate evaluator. Single source of truth for which
+// path a message takes through TTS / notifications. App.tsx logs the
+// decision result AND uses it to drive the engine call, so the log and
+// the actual behaviour are guaranteed to match.
+import {
+  composeDecisionLogData,
+  decideNotificationAction,
+  decideTtsAction,
+  type SideEffectContext,
+} from './side-effect-decision';
 import {
   applyOptimisticSendTimeout,
   logOptimisticSendTimeout,
@@ -549,44 +558,102 @@ export function App(): React.ReactElement {
   // Forward each new message to TTS + native notifications, honouring the
   // platform filter and the v0.1.26 regex-ignore lists.
   //
-  // v0.1.26 product direction: ALL messages are read aloud / notified by
-  // default, including the user's own `self: true` reply_created echoes.
-  // v0.1.10's self-exclusion is deliberately removed. Users who want to
-  // silence their own outgoing messages add a regex to the corresponding
-  // `Settings.filters.*.ignoreRegex` list — the per-message `ignoredByTts`
-  // / `ignoredByNotifications` flags set at insertion time tell us to
-  // skip the side effect AND render the badge.
+  // v0.1.73 (Ethan voice 4364, 2026-05-28) — every decision-gate now emits
+  // a `tts_decision` / `notification_decision` row to tts-events.jsonl
+  // BEFORE the engine is called (or BEFORE the skip is taken). The pure
+  // helper `decideTtsAction` / `decideNotificationAction` lives in
+  // `side-effect-decision.ts` and is the single source of truth for which
+  // path the message takes. We log the decision result AND use it to
+  // drive the engine call — so the log is GUARANTEED to match reality.
+  //
+  // Why this rewrite was needed: Ethan's voice 4364 caught a case where a
+  // viewer message didn't get read aloud and the existing log had NO row
+  // explaining why. We could see `speak_called` rows for messages that
+  // DID get read, but skips were invisible. Now every message produces
+  // at least 2 rows (one tts_decision, one notification_decision) and a
+  // forensic grep can answer "why didn't this get read" in one step.
+  //
+  // Gate ladder (same as pre-v0.1.73 behaviour — pure-function refactor only):
+  //   pending-send → self → same-id → platform → hidden-user → engine-disabled
+  //   → username-regex → content-regex → READ
+  // See `side-effect-decision.ts` for the full per-gate docstring.
   useEffect(() => {
     if (messages.length === 0) return;
     const m = messages[messages.length - 1];
-    // v0.1.60 — gate side effects (TTS + notification) to fire exactly
-    // once per logically-sent message. The optimistic-send flow inserts
-    // a `pendingSend: 'sending'` placeholder on Enter, then REPLACES it
-    // in place when the WS echo arrives. Both transitions change the
-    // `messages` array reference, so without this gate the send-sound
-    // would play twice (once on Enter, once on echo). Voice 2026-05-23:
-    // "I hear double messages sent. One when I click enter, one when
-    // it's sent. It should just be the one when it's sent now."
-    if (!shouldTriggerSideEffects(m, lastSpokenIdRef.current)) return;
-    if (!settings.filter.platforms[m.platform]) return;
-    // v0.1.72 — hidden users are silenced across EVERY surface: the row
-    // doesn't render (see `visibleMessages` below) AND TTS / notifications
-    // don't fire. "Hidden" means "as if they never spoke" — that's the
-    // user-mental-model contract of the Hide User affordance. Re-checked
-    // here in addition to `visibleMessages` because the side-effect
-    // useEffect runs against the FULL `messages` buffer (not the filtered
-    // view) so it can still see the latest arrival even when many hidden
-    // messages have streamed past.
-    if (isHiddenUser(m.username, hiddenUsersSetRef.current)) return;
 
-    lastSpokenIdRef.current = m.id;
-    if (settings.tts.enabled && !m.ignoredByTts) {
+    // Build the immutable decision-context snapshot once per message.
+    // The refs are dereferenced HERE — the decision module is pure and
+    // doesn't know about React refs.
+    const ctx: SideEffectContext = {
+      settings,
+      hiddenUsersSet: hiddenUsersSetRef.current,
+      ttsContentPatterns: ttsIgnoreRef.current,
+      ttsUsernamePatterns: ttsUsernameIgnoreRef.current,
+      notifContentPatterns: notifIgnoreRef.current,
+      notifUsernamePatterns: notifUsernameIgnoreRef.current,
+      lastProcessedId: lastSpokenIdRef.current,
+    };
+
+    // --- TTS path ---
+    const ttsResult = decideTtsAction(m, ctx);
+    // Emit BEFORE the engine call so a crash inside the engine doesn't
+    // hide the decision row.
+    rcpp.ttsLog('tts_decision', composeDecisionLogData(m, ttsResult));
+
+    // --- Notification path ---
+    // Decide INDEPENDENTLY of TTS so a message that's TTS-skipped but
+    // notification-allowed (or vice versa, via the per-axis regex lists)
+    // produces two correctly-distinct rows.
+    const notifResult = decideNotificationAction(m, ctx);
+
+    // The same-id-reprocess gate is the SHARED-state gate — we want
+    // lastSpokenIdRef bumped exactly once per non-reprocess message,
+    // regardless of which side effect actually fired. Bump it now (after
+    // both gates evaluated against the OLD value via ctx.lastProcessedId)
+    // so subsequent useEffect re-fires for THIS id short-circuit at the
+    // same-id gate. NOTE: `ttsResult.reason === 'same-id-reprocess'` is
+    // the right test — if EITHER path saw the message as new (i.e. not
+    // same-id), we should remember it. We check the TTS path since both
+    // paths apply the same-id gate identically.
+    if (ttsResult.reason !== 'same-id-reprocess') {
+      lastSpokenIdRef.current = m.id;
+    }
+
+    // Fire TTS engine if the decision said so.
+    if (ttsResult.decision === 'read') {
       ttsRef.current?.enqueue(m);
     }
-    if (settings.notifications.enabled && !m.ignoredByNotifications) {
+
+    // Notification path has an additional rate-limit gate that lives in
+    // the renderer (not the pure decider) because RateLimiter holds
+    // mutable token-bucket state. Evaluate it as a post-decision filter:
+    // if the decider says 'notify' but the limiter rejects, we emit a
+    // SECOND notification_decision row with `decision: 'skip', reason:
+    // 'rate-limited'`. This means a rate-limited message has BOTH a
+    // 'notify' row (decider's verdict) AND a 'skip:rate-limited' row
+    // (limiter's verdict) — easier to spot a "the regex would have
+    // allowed it but rate limit blocked it" pattern in the log.
+    if (notifResult.decision === 'notify') {
       if (notifyLimiterRef.current.tryConsume()) {
+        rcpp.ttsLog(
+          'notification_decision',
+          composeDecisionLogData(m, notifResult),
+        );
         rcpp.notify(`${m.username} (${m.platform})`, m.text);
+      } else {
+        // Limiter said no — emit a `skip:rate-limited` row INSTEAD of
+        // the `notify` row so the log reflects what actually happened.
+        rcpp.ttsLog(
+          'notification_decision',
+          composeDecisionLogData(m, {
+            decision: 'skip',
+            reason: 'rate-limited',
+          }),
+        );
       }
+    } else {
+      // Decider already said skip — log its reason as-is.
+      rcpp.ttsLog('notification_decision', composeDecisionLogData(m, notifResult));
     }
     // We only react to the freshest message; intentionally omitting `settings` from deps when it changes mid-batch is fine because the engine + limiter pick up updates via refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
