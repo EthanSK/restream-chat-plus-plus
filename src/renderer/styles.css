@@ -1165,6 +1165,90 @@ body {
   color: var(--text-3);
 }
 
+/* --- v0.1.72 hide-user hover affordance + Hidden Users settings section --
+ *
+ * The per-row "Hide user" button only renders on hover (no constant
+ * visual noise in the feed), keyboard-focusable for accessibility.
+ * Sits inside .message-header right-aligned next to the timestamp.
+ *
+ * On hover of the parent .message-row, visibility flips to visible.
+ * `display: inline-block` (not none/block toggle) so the JSX always
+ * mounts and a screen reader can find it via Tab — only the visual
+ * presentation is gated on hover.
+ */
+.hide-user-btn {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  background: transparent;
+  border: 1px solid var(--text-3);
+  border-radius: 4px;
+  cursor: pointer;
+  visibility: hidden; /* Hidden until the row is hovered (or button focused). */
+  user-select: none;
+}
+.message-row:hover .hide-user-btn,
+.hide-user-btn:focus,
+.hide-user-btn:focus-visible {
+  /* Reveal on row-hover OR keyboard-focus so tab-nav can reach it. */
+  visibility: visible;
+}
+.hide-user-btn:hover {
+  color: var(--text-1, #fff);
+  border-color: var(--text-1, #fff);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Hidden Users section in the Settings drawer — list each currently-hidden
+ * username with a small Unhide button beside it. The empty-state copy
+ * explains where the list comes from so a user who hasn't clicked Hide
+ * yet understands the section. */
+.hidden-users-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hidden-users-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-1);
+  border-radius: 4px;
+  font-size: 12.5px;
+}
+.hidden-users-list .hidden-user-name {
+  font-weight: 500;
+  color: var(--text-1);
+  word-break: break-word;
+}
+.hidden-users-list .unhide-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid var(--text-3);
+  background: transparent;
+  color: var(--text-2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hidden-users-list .unhide-btn:hover {
+  color: var(--text-1, #fff);
+  border-color: var(--text-1, #fff);
+}
+.hidden-users-empty {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-3);
+  font-style: italic;
+}
+
 /* v0.1.34: the native Compose-window CSS block that lived here in
  * v0.1.32-v0.1.33 was removed alongside `ComposeApp.tsx` — the wrapper
  * window duplicated the inline send path with no functional value.

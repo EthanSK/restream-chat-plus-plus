@@ -8,7 +8,7 @@ import {
   TtsEngineKind,
 } from '../shared/types';
 import { sortVoicesByQuality, voiceQualityRank } from './tts';
-import { validateIgnoreList } from './message-filters';
+import { removeHiddenUser, validateIgnoreList } from './message-filters';
 
 interface Props {
   settings: Settings;
@@ -165,6 +165,40 @@ export function SettingsDrawer({
       },
     });
   }
+  // v0.1.72 — username-axis patch helpers. Symmetric with the content-axis
+  // textareas above. Empty strings (blank lines) survive the round-trip so
+  // mid-edit blanks don't snap-disappear under the user's cursor.
+  function patchTtsUsernameFilter(lines: string[]) {
+    onChange({
+      ...settings,
+      filters: {
+        ...settings.filters,
+        tts: { ...settings.filters.tts, ignoreUsernameRegex: lines },
+      },
+    });
+  }
+  function patchNotifUsernameFilter(lines: string[]) {
+    onChange({
+      ...settings,
+      filters: {
+        ...settings.filters,
+        notifications: {
+          ...settings.filters.notifications,
+          ignoreUsernameRegex: lines,
+        },
+      },
+    });
+  }
+  // v0.1.72 — Unhide handler. Calls the pure reducer + persists; uses
+  // the same `onChange` IPC path as every other settings patch so the
+  // main process broadcasts SETTINGS_PUSH and ChatFeed re-renders
+  // with the user's messages visible again on the next tick.
+  function unhideUser(username: string) {
+    onChange({
+      ...settings,
+      hiddenUsers: removeHiddenUser(settings.hiddenUsers ?? [], username),
+    });
+  }
   // Per-textarea validation memos — recompute only when the list changes.
   const ttsIgnoreErrors = useMemo(
     () => validateIgnoreList(settings.filters?.tts?.ignoreRegex ?? []),
@@ -173,6 +207,18 @@ export function SettingsDrawer({
   const notifIgnoreErrors = useMemo(
     () => validateIgnoreList(settings.filters?.notifications?.ignoreRegex ?? []),
     [settings.filters?.notifications?.ignoreRegex],
+  );
+  // v0.1.72 — username-axis validation memos.
+  const ttsUsernameIgnoreErrors = useMemo(
+    () => validateIgnoreList(settings.filters?.tts?.ignoreUsernameRegex ?? []),
+    [settings.filters?.tts?.ignoreUsernameRegex],
+  );
+  const notifUsernameIgnoreErrors = useMemo(
+    () =>
+      validateIgnoreList(
+        settings.filters?.notifications?.ignoreUsernameRegex ?? [],
+      ),
+    [settings.filters?.notifications?.ignoreUsernameRegex],
   );
 
   function togglePlatform(p: Platform) {
@@ -431,6 +477,127 @@ export function SettingsDrawer({
                 aria-invalid={notifIgnoreErrors.length > 0}
               />
             </div>
+            {/*
+              v0.1.72 (voice 4352, 2026-05-28) — username-axis regex textareas.
+              These match against `ChatMessage.username` (the author's
+              display name), independent of the content lists above. Within
+              a single side-effect (TTS or notifications), the content and
+              username axes OR-compose — if EITHER matches, the side effect
+              is suppressed. See applyMessageFilters() in message-filters.ts
+              for the contract.
+
+              Empty by default; users opt in by typing one regex per line.
+              The hover-row "Hide user" affordance writes EXACT usernames
+              into the separate `settings.hiddenUsers` list (Hidden Users
+              section below) — NOT into these regex textareas — because
+              hide-from-hover is an exact-match one-click action, whereas
+              these textareas exist for pattern-matching ("anyone whose
+              name starts with 'bot_'").
+            */}
+            <p className="section-hint" style={{ marginTop: 18 }}>
+              Username regexes — one per line. Matched case-insensitively
+              against the sender&apos;s display name. Independent from the
+              message-body regexes above.
+            </p>
+            <div className="filter-row">
+              <label htmlFor="tts-ignore-username-regex">
+                Ignore TTS for usernames matching:
+              </label>
+              <textarea
+                id="tts-ignore-username-regex"
+                className={`filter-regex${
+                  ttsUsernameIgnoreErrors.length > 0 ? ' invalid' : ''
+                }`}
+                rows={3}
+                spellCheck={false}
+                placeholder={'e.g. ^bot_\nstreamlabs$\nnightbot'}
+                value={(
+                  settings.filters?.tts?.ignoreUsernameRegex ?? []
+                ).join('\n')}
+                onChange={(e) =>
+                  patchTtsUsernameFilter(e.target.value.split('\n'))
+                }
+                title={
+                  ttsUsernameIgnoreErrors.length > 0
+                    ? ttsUsernameIgnoreErrors
+                        .map((er) => `Line ${er.line}: ${er.error}`)
+                        .join('\n')
+                    : 'TTS will skip any message whose USERNAME matches one of these regexes.'
+                }
+                aria-invalid={ttsUsernameIgnoreErrors.length > 0}
+              />
+            </div>
+            <div className="filter-row">
+              <label htmlFor="notif-ignore-username-regex">
+                Ignore notifications for usernames matching:
+              </label>
+              <textarea
+                id="notif-ignore-username-regex"
+                className={`filter-regex${
+                  notifUsernameIgnoreErrors.length > 0 ? ' invalid' : ''
+                }`}
+                rows={3}
+                spellCheck={false}
+                placeholder={'e.g. ^bot_\nstreamlabs$\nnightbot'}
+                value={(
+                  settings.filters?.notifications?.ignoreUsernameRegex ?? []
+                ).join('\n')}
+                onChange={(e) =>
+                  patchNotifUsernameFilter(e.target.value.split('\n'))
+                }
+                title={
+                  notifUsernameIgnoreErrors.length > 0
+                    ? notifUsernameIgnoreErrors
+                        .map((er) => `Line ${er.line}: ${er.error}`)
+                        .join('\n')
+                    : 'Native notifications will be suppressed for any message whose USERNAME matches one of these regexes.'
+                }
+                aria-invalid={notifUsernameIgnoreErrors.length > 0}
+              />
+            </div>
+          </section>
+
+          {/*
+            v0.1.72 (voice 4352, 2026-05-28) — Hidden Users section.
+            Populated by the per-row hover "Hide user" affordance in
+            ChatFeed; each entry can be Unhidden one-at-a-time here.
+
+            Hidden users are filtered from the visible feed entirely AND
+            their messages don't wake TTS / notifications either. This is
+            stronger than the regex lists above (which only suppress the
+            side effect — the message still renders with a "regex-ignored"
+            badge). "Hide" means "as if they never spoke".
+
+            Empty-state copy explains where entries come from so a user
+            who hasn't clicked Hide on any row understands what this is.
+          */}
+          <section className="section">
+            <h3>Hidden Users</h3>
+            <p className="section-hint">
+              Click <strong>Hide user</strong> on any chat row to add them
+              here. Their messages disappear from the feed and never trigger
+              TTS or notifications. Case-insensitive exact-match.
+            </p>
+            {(settings.hiddenUsers ?? []).length === 0 ? (
+              <p className="hidden-users-empty">No hidden users yet.</p>
+            ) : (
+              <ul className="hidden-users-list">
+                {(settings.hiddenUsers ?? []).map((u) => (
+                  <li key={u}>
+                    <span className="hidden-user-name">{u}</span>
+                    <button
+                      type="button"
+                      className="unhide-btn"
+                      title={`Unhide ${u}`}
+                      aria-label={`Unhide ${u}`}
+                      onClick={() => unhideUser(u)}
+                    >
+                      Unhide
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
 
           <section className="section">

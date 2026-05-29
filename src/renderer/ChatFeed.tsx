@@ -22,6 +22,14 @@ interface Props {
    * the UI in lockstep.
    */
   connection: ConnectionState;
+  /**
+   * v0.1.72 (voice 4352, 2026-05-28) — invoked by the per-row hover
+   * "Hide user" button. App.tsx owns the hidden-users list + the persist
+   * round-trip; ChatFeed just surfaces the affordance + relays the
+   * click. Optional so older test-mount sites don't have to thread it
+   * through (tests that don't exercise hide can omit it).
+   */
+  onHideUser?: (username: string) => void;
 }
 
 /**
@@ -48,6 +56,7 @@ export function ChatFeed({
   messages,
   authenticated,
   connection,
+  onHideUser,
 }: Props): React.ReactElement {
   if (!authenticated) {
     return (
@@ -80,7 +89,13 @@ export function ChatFeed({
         data={messages}
         followOutput="smooth"
         initialTopMostItemIndex={messages.length - 1}
-        itemContent={(_, m) => <MessageRow message={m} />}
+        // v0.1.72 — thread `onHideUser` down to each row so the hover-
+        // affordance button can fire without ChatFeed reaching back into
+        // its own props inside the itemContent closure. Each MessageRow
+        // independently decides whether to render the button (no-op when
+        // the callback is undefined, e.g. test mounts that don't exercise
+        // hide).
+        itemContent={(_, m) => <MessageRow message={m} onHideUser={onHideUser} />}
       />
     </div>
   );
@@ -159,7 +174,16 @@ function EmptyFeedBody({
   }
 }
 
-function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElement {
+function MessageRow({
+  message: m,
+  onHideUser,
+}: {
+  message: ChatMessage;
+  // v0.1.72 — optional so test mounts that don't exercise the hide
+  // affordance can leave this off; production always passes it via
+  // ChatFeed → App.tsx → handleHideUser.
+  onHideUser?: (username: string) => void;
+}): React.ReactElement {
   // Self-originated messages (echoes of replies WE sent via the inline
   // send bar at the bottom of the feed) render visually distinct
   // — accent-tinted background + "You" username + "self" badge — so the
@@ -200,6 +224,18 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
   // are never auto-removed; subsequent sends are never blocked by them.
   const isSending = m.pendingSend === 'sending';
   const isFailed = m.pendingSend === 'failed';
+  // v0.1.72 — only surface the Hide-user affordance for incoming messages
+  // from a NAMED user. Hiding "You" (self echoes), the anonymous
+  // "via Restream" common-reply rows, or messages with an empty username
+  // would either be nonsensical ("hide myself") or poison the hidden-users
+  // list with a meaningless string. The Hide button is therefore gated on
+  // (a) not-self, (b) non-empty trimmed username, (c) parent passed
+  // `onHideUser`. The button itself appears via CSS hover on the row.
+  const canHide =
+    !m.self &&
+    typeof m.username === 'string' &&
+    m.username.trim().length > 0 &&
+    typeof onHideUser === 'function';
   return (
     <div
       className={
@@ -228,6 +264,37 @@ function MessageRow({ message: m }: { message: ChatMessage }): React.ReactElemen
             >
               sending…
             </span>
+          )}
+          {/*
+            v0.1.72 — per-row "Hide user" affordance (voice 4352, 2026-05-28).
+            Rendered last in the message-header so it sits at the right edge
+            of the row. CSS .hide-user-btn defaults to `visibility: hidden`
+            and the parent .message-row:hover .hide-user-btn flips it to
+            `visible` — that gives the hover-reveal UX without an
+            onMouseEnter / onMouseLeave state dance.
+
+            On click: append `m.username` (case-preserved trim) to the
+            persistent `settings.hiddenUsers` list. App.tsx owns the
+            mutation + persist round-trip; ChatFeed is purely the relay
+            surface.
+
+            stopPropagation guards against the feed's right-click context
+            menu opening — left clicks on the button shouldn't bubble up
+            to a parent handler if a future redesign attaches one.
+          */}
+          {canHide && (
+            <button
+              className="hide-user-btn"
+              type="button"
+              title={`Hide all messages from ${m.username}`}
+              aria-label={`Hide user ${m.username}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onHideUser?.(m.username);
+              }}
+            >
+              Hide user
+            </button>
           )}
         </div>
         <div className="body">

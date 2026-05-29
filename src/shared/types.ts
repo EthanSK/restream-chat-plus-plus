@@ -192,17 +192,51 @@ export interface Settings {
    * independent — a message can be regex-ignored for TTS but still
    * trigger a notification (or vice versa).
    *
-   * Defaults to empty arrays — out of the box, every message is read
-   * aloud (when TTS is enabled) per the v0.1.26 product direction.
+   * v0.1.72 (voice 4352, 2026-05-28) — added `ignoreUsernameRegex` as a
+   * SECOND matching axis. The content regex matches against
+   * `ChatMessage.text`; the username regex matches against
+   * `ChatMessage.username` (the author's display name). The two axes
+   * COMPOSE within a side-effect — a message is filtered if EITHER axis
+   * matches. A rule that wants "content X AND username Y must both be
+   * true" would need a different shape; the v0.1.72 surface keeps the
+   * axes independent because that maps cleanly to the existing OR
+   * semantics ("if any pattern matches → ignore"). Username patterns
+   * also use the case-insensitive `i` flag uniformly.
+   *
+   * Defaults to empty arrays for the username lists — out of the box no
+   * usernames are filtered. The `ignoreRegex` content lists default to
+   * `['^viewer$']` per v0.1.48 — see the loadSettings docstring.
    */
   filters: {
     tts: {
       ignoreRegex: string[];
+      ignoreUsernameRegex: string[];
     };
     notifications: {
       ignoreRegex: string[];
+      ignoreUsernameRegex: string[];
     };
   };
+  /**
+   * v0.1.72 (voice 4352, 2026-05-28) — hidden-user list. Messages whose
+   * `username` exactly matches any string in this list are filtered out
+   * of the visible feed entirely (NOT just regex-ignored for side
+   * effects — they don't render at all). Populated by the hover →
+   * "Hide user" button on each chat row, removed via the Unhide button
+   * in the Settings drawer's Hidden Users section.
+   *
+   * Exact-match (case-INSENSITIVE) rather than regex because the hide
+   * action is one-click from a specific row — the user is naming a
+   * specific person, not authoring a pattern. Case-insensitive because
+   * usernames on Twitch/YouTube/etc. display in mixed case but the
+   * underlying identity is the same.
+   *
+   * Empty by default. Persists in electron-store alongside the rest of
+   * Settings. Historical messages already in the in-memory feed buffer
+   * get re-filtered on every render so clicking Hide hides their past
+   * messages too (not just future ones).
+   */
+  hiddenUsers: string[];
   /**
    * Update-checker preferences. The GH-Releases-API-backed poller in
    * `src/main/github-update-check.ts` reads `update.autoCheck` at every
@@ -265,9 +299,17 @@ export const DEFAULT_SETTINGS: Settings = {
     // pre-v0.1.48 default was empty; the existing settings of a user who
     // already has the v0.1.26 filters section persisted to disk are
     // upgraded via the one-time migration in `main.ts`.
-    tts: { ignoreRegex: ['^viewer$'] },
-    notifications: { ignoreRegex: ['^viewer$'] },
+    //
+    // v0.1.72 — the new `ignoreUsernameRegex` axis defaults empty. Users
+    // opt in via the Settings drawer textarea (one regex per line) or via
+    // the hover → "Hide user" affordance (which writes the EXACT
+    // username into `hiddenUsers`, NOT into this regex list — see below).
+    tts: { ignoreRegex: ['^viewer$'], ignoreUsernameRegex: [] },
+    notifications: { ignoreRegex: ['^viewer$'], ignoreUsernameRegex: [] },
   },
+  // v0.1.72 — fresh installs start with no hidden users. The list grows
+  // as the user clicks Hide on individual rows.
+  hiddenUsers: [],
   update: {
     // Opt-out, not opt-in: unsigned builds get no other update signal.
     autoCheck: true,

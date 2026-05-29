@@ -123,6 +123,20 @@ export function applyFailedSendStatus(
  *      re-fires and would re-speak that unrelated last message. Guard
  *      by remembering the id of the last message we acted on.
  *
+ * v0.1.72 (voice 4352, 2026-05-28) — added a THIRD hard-default gate:
+ *
+ *   3. Self-ignore. If `lastMessage.self === true`, the message is the
+ *      LOCAL user's own outgoing reply (Restream's `reply_created` echo,
+ *      normalised with `self: true` in src/main/normalize.ts). The local
+ *      user does NOT want their own messages read aloud or pushed as
+ *      notifications, full stop — that's noise from the user's own
+ *      action. This is NOT user-configurable; it's a hard default. The
+ *      previous v0.1.26 product direction ("read ALL messages including
+ *      self") was reverted here per Ethan voice 4352. Users who DO want
+ *      self-speak can drop a regex against their own username into the
+ *      v0.1.72 `ignoreUsernameRegex` list to PREVENT it (the inverse) —
+ *      but no setting re-enables self-speak today (YAGNI).
+ *
  * Returns `true` when the side effect should fire. `lastProcessedId`
  * is the id we most-recently spoke (or `undefined` on first call).
  */
@@ -135,6 +149,11 @@ export function shouldTriggerSideEffects(
   // "actually-sent" — never speak them. Only confirmed echoes (no
   // pendingSend) qualify.
   if (lastMessage.pendingSend !== undefined) return false;
+  // v0.1.72 — self-ignore. Local user's own messages never trigger TTS
+  // or notifications. This is the SINGLE gate point for the rule — any
+  // future caller of shouldTriggerSideEffects automatically inherits the
+  // self-ignore guarantee. Tested in src/__tests__/self-ignore.test.ts.
+  if (lastMessage.self === true) return false;
   // Same-id reprocessing guard (see docstring case 2).
   if (lastMessage.id === lastProcessedId) return false;
   return true;

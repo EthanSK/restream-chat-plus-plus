@@ -196,11 +196,17 @@ describe('shouldTriggerSideEffects (v0.1.60 — double-send-sound fix)', () => {
     expect(shouldTriggerSideEffects(failed, undefined)).toBe(false);
   });
 
-  it('returns true for a confirmed self-echo (no pendingSend)', () => {
-    expect(shouldTriggerSideEffects(wsEcho('local-x'), undefined)).toBe(true);
+  // v0.1.72 (voice 4352, 2026-05-28) — self-ignore became a hard default.
+  // The previous v0.1.26-v0.1.71 behaviour ("read ALL messages including
+  // self") was reverted. A confirmed self-echo (no pendingSend) is the
+  // user's OWN reply_created bounced back by the WS, and the user does
+  // NOT want to hear themselves or get notified about their own outgoing
+  // post. See src/__tests__/self-ignore.test.ts for the dedicated coverage.
+  it('returns FALSE for a confirmed self-echo (v0.1.72 self-ignore — was true pre-v0.1.72)', () => {
+    expect(shouldTriggerSideEffects(wsEcho('local-x'), undefined)).toBe(false);
   });
 
-  it('returns true for an incoming viewer message (no pendingSend)', () => {
+  it('returns true for an incoming viewer message (no pendingSend, not self)', () => {
     expect(shouldTriggerSideEffects(incoming('m-1'), undefined)).toBe(true);
   });
 
@@ -213,15 +219,22 @@ describe('shouldTriggerSideEffects (v0.1.60 — double-send-sound fix)', () => {
     expect(shouldTriggerSideEffects(undefined, undefined)).toBe(false);
   });
 
-  it('regression: simulate the full optimistic-send lifecycle and assert exactly ONE trigger', () => {
+  it('regression: full optimistic-send lifecycle fires ZERO times under v0.1.72 self-ignore', () => {
     // App.tsx's useEffect re-runs every time the `messages` array
     // reference changes. We simulate the exact sequence:
     //
     //   1. User hits Enter        → push placeholder (pendingSend='sending')
-    //   2. WS echo arrives        → dedupeOptimisticOnEcho replaces in place (pendingSend=undefined)
+    //   2. WS echo arrives        → dedupeOptimisticOnEcho replaces in place
+    //                               (pendingSend=undefined, self=true)
     //
-    // The pre-v0.1.60 code fired the side effect on BOTH. After the
-    // gate, only step 2 should fire.
+    // Pre-v0.1.60: BOTH steps fired the side effect (double send sound).
+    // v0.1.60: Step 1 gated by pendingSend; only Step 2 fired (one sound).
+    // v0.1.72: Step 2 ALSO gated by self===true; ZERO sounds for the
+    // user's own outgoing message. This is what voice 4352 asks for —
+    // "stop reading my own messages back to me."
+    //
+    // An incoming viewer message that arrives in between would still
+    // fire — that's covered by the next regression test.
     let messages: ChatMessage[] = [];
     let lastProcessedId: string | undefined = undefined;
     let triggerCount = 0;
@@ -234,21 +247,19 @@ describe('shouldTriggerSideEffects (v0.1.60 — double-send-sound fix)', () => {
       triggerCount += 1;
     };
 
-    // Step 1: optimistic insert.
+    // Step 1: optimistic insert (pendingSend gate keeps trigger off).
     messages = pushOptimisticMessage(messages, placeholder('local-x', 'hi'));
     runSideEffect();
-    expect(triggerCount).toBe(0); // placeholder is gated out
+    expect(triggerCount).toBe(0);
 
-    // Step 2: WS echo arrives.
+    // Step 2: WS echo arrives. Self===true keeps trigger off (v0.1.72).
     messages = dedupeOptimisticOnEcho(messages, wsEcho('local-x', 'hi'));
     runSideEffect();
-    expect(triggerCount).toBe(1); // echo fires exactly once
+    expect(triggerCount).toBe(0);
 
-    // Step 3: a hypothetical re-fire of the same useEffect (e.g. a
-    // descendant `setMessages` returning the same content) must NOT
-    // double-trigger.
+    // Step 3: re-fire of the same useEffect must NOT double-trigger.
     runSideEffect();
-    expect(triggerCount).toBe(1);
+    expect(triggerCount).toBe(0);
   });
 
   it('regression: viewer-message-between-placeholder-and-echo does NOT re-fire on dedupe-replace', () => {

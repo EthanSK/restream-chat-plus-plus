@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-29T00:21:51Z
+**Trigger:** voice 4352, 2026-05-28
+**Symptom:** User's own messages were read aloud by TTS and triggered native notifications; v0.1.26 had reverted self-ignore as a hard default, but voice 4352 (2026-05-28) reverses that direction
+**Root cause:** App.tsx side-effect useEffect had no self check; the only existing gate was the lapsed v0.1.10 implementation that removed in v0.1.26. With multiple side-effect paths (TTS, notifications, future ones), scattering 'if (m.self) return' across each is brittle and historically drifts (v0.1.10 -> v0.1.26 regression). Hidden-user list also needed a fully persistent storage path separate from the regex ignore lists
+**Fix:** Single gate at shouldTriggerSideEffects in src/renderer/chat-message-reducers.ts — added 'if (lastMessage.self === true) return false' so every caller automatically inherits the suppression. Hidden-user list lives in settings.hiddenUsers (persistent electron-store array) + composes via compileHiddenUsersSet/isHiddenUser helpers. Hide-user hover button in ChatFeed; Unhide UI in SettingsDrawer's new Hidden Users section. Username regex axis added to applyMessageFilters as the second composable matching axis (OR with content)
+**Commit:** PENDING
+**Guard:** src/__tests__/self-ignore.test.ts (10 cases pinning self-ignore at the gate point + simulating App.tsx TTS+notification paths together) + src/__tests__/hide-user.test.ts (25 cases pinning compileHiddenUsersSet/isHiddenUser/addHiddenUser/removeHiddenUser + JSON round-trip + end-to-end hide/unhide). Updated existing chat-message-reducers.test.ts cases that asserted self-echoes triggered (pre-v0.1.72 contract)
+---
+
+---
 **Date:** 2026-05-26T15:42:19Z
 **Trigger:** voice 4198 2026-05-26
 **Symptom:** Cold start showed Sign In button before main-process decrypt finished; user accidentally clicked it kicking off unwanted OAuth flow

@@ -68,24 +68,52 @@ export function matchesAnyIgnorePattern(
 
 /**
  * Apply the two ignore lists (TTS + notifications) to a single message
- * `text` and return the side-effect flags. Pure function — does NOT
- * mutate any input.
+ * `text` + `username` and return the side-effect flags. Pure function —
+ * does NOT mutate any input.
  *
  * Returns `undefined` for each flag when the message is NOT ignored.
  * Returning `undefined` rather than `false` keeps the persisted
  * ChatMessage shape lean — only ignored messages carry the flag, which
  * matches the "optional badge" semantics in ChatFeed.tsx.
+ *
+ * v0.1.72 — accepts two pattern lists PER side-effect (TTS / notif):
+ *   - `*ContentPatterns` matches against the message body (`text`).
+ *   - `*UsernamePatterns` matches against the author's display name
+ *     (`username`).
+ *
+ * The axes compose with OR — if EITHER the content axis OR the username
+ * axis matches, the message is flagged for that side effect. This matches
+ * user mental model: "ignore X" where X can be a content rule, a username
+ * rule, or both. A rule that needed AND semantics ("ignore messages that
+ * are spam AND from bot accounts") would need a different shape; YAGNI
+ * for now.
+ *
+ * The `username` argument is optional + defaulted to '' for backwards
+ * compatibility with the v0.1.26-v0.1.71 call sites — but the v0.1.72
+ * App.tsx call site always passes the real username, so username
+ * filtering is live in production.
  */
 export function applyMessageFilters(
   text: string,
-  ttsPatterns: readonly RegExp[],
-  notifPatterns: readonly RegExp[],
+  ttsContentPatterns: readonly RegExp[],
+  notifContentPatterns: readonly RegExp[],
+  username = '',
+  ttsUsernamePatterns: readonly RegExp[] = [],
+  notifUsernamePatterns: readonly RegExp[] = [],
 ): { ignoredByTts?: boolean; ignoredByNotifications?: boolean } {
   const out: { ignoredByTts?: boolean; ignoredByNotifications?: boolean } = {};
-  if (matchesAnyIgnorePattern(text, ttsPatterns)) {
+  // TTS axis: content OR username match → ignored.
+  if (
+    matchesAnyIgnorePattern(text, ttsContentPatterns) ||
+    (username.length > 0 && matchesAnyIgnorePattern(username, ttsUsernamePatterns))
+  ) {
     out.ignoredByTts = true;
   }
-  if (matchesAnyIgnorePattern(text, notifPatterns)) {
+  // Notifications axis: independent — same OR composition.
+  if (
+    matchesAnyIgnorePattern(text, notifContentPatterns) ||
+    (username.length > 0 && matchesAnyIgnorePattern(username, notifUsernamePatterns))
+  ) {
     out.ignoredByNotifications = true;
   }
   return out;
@@ -116,6 +144,93 @@ export function regexIgnoredBadgeLabel(m: {
   if (m.ignoredByTts) return '🔇 regex-ignored (TTS)';
   if (m.ignoredByNotifications) return '🔕 regex-ignored (notif)';
   return null;
+}
+
+/**
+ * v0.1.72 — case-insensitive exact-match check against the hidden-users
+ * list. Returns true when `username` is a member of `hiddenUsers`
+ * (regardless of case). Used by both ChatFeed (to drop hidden rows from
+ * the visible feed) and the App.tsx side-effect gate (so a hidden user's
+ * messages never wake TTS or notifications either).
+ *
+ * Pure, DOM-free, no allocations on the hot path beyond `.toLowerCase()`
+ * once per message. The Set lookup is O(1) — the caller is expected to
+ * build the lowercase Set once per Settings change via
+ * `compileHiddenUsersSet` below and reuse it on every message.
+ */
+export function isHiddenUser(
+  username: string,
+  hiddenUsersLowercaseSet: ReadonlySet<string>,
+): boolean {
+  if (hiddenUsersLowercaseSet.size === 0) return false;
+  if (typeof username !== 'string' || username.length === 0) return false;
+  return hiddenUsersLowercaseSet.has(username.toLowerCase());
+}
+
+/**
+ * v0.1.72 — build a lowercase Set from the raw hidden-users array. Empty /
+ * non-string entries are skipped defensively. Returns a frozen Set so a
+ * future bug-fix can't accidentally mutate it from outside the compile
+ * site (the renderer uses `useMemo` + a ref to keep the live set fresh).
+ */
+export function compileHiddenUsersSet(hiddenUsers: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const u of hiddenUsers) {
+    if (typeof u !== 'string') continue;
+    const trimmed = u.trim();
+    if (trimmed.length === 0) continue;
+    out.add(trimmed.toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * v0.1.72 — pure reducer for the Hide User action. Returns a NEW
+ * settings.hiddenUsers list with `username` appended if not already
+ * present (case-insensitive de-dup). Used by both the hover button in
+ * ChatFeed and the future MCP `hide_user` tool if/when we add one.
+ *
+ * Empty / whitespace-only usernames are no-ops (returns the original
+ * list reference, NOT a clone) so a defensive caller doesn't trigger an
+ * unnecessary settings persist.
+ */
+export function addHiddenUser(
+  hiddenUsers: readonly string[],
+  username: string,
+): string[] {
+  if (typeof username !== 'string') return hiddenUsers.slice();
+  const trimmed = username.trim();
+  if (trimmed.length === 0) return hiddenUsers.slice();
+  const lower = trimmed.toLowerCase();
+  for (const existing of hiddenUsers) {
+    if (typeof existing === 'string' && existing.trim().toLowerCase() === lower) {
+      // Already hidden — return a clone so the caller's reference
+      // equality check still detects "no change needed". Returning the
+      // same array would silently no-op which is what we want, but
+      // returning a clone keeps the contract simple: this function
+      // always returns a fresh array.
+      return hiddenUsers.slice();
+    }
+  }
+  return [...hiddenUsers, trimmed];
+}
+
+/**
+ * v0.1.72 — pure reducer for the Unhide action. Removes `username`
+ * (case-insensitive) from the hidden-users list and returns the new
+ * array. If `username` wasn't in the list this returns a clone for the
+ * same reasons as `addHiddenUser`.
+ */
+export function removeHiddenUser(
+  hiddenUsers: readonly string[],
+  username: string,
+): string[] {
+  if (typeof username !== 'string') return hiddenUsers.slice();
+  const lower = username.trim().toLowerCase();
+  if (lower.length === 0) return hiddenUsers.slice();
+  return hiddenUsers.filter(
+    (u) => typeof u !== 'string' || u.trim().toLowerCase() !== lower,
+  );
 }
 
 /**

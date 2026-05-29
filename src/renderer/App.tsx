@@ -34,8 +34,11 @@ import { makeTtsEngine, RateLimiter, type TtsEngineLike } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
+  addHiddenUser,
   applyMessageFilters,
+  compileHiddenUsersSet,
   compileIgnorePatterns,
+  isHiddenUser,
 } from './message-filters';
 import {
   applyFailedSendStatus,
@@ -121,6 +124,11 @@ export function App(): React.ReactElement {
   // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
   // and stash both in refs so the mount-only `onChatMessage` subscription
   // can read the freshest lists without being torn down on every tweak.
+  //
+  // v0.1.72 adds TWO more compiled lists per axis: username-regex (the
+  // second matching axis added in voice 4352). Same ref-pattern so the
+  // onChatMessage handler picks up the latest compiled set without
+  // re-subscribing.
   const ttsIgnoreCompiled = useMemo(
     () => compileIgnorePatterns(settings.filters?.tts?.ignoreRegex ?? []),
     [settings.filters?.tts?.ignoreRegex],
@@ -129,14 +137,45 @@ export function App(): React.ReactElement {
     () => compileIgnorePatterns(settings.filters?.notifications?.ignoreRegex ?? []),
     [settings.filters?.notifications?.ignoreRegex],
   );
+  const ttsUsernameIgnoreCompiled = useMemo(
+    () => compileIgnorePatterns(settings.filters?.tts?.ignoreUsernameRegex ?? []),
+    [settings.filters?.tts?.ignoreUsernameRegex],
+  );
+  const notifUsernameIgnoreCompiled = useMemo(
+    () =>
+      compileIgnorePatterns(settings.filters?.notifications?.ignoreUsernameRegex ?? []),
+    [settings.filters?.notifications?.ignoreUsernameRegex],
+  );
   const ttsIgnoreRef = useRef<RegExp[]>(ttsIgnoreCompiled);
   const notifIgnoreRef = useRef<RegExp[]>(notifIgnoreCompiled);
+  const ttsUsernameIgnoreRef = useRef<RegExp[]>(ttsUsernameIgnoreCompiled);
+  const notifUsernameIgnoreRef = useRef<RegExp[]>(notifUsernameIgnoreCompiled);
   useEffect(() => {
     ttsIgnoreRef.current = ttsIgnoreCompiled;
   }, [ttsIgnoreCompiled]);
   useEffect(() => {
     notifIgnoreRef.current = notifIgnoreCompiled;
   }, [notifIgnoreCompiled]);
+  useEffect(() => {
+    ttsUsernameIgnoreRef.current = ttsUsernameIgnoreCompiled;
+  }, [ttsUsernameIgnoreCompiled]);
+  useEffect(() => {
+    notifUsernameIgnoreRef.current = notifUsernameIgnoreCompiled;
+  }, [notifUsernameIgnoreCompiled]);
+
+  // v0.1.72 — compile the hidden-users list into a lowercase Set once per
+  // settings change. Used by both ChatFeed (to hide the row from the
+  // visible feed) and the side-effect gate (so hidden users' messages
+  // don't wake TTS / notifications either — hidden means hidden across
+  // every surface).
+  const hiddenUsersSet = useMemo(
+    () => compileHiddenUsersSet(settings.hiddenUsers ?? []),
+    [settings.hiddenUsers],
+  );
+  const hiddenUsersSetRef = useRef<Set<string>>(hiddenUsersSet);
+  useEffect(() => {
+    hiddenUsersSetRef.current = hiddenUsersSet;
+  }, [hiddenUsersSet]);
 
   const showSendNotice = (text: string): void => {
     // The id makes repeated identical failures visible as fresh state changes.
@@ -327,10 +366,18 @@ export function App(): React.ReactElement {
       // `ignoredByNotifications`. The forward-to-side-effects useEffect
       // below reads those flags to skip TTS / notifications, and
       // ChatFeed renders the "regex-ignored" badge from the same flags.
+      //
+      // v0.1.72 — apply BOTH axes (content + username) per side-effect.
+      // The compiled username regex lists live in *UsernameIgnoreRef and
+      // are passed down so the helper can OR-compose content + username
+      // matches. See `applyMessageFilters` docstring for the contract.
       const flags = applyMessageFilters(
         m.text,
         ttsIgnoreRef.current,
         notifIgnoreRef.current,
+        m.username,
+        ttsUsernameIgnoreRef.current,
+        notifUsernameIgnoreRef.current,
       );
       const flagged: ChatMessage =
         flags.ignoredByTts || flags.ignoredByNotifications
@@ -522,6 +569,15 @@ export function App(): React.ReactElement {
     // it's sent. It should just be the one when it's sent now."
     if (!shouldTriggerSideEffects(m, lastSpokenIdRef.current)) return;
     if (!settings.filter.platforms[m.platform]) return;
+    // v0.1.72 — hidden users are silenced across EVERY surface: the row
+    // doesn't render (see `visibleMessages` below) AND TTS / notifications
+    // don't fire. "Hidden" means "as if they never spoke" — that's the
+    // user-mental-model contract of the Hide User affordance. Re-checked
+    // here in addition to `visibleMessages` because the side-effect
+    // useEffect runs against the FULL `messages` buffer (not the filtered
+    // view) so it can still see the latest arrival even when many hidden
+    // messages have streamed past.
+    if (isHiddenUser(m.username, hiddenUsersSetRef.current)) return;
 
     lastSpokenIdRef.current = m.id;
     if (settings.tts.enabled && !m.ignoredByTts) {
@@ -536,10 +592,47 @@ export function App(): React.ReactElement {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
+  // v0.1.72 — also drop messages whose `username` is in `hiddenUsers`
+  // (case-insensitive exact match). Re-runs every render so historical
+  // messages already in the buffer disappear the instant the user clicks
+  // Hide on a row (NOT just for future arrivals). The Set is rebuilt
+  // only when settings.hiddenUsers changes (see `hiddenUsersSet` useMemo
+  // above), so the per-row check is O(1).
   const visibleMessages = useMemo(
-    () => messages.filter((m) => settings.filter.platforms[m.platform] !== false),
-    [messages, settings.filter.platforms],
+    () =>
+      messages.filter(
+        (m) =>
+          settings.filter.platforms[m.platform] !== false &&
+          !isHiddenUser(m.username, hiddenUsersSet),
+      ),
+    [messages, settings.filter.platforms, hiddenUsersSet],
   );
+
+  // v0.1.72 — handler for the per-row "Hide user" hover button. Appends
+  // the username to `settings.hiddenUsers` (de-duped, case-insensitive)
+  // and persists via the normal updateSettings IPC round-trip. Async
+  // because settings persist is async; the renderer doesn't await the
+  // promise so the click feels instant — the in-memory `setSettings`
+  // call in updateSettings flips the local state synchronously, which
+  // re-runs `visibleMessages` on the next render, which hides the row.
+  const handleHideUser = (username: string): void => {
+    // Defensive: skip empty / whitespace-only usernames so a malformed
+    // ChatMessage can't poison the hidden list with `""`. addHiddenUser
+    // also guards but it never hurts to check at the call site too.
+    if (typeof username !== 'string' || username.trim().length === 0) return;
+    const nextHidden = addHiddenUser(settings.hiddenUsers ?? [], username);
+    // Bail if nothing actually changed (already hidden) to avoid an
+    // unnecessary settings persist / IPC round-trip.
+    if (nextHidden.length === (settings.hiddenUsers ?? []).length) {
+      const before = (settings.hiddenUsers ?? []).map((u) => u.toLowerCase());
+      const after = nextHidden.map((u) => u.toLowerCase());
+      if (before.every((u, i) => u === after[i])) return;
+    }
+    void updateSettings({
+      ...settings,
+      hiddenUsers: nextHidden,
+    });
+  };
 
   const updateSettings = async (next: Settings) => {
     // v0.1.42: detect engine-kind change BEFORE setState so we can swap
@@ -834,6 +927,11 @@ export function App(): React.ReactElement {
         messages={visibleMessages}
         authenticated={auth.authenticated}
         connection={conn}
+        // v0.1.72 — per-row hover affordance fires this callback with the
+        // author's username. App.tsx owns the settings + persists the
+        // hidden-users list. ChatFeed is a pure render layer here; it
+        // just surfaces the button + relays the click.
+        onHideUser={handleHideUser}
       />
       <ChatInputInline
         authenticated={auth.authenticated}
