@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-30T22:30:17Z
+**Trigger:** voice 4438
+**Symptom:** No fast way to silence the app speaking incoming chat aloud (TTS) without quitting or digging into Settings
+**Root cause:** TTS on/off was only controllable via the detailed Settings 'Enabled' toggle; no header-level instant mute, and toggling 'enabled' would clobber the distinction between 'feature off' and 'temporarily silenced'
+**Fix:** Added dedicated settings.tts.muted boolean (types.ts + DEFAULT_SETTINGS, persisted via existing electron-store shallow-merge). Header emoji button in App.tsx (toggleMuted) + Settings 'Muted' row both write the same field. Source of truth = new gate 6b in shared decideTtsAction (side-effect-decision.ts): skips reason 'muted' BEFORE backend choice, silencing both browser Web-Speech AND native say. Messages still render; notifications unaffected. commit 4fdf74e
+**Commit:** 4fdf74e
+**Guard:** tts-dispatch.test.ts (muted->skip both backends, unmute resumes, notif unaffected) + side-effect-decision.test.ts (gate 6b ordering). 620 tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-05-30T16:46:12Z
 **Trigger:** Ethan voice 4414, 2026-05-30
 **Symptom:** TTS robustness depended on the renderer: chat→speak decision/filter/queue/rate-limit lived in the renderer (App.tsx + side-effect-decision.ts), so a wedged/slow/dead renderer could swallow a message. Native say fallback also ignored the volume slider. Ethan voice 4414: must NEVER miss a message; move ALL TTS decision/dispatch to background (main) process; volume + every other control must still work.

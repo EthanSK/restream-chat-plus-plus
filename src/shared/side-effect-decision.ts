@@ -141,6 +141,7 @@ function findFirstMatch(
  *   4. !settings.filter.platforms[platform] → SKIP 'platform-disabled'
  *   5. hiddenUsersSet.has(username.toLowerCase()) → SKIP 'hidden-user'
  *   6. !settings.tts.enabled     → SKIP 'engine-disabled'
+ *   6b. settings.tts.muted       → SKIP 'muted'  (v0.1.77 one-click header mute)
  *   7. matches ttsUsernamePatterns → SKIP 'username-regex' (extra.matched: pattern source)
  *   8. matches ttsContentPatterns  → SKIP 'content-regex'  (extra.matched: pattern source)
  *   9. → READ 'read'
@@ -188,6 +189,29 @@ export function decideTtsAction(
   // that's a top-level kill switch, not a per-message filter.
   if (!ctx.settings.tts.enabled) {
     return { decision: 'skip', reason: 'engine-disabled' };
+  }
+  // Gate 6b (v0.1.77, Ethan voice 4438): ONE-CLICK MUTE.
+  //
+  // The header 🔊/🔇 button flips `settings.tts.muted`. This gate is the
+  // SINGLE source of truth that genuinely silences ALL spoken chat — because
+  // it sits in the shared decider that the MAIN-process TtsDispatcher runs
+  // BEFORE it ever picks a backend, a `muted` skip suppresses BOTH the browser
+  // Web-Speech path AND the native `say` path. So muting works regardless of
+  // whether the window is visible or hidden.
+  //
+  // It is deliberately SEPARATE from gate 6 (`engine-disabled`): mute is a
+  // temporary "shut up now" switch that leaves the user's whole TTS config
+  // (enabled flag, voice, rate, volume, filters) untouched, so un-muting
+  // restores everything exactly. The notification path does NOT have this
+  // gate — mute is about the app SPEAKING, not OS notification sounds (those
+  // keep their own `notifications.soundEnabled` setting).
+  //
+  // NOTE: this only suppresses the SPEECH. The message still renders in the
+  // chat feed normally — the renderer's onChatMessage handler pushes every
+  // message into the feed independently of this decision; mute never drops a
+  // row from the UI.
+  if (ctx.settings.tts.muted) {
+    return { decision: 'skip', reason: 'muted' };
   }
   // Gate 7: username regex (v0.1.72). Checked BEFORE content regex
   // because a username match is cheaper to debug ("oh, I added that

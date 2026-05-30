@@ -154,6 +154,7 @@ const baseTts: Settings['tts'] = {
   pitch: 1.0,
   volume: 0.8,
   maxPerMinute: 60,
+  muted: false, // v0.1.77 — not muted; these tests exercise the speak path.
 };
 
 const msg = (id: string, text: string): ChatMessage => ({

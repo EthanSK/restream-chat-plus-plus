@@ -471,6 +471,24 @@ body {
 .reconnect-btn svg { display: block; }
 .reconnect-btn.spinning svg { animation: spin 0.7s linear infinite; }
 
+/* v0.1.77 (Ethan voice 4438) — header one-click mute button.
+ * Emoji glyph needs slightly more box than the SVG icon button and we want the
+ * emoji rendered at full opacity (the base `.btn.icon` dims color via --text-2,
+ * which would wash out the emoji). When muted, a subtle danger-tinted
+ * background reinforces the "speech is off" state at a glance. */
+.mute-btn {
+  font-size: 14px;
+  line-height: 1;
+  /* Override .btn.icon's muted text color so the emoji stays vivid. */
+  color: var(--text-0);
+}
+.mute-btn.muted {
+  background: rgba(248, 81, 73, 0.18);
+}
+.mute-btn.muted:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.28);
+}
+
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }

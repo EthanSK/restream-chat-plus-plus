@@ -134,6 +134,41 @@ describe('decideTtsAction — gate ordering', () => {
     expect(r.reason).toBe('engine-disabled');
   });
 
+  // v0.1.77 (Ethan voice 4438) — the one-click-mute gate sits between
+  // engine-disabled (gate 6) and username-regex (gate 7). Pin its ordering so
+  // a future edit can't accidentally move/drop it.
+  it('6b. muted skips with reason "muted" (when enabled but muted)', () => {
+    const ctx = makeCtx();
+    ctx.settings.tts.enabled = true; // feature on...
+    ctx.settings.tts.muted = true; // ...but user tapped the header 🔇 button
+    const r = decideTtsAction(makeMessage(), ctx);
+    expect(r.decision).toBe('skip');
+    expect(r.reason).toBe('muted');
+  });
+
+  it('6b. engine-disabled wins over muted (disabled checked first)', () => {
+    const ctx = makeCtx();
+    ctx.settings.tts.enabled = false;
+    ctx.settings.tts.muted = true;
+    const r = decideTtsAction(makeMessage(), ctx);
+    // Both gates would skip; engine-disabled is the earlier gate so it wins.
+    expect(r.reason).toBe('engine-disabled');
+  });
+
+  it('6b. muted wins over username-regex (mute checked before regex axes)', () => {
+    const ctx = makeCtx({ ttsUsernamePatterns: compileIgnorePatterns(['viewer42']) });
+    ctx.settings.tts.muted = true;
+    const r = decideTtsAction(makeMessage(), ctx);
+    expect(r.reason).toBe('muted');
+  });
+
+  it('6b. NOT muted (default) passes the mute gate and reaches READ', () => {
+    const ctx = makeCtx(); // muted defaults to false
+    const r = decideTtsAction(makeMessage(), ctx);
+    expect(r.decision).toBe('read');
+    expect(r.reason).toBe('read');
+  });
+
   it('7. username-regex wins over content-regex', () => {
     const ctx = makeCtx({
       ttsUsernamePatterns: compileIgnorePatterns(['viewer42']),
@@ -215,6 +250,14 @@ describe('decideNotificationAction', () => {
     ctx.settings.notifications.enabled = false;
     const r = decideNotificationAction(makeMessage(), ctx);
     expect(r.reason).toBe('engine-disabled');
+  });
+
+  it('v0.1.77 — tts.muted does NOT block notifications (mute is speech-only)', () => {
+    const ctx = makeCtx();
+    ctx.settings.tts.muted = true; // header mute is on...
+    const r = decideNotificationAction(makeMessage(), ctx);
+    // ...but the notification still fires — mute only silences spoken TTS.
+    expect(r.decision).toBe('notify');
   });
 
   it('uses the notif-axis regex lists, not the tts-axis ones', () => {

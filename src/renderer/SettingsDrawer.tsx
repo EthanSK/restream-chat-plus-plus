@@ -250,6 +250,30 @@ export function SettingsDrawer({
                 onChange={(e) => patchTts({ enabled: e.target.checked })}
               />
             </div>
+            {/*
+             * v0.1.77 (Ethan voice 4438, 2026-05-30) — Muted toggle, in sync
+             * with the header 🔊/🔇 button. Both write the SAME
+             * `settings.tts.muted` field (header via App.tsx toggleMuted, here
+             * via patchTts), so flipping one is instantly reflected in the
+             * other — there's only one source of truth. Distinct from "Enabled"
+             * above: "Enabled" is the feature switch (off = TTS configured off);
+             * "Muted" is a temporary silence that preserves all other TTS
+             * config so un-muting restores everything. Speech happens only when
+             * Enabled AND NOT Muted (the main-process dispatcher gates on both).
+             */}
+            <div className="row">
+              <label
+                title="One-click silence for spoken chat. Leaves your voice/rate/volume config untouched — un-muting restores everything. Same toggle as the 🔊/🔇 button in the app header."
+              >
+                Muted
+              </label>
+              <input
+                className="switch"
+                type="checkbox"
+                checked={settings.tts.muted}
+                onChange={(e) => patchTts({ muted: e.target.checked })}
+              />
+            </div>
             <div className="row">
               <label
                 title={

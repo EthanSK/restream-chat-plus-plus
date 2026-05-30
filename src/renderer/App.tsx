@@ -661,6 +661,23 @@ export function App(): React.ReactElement {
     });
   };
 
+  // v0.1.77 (Ethan voice 4438, 2026-05-30) — header ONE-CLICK MUTE toggle.
+  //
+  // Flips `settings.tts.muted` and persists it through the normal
+  // updateSettings round-trip (which setState's locally for an instant UI
+  // flip AND IPCs to main, where the TtsDispatcher reads the new value on the
+  // very next message). The renderer button is JUST a switch — it does not
+  // decide whether to speak; the main-process dispatcher's `muted` gate
+  // (shared decideTtsAction) is the source of truth that silences both the
+  // browser and native speech paths. Mute leaves every other TTS setting
+  // untouched so un-muting restores the user's config exactly.
+  const toggleMuted = (): void => {
+    void updateSettings({
+      ...settings,
+      tts: { ...settings.tts, muted: !settings.tts.muted },
+    });
+  };
+
   const updateSettings = async (next: Settings) => {
     // v0.1.42: detect engine-kind change BEFORE setState so we can swap
     // the engine instance synchronously rather than racing the next
@@ -920,6 +937,32 @@ export function App(): React.ReactElement {
         )}
         {auth.authenticated && <ChannelsPanel connections={connections} />}
         <span className="spacer" />
+        {/*
+         * v0.1.77 (Ethan voice 4438, 2026-05-30) — ONE-CLICK MUTE button.
+         *
+         * Compact emoji toggle for silencing spoken chat (TTS) instantly,
+         * without quitting the app or opening Settings. 🔊 = speaking enabled,
+         * 🔇 = muted. One click flips `settings.tts.muted` via `toggleMuted`,
+         * which persists through updateSettings (instant local flip + IPC to
+         * main). The main-process dispatcher's `muted` gate is what actually
+         * stops speech on BOTH the browser and native paths; this button only
+         * flips the setting. Tooltip + aria-label reflect the CURRENT state's
+         * ACTION ("Mute speech" when currently on, "Unmute speech" when muted).
+         * Styled `btn icon` to match the existing reconnect icon button.
+         * Always shown (independent of auth) so Ethan can silence speech the
+         * moment chat starts pouring in. Settings drawer's "Enabled" switch and
+         * this button stay in sync automatically because both read/write the
+         * same `settings.tts` object (see SettingsDrawer's Muted row).
+         */}
+        <button
+          className={`btn icon ghost mute-btn${settings.tts.muted ? ' muted' : ''}`}
+          title={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
+          aria-label={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
+          aria-pressed={settings.tts.muted}
+          onClick={toggleMuted}
+        >
+          {settings.tts.muted ? '🔇' : '🔊'}
+        </button>
         <button
           className="btn ghost"
           title="Reveal raw-frames.jsonl in Finder for debugging"

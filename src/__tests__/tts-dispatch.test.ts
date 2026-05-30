@@ -165,6 +165,61 @@ describe('TtsDispatcher decision gates still suppress (v0.1.76)', () => {
     expect(h.browserCalls).toHaveLength(0);
   });
 
+  // v0.1.77 (Ethan voice 4438) — ONE-CLICK MUTE gate. The header 🔇 button
+  // flips settings.tts.muted; the dispatcher must skip speech on BOTH backends
+  // regardless of window visibility, and un-muting must resume speech.
+  it('muted=true → no speak on the BROWSER path (window visible)', () => {
+    const h = makeHarness({
+      settings: settingsWith({ muted: true }),
+      hidden: false,
+    });
+    expect(h.dispatcher.handleMessage(msg())).toBe('skip');
+    expect(h.browserCalls).toHaveLength(0);
+    expect(h.nativeCalls).toHaveLength(0);
+  });
+
+  it('muted=true → no speak on the NATIVE path either (window hidden)', () => {
+    const h = makeHarness({
+      settings: settingsWith({ muted: true }),
+      hidden: true,
+    });
+    // The critical guarantee: muting silences ALL speech even when the window
+    // is genuinely hidden (the native say path), not just the visible/browser
+    // path. Otherwise muting wouldn't actually shut the app up.
+    expect(h.dispatcher.handleMessage(msg())).toBe('skip');
+    expect(h.nativeCalls).toHaveLength(0);
+    expect(h.browserCalls).toHaveLength(0);
+  });
+
+  it('unmuting (muted=false) resumes speech with all settings intact', () => {
+    // muted=false is the default settingsWith() — every other knob is the
+    // user's normal config, proving un-mute restores speech exactly.
+    const h = makeHarness({
+      settings: settingsWith({ muted: false, voiceURI: 'Daniel', volume: 0.4 }),
+      hidden: false,
+    });
+    expect(h.dispatcher.handleMessage(msg({ text: 'back on' }))).toBe('browser');
+    expect(h.browserCalls).toHaveLength(1);
+    expect(h.browserCalls[0].text).toBe('back on');
+    expect(h.browserCalls[0].voiceURI).toBe('Daniel');
+    expect(h.browserCalls[0].volume).toBe(0.4);
+  });
+
+  it('muted does NOT suppress notifications (mute is about SPEECH only)', () => {
+    // Voice 4438 scope: mute silences the spoken voice; OS notifications keep
+    // their own soundEnabled setting. A muted-but-notifications-enabled config
+    // still fires the notification.
+    const h = makeHarness({
+      settings: settingsWith({ muted: true }, {
+        notifications: { enabled: true, soundEnabled: true, maxPerMinute: 30 },
+      }),
+      hidden: false,
+    });
+    h.dispatcher.handleMessage(msg({ username: 'dan', platform: 'twitch', text: 'yo' }));
+    expect(h.browserCalls).toHaveLength(0); // speech muted
+    expect(h.notifyCalls).toHaveLength(1); // notification still fires
+  });
+
   it('self message → skip (own outgoing echo)', () => {
     const h = makeHarness({ settings: settingsWith(), hidden: false });
     expect(h.dispatcher.handleMessage(msg({ self: true }))).toBe('skip');

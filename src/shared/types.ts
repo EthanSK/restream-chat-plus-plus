@@ -166,6 +166,37 @@ export interface Settings {
     pitch: number;
     volume: number;
     maxPerMinute: number;
+    /**
+     * v0.1.77 (Ethan voice 4438, 2026-05-30) — ONE-CLICK MUTE for spoken chat.
+     *
+     * A DEDICATED kill-switch for the app SPEAKING chat aloud (TTS), separate
+     * from `enabled` (the detailed "TTS feature on/off" toggle in Settings) and
+     * separate from every voice/rate/volume/filter knob. The point is a header
+     * button Ethan can tap to instantly silence speech WITHOUT clobbering his
+     * carefully-tuned config — flipping `muted` back to false restores
+     * everything exactly as it was (because nothing else was touched).
+     *
+     * WHY a new field instead of toggling `enabled`:
+     *   - `enabled` is the deliberate feature switch; if we reused it, unmuting
+     *     could resurrect a TTS feature the user had genuinely turned off, and
+     *     muting would lose the distinction between "I configured TTS off" and
+     *     "I temporarily silenced it". `muted` layers cleanly ON TOP of
+     *     `enabled`: speech happens only when `enabled && !muted`.
+     *
+     * THE MUTE GATE (source of truth = MAIN process):
+     *   The renderer header button just flips this boolean and persists it.
+     *   The authoritative "do we speak?" decision lives in the main-process
+     *   TtsDispatcher (src/main/tts-dispatch.ts), which checks `muted` and skips
+     *   BOTH the browser-voice dispatch AND the native `say` path when true — so
+     *   muting genuinely silences ALL speech regardless of window state. A muted
+     *   message still RENDERS in the chat feed as normal; only the speech is
+     *   suppressed.
+     *
+     * Persisted via electron-store (survives restart). Defaults to false — a
+     * fresh install is NOT muted (TTS-disabled-by-default is handled by
+     * `enabled`, not this flag).
+     */
+    muted: boolean;
   };
   notifications: {
     enabled: boolean;
@@ -270,6 +301,9 @@ export const DEFAULT_SETTINGS: Settings = {
     pitch: 1.0,
     volume: 1.0,
     maxPerMinute: 20,
+    // v0.1.77 — not muted out of the box. The header 🔊/🔇 button flips this;
+    // the main-process dispatcher gates speech on `enabled && !muted`.
+    muted: false,
   },
   notifications: {
     enabled: false,
@@ -702,6 +736,7 @@ export type TtsDecisionReason =
   // - 'platform-disabled': settings.filter.platforms[m.platform] === false
   // - 'hidden-user': username in settings.hiddenUsers
   // - 'engine-disabled': settings.tts.enabled === false
+  // - 'muted': v0.1.77 settings.tts.muted === true (header 🔇 one-click mute)
   // - 'content-regex': matched a ttsIgnoreRegex / content axis
   // - 'username-regex': matched a ttsIgnoreUsernameRegex / username axis
   | 'pending-send'
@@ -710,6 +745,11 @@ export type TtsDecisionReason =
   | 'platform-disabled'
   | 'hidden-user'
   | 'engine-disabled'
+  // v0.1.77 (Ethan voice 4438) — one-click mute. Distinct from
+  // 'engine-disabled' so the forensic log can tell "TTS feature is off" apart
+  // from "user tapped the header mute button". Only the TTS path has this
+  // reason; the notification path is unaffected (mute is about SPEECH only).
+  | 'muted'
   | 'content-regex'
   | 'username-regex';
 
