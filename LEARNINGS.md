@@ -24,6 +24,26 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-30T14:27:02Z
+**Trigger:** Ethan voice 4407 follow-up, 2026-05-30
+**Symptom:** Ethan PREFERS the browser (Web Speech) voice in the background, not the native 'say' voice — v0.1.74 made native the default for ALL backgrounded/occluded states. He asked 'is there actually nothing we can do?'
+**Root cause:** macOS marks a window merely COVERED by other windows as occluded; Chromium's MacWebContentsOcclusion feature reacts by flipping the WebContents to HIDDEN, so document.visibilityState goes 'hidden' and speechSynthesis is suspended even though the window is just covered, not minimised. v0.1.74 therefore routed the common covered-window case to native say.
+**Fix:** v0.1.75 (main.ts, before app.ready): app.commandLine.appendSwitch('disable-features', 'MacWebContentsOcclusion,CalculateNativeWinOcclusion') — single comma-separated value (appendSwitch on the same key OVERWRITES, does NOT merge; this is the ONLY disable-features call, verified by grep). A merely-covered window now stays visibilityState==='visible' so isPageHidden() returns false and the BROWSER voice keeps speaking (Ethan's preference). tts.ts logic unchanged (already keys off isPageHidden); comments updated to frame native say as a LAST-RESORT safety net.
+**Commit:** WORKING-TREE-uncommitted
+**Guard:** Existing tts-background-fallback.test.ts pins ordering (visible->speechSynthesis, hidden->native). 594/594 pass, typecheck clean. HARD LIMIT documented in comments: occlusion flag only rescues covered-windows; MINIMISED / other-Space / Cmd-H-hidden still report hidden -> Chromium hard-suspends speechSynthesis -> native say covers them. Live Mini verification still needed: cover window, send chat msg, confirm browser voice speaks + NO background_native_fallback event.
+---
+
+---
+**Date:** 2026-05-30T13:44:36Z
+**Trigger:** Ethan voice 4407 2026-05-30
+**Symptom:** TTS doesn't speak incoming chat when app backgrounded too long (message renders but no speech)
+**Root cause:** Default TTS engine is renderer-side window.speechSynthesis (DEFAULT_SETTINGS.tts.engine='browser', types.ts:266). Chromium SUSPENDS speechSynthesis while the page is hidden/occluded and throttles backgrounded renderer timers to ~1/min; speak() is silently swallowed (no onstart/onend/onerror). Chat msgs still render because the WS frame is received in MAIN and pushed over IPC (never throttled). BrowserWindow webPreferences (main.ts) had no backgroundThrottling:false; app had no disable-*-backgrounding switches; no powerSaveBlocker (App Nap could suspend app). Native main-process say(1) engine existed (v0.1.42) but wasn't the default and ignores the volume slider.
+**Fix:** v0.1.74 four stacked layers: (1) webPreferences.backgroundThrottling:false + webContents.setBackgroundThrottling(false) on main window. (2) app.commandLine.appendSwitch disable-background-timer-throttling / disable-renderer-backgrounding / disable-backgrounding-occluded-windows before app.ready. (3) powerSaveBlocker.start('prevent-app-suspension') held for app lifetime. (4) LOAD-BEARING: browser TTSEngine.speak() detects isPageHidden() and routes the utterance to the native window.rcpp.ttsNative say bridge instead of speechSynthesis when hidden; foreground keeps Web Speech so the volume slider works. New 'background_native_fallback' TtsLogEvent for forensics.
+**Commit:** WORKING-TREE-uncommitted
+**Guard:** src/__tests__/tts-background-fallback.test.ts (5 cases). 594/594 tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-05-29T18:00:00Z
 **Trigger:** voice 4364, 2026-05-28
 **Symptom:** (a) v0.1.47 disabled WS auto-reconnect by default; Ethan wanted it back on because brief network blips left him on "disconnected" until manual click. (b) Ethan reported "YoWSG" (wildswanxx) message "didn't get read aloud" but his logs were too blind to confirm — only `speak_called` rows existed, no row for SKIPPED messages so any TTS miss was undebuggable from logs.

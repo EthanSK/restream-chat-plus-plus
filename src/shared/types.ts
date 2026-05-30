@@ -632,7 +632,15 @@ export interface TtsLogEvent {
     // aloud? If not, we need to add that to the logs, but, like,
     // that's fucked."
     | 'tts_decision'
-    | 'notification_decision';
+    | 'notification_decision'
+    // v0.1.74 (Ethan voice 4407, 2026-05-30) — background-TTS fix. Emitted
+    // by the renderer browser `TTSEngine` when it detects the page is
+    // hidden/occluded (so `window.speechSynthesis` is suspended) and
+    // therefore routes the utterance through the native main-process `say`
+    // bridge instead. Lets a forensic grep confirm "this message was voiced
+    // via the background fallback path, not Web Speech" — which is exactly
+    // the case the user couldn't previously diagnose.
+    | 'background_native_fallback';
   data?: Record<string, unknown>;
 }
 

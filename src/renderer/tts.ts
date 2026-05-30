@@ -222,6 +222,89 @@ function persistTtsEvent(event: string, data?: Record<string, unknown>): void {
   }
 }
 
+/**
+ * v0.1.74 (Ethan voice 4407, 2026-05-30) — BACKGROUND-TTS FALLBACK, layer 4.
+ * Refined in v0.1.75 to a LAST-RESORT SAFETY NET (Ethan prefers browser voice).
+ * ===========================================================================
+ *
+ * Chromium SUSPENDS `window.speechSynthesis` while the page is genuinely
+ * hidden. When that happens, speak() calls are silently swallowed (no
+ * onstart/onend/onerror) — the message renders but is never voiced.
+ *
+ * BROWSER VOICE IS PREFERRED (v0.1.75): Ethan wants the in-app Web-Speech
+ * voice even in the background, NOT the native `say` voice. The main process
+ * disables Chromium's macOS occlusion feature
+ * (`--disable-features=MacWebContentsOcclusion`, see src/main/main.ts), so a
+ * window that is merely COVERED by other app windows keeps reporting
+ * `document.visibilityState === 'visible'`. `isPageHidden()` therefore returns
+ * FALSE for the covered-window case → the browser voice keeps speaking. That
+ * is the common "background" scenario and it now uses Web Speech, honouring
+ * the in-app volume slider (`say` has no volume knob — exactly why v0.1.44
+ * made browser the default).
+ *
+ * NATIVE `say` IS THE SAFETY NET, NOT THE NORMAL BACKGROUND PATH: the
+ * occlusion flag CANNOT rescue every state. A window that is MINIMISED, on
+ * ANOTHER macOS Space, or whose app is HIDDEN via Cmd-H still reports
+ * `document.hidden === true`, and Chromium HARD-SUSPENDS speechSynthesis in
+ * those states — the browser voice genuinely cannot run there. For exactly
+ * those genuinely-hidden states, `isPageHidden()` returns TRUE and the engine
+ * forwards the utterance to the macOS-native `say(1)` path (driven from the
+ * MAIN process via the `window.rcpp.ttsNative` IPC bridge). The native path is
+ * a subprocess spawned outside the renderer, so renderer visibility is
+ * irrelevant — it ALWAYS speaks. This guarantees a message is NEVER silently
+ * dropped, even in the states the browser voice can't reach.
+ *
+ * Net result:
+ *   - foreground                          → Web Speech (volume slider honoured)
+ *   - covered by other windows            → Web Speech (PREFERRED; the common
+ *                                            background case, kept visible by
+ *                                            disabling occlusion)
+ *   - minimised / other-Space / app-hidden → native `say` (LAST-RESORT net;
+ *                                            browser voice truly can't run)
+ */
+function isPageHidden(): boolean {
+  // `document.hidden` / `visibilityState !== 'visible'` is TRUE for genuinely
+  // hidden states only: minimised, on another macOS Space, or app hidden via
+  // Cmd-H. It is NOT true for a merely-COVERED window, because the main
+  // process disables Chromium's occlusion feature (MacWebContentsOcclusion) —
+  // a covered window stays 'visible', so this returns false and the browser
+  // voice is used (Ethan's preferred background path). `visibilityState` is
+  // the modern signal; we check both for older-Chromium safety. In a non-DOM/
+  // test env we report "not hidden" so unit tests exercise the speechSynthesis
+  // path unless they explicitly stub document.hidden.
+  if (typeof document === 'undefined') return false;
+  if (document.hidden === true) return true;
+  if (typeof document.visibilityState === 'string') {
+    return document.visibilityState !== 'visible';
+  }
+  return false;
+}
+
+/**
+ * Grab the native `say` IPC bridge (`window.rcpp.ttsNative`), if present.
+ * Returns undefined in test/non-Electron environments — callers fall back
+ * to speechSynthesis when it's missing (best-effort: better to try the
+ * possibly-suspended browser engine than to drop the message entirely).
+ */
+function getNativeBridgeForFallback():
+  | {
+      enqueue: (payload: TtsNativeEnqueuePayload) => void;
+      cancel: () => void;
+    }
+  | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (
+    window as unknown as {
+      rcpp?: {
+        ttsNative?: {
+          enqueue: (payload: TtsNativeEnqueuePayload) => void;
+          cancel: () => void;
+        };
+      };
+    }
+  ).rcpp?.ttsNative;
+}
+
 export class TTSEngine {
   private queue: ChatMessage[] = [];
   private speaking = false;
@@ -373,7 +456,81 @@ export class TTSEngine {
     // Pause the keep-alive so it doesn't fire concurrent with real speech.
     this.clearKeepalive();
     this.currentUtterRetries = 0;
+
+    // v0.1.74/v0.1.75 BACKGROUND-TTS SAFETY NET (layer 4): if the page is
+    // GENUINELY hidden (minimised / another Space / app hidden via Cmd-H —
+    // NOT merely covered, which the occlusion-disable flag keeps 'visible'),
+    // Chromium has suspended `window.speechSynthesis` and any speak() we issue
+    // will be silently swallowed — the message would render but never be
+    // voiced. Only in that genuinely-hidden case do we route through the
+    // native main-process `say` bridge instead, which is immune to renderer
+    // visibility. The common covered-window background case never reaches here
+    // (isPageHidden() returns false) so it keeps using the BROWSER voice that
+    // Ethan prefers. We still mark the utterance as
+    // "spoken" for throttle bookkeeping (push the timestamp) and immediately
+    // advance the queue, because the native bridge is fire-and-forget (no
+    // onend handshake back into this engine) — the main-process queue
+    // serialises the actual `say` subprocesses on its own.
+    if (this.trySpeakViaNativeWhileHidden(m, text)) {
+      // pruneTimestamps already ran in tick(); record this utterance so the
+      // maxPerMinute rate-limit still applies to background speech.
+      this.timestamps.push(Date.now());
+      this.speaking = false;
+      // Drain the next queued message on a fresh tick; re-arm keepalive if
+      // the queue is now empty so the foreground engine stays warm for when
+      // the window comes back to the front.
+      setTimeout(() => {
+        this.tick();
+        if (!this.speaking && this.queue.length === 0 && this.settings.enabled) {
+          this.armKeepalive();
+        }
+      }, 50);
+      return;
+    }
+
     this.speakUtterance(m, text, 0);
+  }
+
+  /**
+   * v0.1.74 — background fallback. Returns true if it handled the message
+   * by forwarding it to the native `say` bridge (because the page is hidden
+   * AND the bridge exists); false if the caller should proceed with the
+   * normal speechSynthesis path.
+   *
+   * Defensive: any failure (bridge throws, etc.) returns false so we fall
+   * back to attempting speechSynthesis rather than silently dropping the
+   * message. The whole point of this fix is that a message can NEVER be
+   * silently lost.
+   */
+  private trySpeakViaNativeWhileHidden(m: ChatMessage, text: string): boolean {
+    if (!isPageHidden()) return false;
+    const bridge = getNativeBridgeForFallback();
+    if (!bridge) {
+      // No native bridge (non-Electron / test env). Can't fall back; let the
+      // (possibly-suspended) speechSynthesis path try anyway — better than
+      // dropping the message outright.
+      log('speak: page hidden but no native bridge — using speechSynthesis');
+      return false;
+    }
+    try {
+      log('speak: page hidden — routing via native `say` bridge', { id: m.id });
+      persistTtsEvent('background_native_fallback', {
+        message_id: m.id,
+        platform: m.platform,
+      });
+      bridge.enqueue({
+        text,
+        voice: this.settings.voiceURI,
+        rate: this.settings.rate,
+        volume: this.settings.volume,
+        messageId: m.id,
+      });
+      return true;
+    } catch (err) {
+      // Bridge failed — fall through to speechSynthesis as last resort.
+      log('speak: native bridge threw — falling back to speechSynthesis', { err });
+      return false;
+    }
   }
 
   /**

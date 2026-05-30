@@ -5,6 +5,7 @@ import {
   ipcMain,
   Menu,
   Notification,
+  powerSaveBlocker,
   shell,
 } from 'electron';
 import path from 'node:path';
@@ -75,6 +76,94 @@ import {
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
+
+// ---------------------------------------------------------------------------
+// v0.1.74 (Ethan voice 4407, 2026-05-30) — BACKGROUND-TTS FIX, layer 2.
+// ---------------------------------------------------------------------------
+// These Chromium command-line switches MUST be applied at module-eval time —
+// i.e. BEFORE `app.on('ready')` fires — or Electron will have already booted
+// the renderer process group with the default (throttling-ON) behaviour and
+// the switches become no-ops.
+//
+// Why each switch matters for the "TTS stops when backgrounded" symptom:
+//   - `disable-background-timer-throttling`     — stops Chromium clamping a
+//     backgrounded renderer's setTimeout/setInterval to ~1 fire/min. The
+//     TTS engine's tick()/keep-alive/watchdog timers (src/renderer/tts.ts)
+//     depend on firing promptly; under the default clamp they stall and the
+//     queue never drains.
+//   - `disable-renderer-backgrounding`          — stops Chromium lowering the
+//     renderer process priority when the window loses focus, which is what
+//     puts the speechSynthesis engine to sleep.
+//   - `disable-backgrounding-occluded-windows`  — macOS-specific: a window
+//     that's fully covered by another app's window is "occluded" and gets
+//     the same backgrounding treatment as a minimised one. Without this an
+//     occluded (but technically open) RC++ window still throttles.
+//
+// These are the renderer-process counterpart to the per-window
+// `backgroundThrottling: false` + `powerSaveBlocker` (App-Nap guard) set
+// elsewhere. All layers stack: the goal is that NOTHING about focus or
+// visibility can ever silently stall the message → TTS pipeline.
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+
+// ---------------------------------------------------------------------------
+// v0.1.75 (Ethan voice 4407 follow-up, 2026-05-30) — KEEP THE BROWSER VOICE
+// ALIVE WHEN THE WINDOW IS MERELY COVERED.
+// ---------------------------------------------------------------------------
+// Ethan PREFERS the in-app Web-Speech (browser) voice even in the background —
+// he does NOT want the native macOS `say` voice to be the default background
+// path. There IS a way to keep the browser voice working in the most common
+// "background" case (RC++ open but COVERED by other app windows):
+//
+// macOS marks any window that's fully covered by another window as
+// "occluded". Chromium's macOS occlusion-tracking feature
+// (`MacWebContentsOcclusion`) reacts to that by flipping the WebContents to
+// the HIDDEN visibility state — which is exactly what makes
+// `document.visibilityState` go to 'hidden' and causes Chromium to SUSPEND
+// `window.speechSynthesis`. Disabling that feature stops Chromium from
+// treating a merely-covered window as hidden, so:
+//   - `document.visibilityState` stays 'visible' while RC++ is covered,
+//   - `isPageHidden()` in src/renderer/tts.ts therefore returns false,
+//   - and the renderer keeps using the BROWSER voice (what Ethan wants).
+//
+// We disable BOTH the macOS occlusion feature (`MacWebContentsOcclusion`) and
+// the Windows equivalent (`CalculateNativeWinOcclusion`) in one merged value
+// so the behaviour is consistent cross-platform. They're packed into a SINGLE
+// comma-separated `--disable-features` value on purpose:
+//   IMPORTANT: calling `appendSwitch('disable-features', X)` then again with
+//   Y does NOT merge — the second call OVERWRITES the first (last-write-wins
+//   on a given switch key). So every feature we want disabled MUST live in
+//   this one comma-separated string. If you add another `--disable-features`
+//   need later, append it to THIS string; do NOT add a second appendSwitch
+//   call for 'disable-features'. (Verified: this is currently the only
+//   `disable-features` appendSwitch in the codebase — grep confirms it.)
+//
+// HARD LIMIT — be honest about what this flag does NOT fix:
+//   Disabling occlusion only helps the "covered by other windows" case. A
+//   window that is MINIMISED, on ANOTHER macOS Space, or whose app is HIDDEN
+//   via Cmd-H still reports `document.hidden === true` and Chromium WILL hard-
+//   suspend speechSynthesis in those states — the browser voice genuinely
+//   cannot run there. For those states the native `say` fallback (see
+//   src/renderer/tts.ts) is the safety net so a message is NEVER missed.
+//   Net result:
+//     covered-by-other-windows → BROWSER voice (preferred, what Ethan wants)
+//     minimised / other-Space / app-hidden → native `say` (last-resort net)
+//
+// Electron/Chromium version: this app ships Electron 42 (Chromium 138-era —
+// see "electron": "42.1.0" in package.json). Both `MacWebContentsOcclusion`
+// and `CalculateNativeWinOcclusion` are long-standing Chromium feature flags
+// valid for this version. If a future Electron renames/removes either flag,
+// the switch becomes a harmless no-op (Chromium ignores unknown feature
+// names) — it can't crash the app; it would just silently stop keeping the
+// covered-window case visible, at which point the native `say` safety net
+// would resume covering it.
+const DISABLED_FEATURES = 'MacWebContentsOcclusion,CalculateNativeWinOcclusion';
+app.commandLine.appendSwitch('disable-features', DISABLED_FEATURES);
+// Log the RESOLVED switch value so a field log confirms all intended features
+// actually made it into the single comma-separated string (guards against a
+// future double-appendSwitch silently dropping one of them).
+console.log('[main] disable-features resolved to:', DISABLED_FEATURES);
 
 // ---------------------------------------------------------------------------
 // MCP server — v0.1.36+ HTTP-over-loopback architecture
@@ -425,8 +514,56 @@ async function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // v0.1.74 (Ethan voice 4407, 2026-05-30) — BACKGROUND-TTS FIX, layer 1.
+      // ----------------------------------------------------------------------
+      // Symptom: when RC++ sits in the background/occluded for a while, an
+      // incoming chat message still RENDERS in the feed (the WS frame is
+      // received in the MAIN process and pushed over IPC, which is never
+      // throttled) but TTS does NOT speak it. When the window is focused,
+      // TTS works fine.
+      //
+      // Root cause: the default TTS engine is the renderer-side Web Speech
+      // path (`window.speechSynthesis`, see src/renderer/tts.ts). Chromium
+      // aggressively throttles a backgrounded/occluded renderer:
+      //   - Background timers are clamped to ~1 fire/minute, which stalls
+      //     the TTS engine's tick()/keep-alive/watchdog timers.
+      //   - `window.speechSynthesis` itself is SUSPENDED while the page is
+      //     hidden/occluded — speak() calls are silently swallowed (no
+      //     onstart/onend/onerror), so the message renders but is never
+      //     voiced. This is the single most common cause of "renders but
+      //     doesn't speak when backgrounded".
+      //
+      // `backgroundThrottling: false` disables Chromium's per-window timer
+      // throttling so the renderer's TTS timers keep firing at full rate
+      // even when occluded.
+      //
+      // v0.1.75 ORDERING (Ethan prefers the BROWSER voice in the background):
+      //   - The app-level `--disable-features=MacWebContentsOcclusion,...`
+      //     switch (set near the top of this file, before app.ready) keeps a
+      //     COVERED window reporting `visibilityState === 'visible'`, so the
+      //     renderer keeps using the BROWSER voice when RC++ is merely behind
+      //     other windows. This is the preferred path.
+      //   - The renderer's native-`say` fallback (src/renderer/tts.ts) is now
+      //     a LAST-RESORT SAFETY NET, not the normal background path. It only
+      //     fires for GENUINELY hidden states the occlusion flag can't rescue:
+      //     window minimised, on another macOS Space, or app hidden via Cmd-H
+      //     — Chromium hard-suspends speechSynthesis there and the browser
+      //     voice truly cannot run. The native path guarantees the message is
+      //     still voiced in those states so nothing is ever silently dropped.
+      // All layers stack so a message can never be silently dropped regardless
+      // of focus/visibility, while the browser voice stays the default for the
+      // common covered-window case.
+      backgroundThrottling: false,
     },
   });
+  // v0.1.74 — belt-and-suspenders: also clear backgroundThrottling on the
+  // live webContents in case a future Electron honours the runtime setter
+  // over the constructor option. Harmless if redundant.
+  try {
+    mainWindow.webContents.setBackgroundThrottling(false);
+  } catch (err) {
+    console.warn('[main] setBackgroundThrottling(false) failed', err);
+  }
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
@@ -620,6 +757,34 @@ app.on('ready', async () => {
   const chat = new ChatClient();
 
   app.setName('Restream Chat++');
+
+  // v0.1.74 (Ethan voice 4407, 2026-05-30) — BACKGROUND-TTS FIX, layer 3.
+  // ----------------------------------------------------------------------
+  // macOS App Nap can suspend a backgrounded app entirely — timers freeze,
+  // the renderer stops doing work, and (critically) the main-process `say`
+  // queue can stall mid-utterance. `powerSaveBlocker.start(
+  // 'prevent-app-suspension')` tells the OS to keep the app fully running
+  // even when it's not frontmost, which is exactly what we need so chat
+  // messages keep being voiced while RC++ sits behind other windows.
+  //
+  // We hold the blocker for the entire app lifetime (started here, never
+  // explicitly stopped — it's released automatically on quit). The blocker
+  // does NOT keep the *display* awake (that would be
+  // 'prevent-display-sleep'); it only prevents *app* suspension, so the
+  // user's screen can still sleep normally.
+  //
+  // Wrapped defensively: if powerSaveBlocker is unavailable for any reason
+  // the app must still boot — a missing nap-guard degrades to "TTS may
+  // stall under heavy App Nap" rather than a crash.
+  try {
+    const blockerId = powerSaveBlocker.start('prevent-app-suspension');
+    console.log('[main] powerSaveBlocker(prevent-app-suspension) started', {
+      blockerId,
+      active: powerSaveBlocker.isStarted(blockerId),
+    });
+  } catch (err) {
+    console.warn('[main] powerSaveBlocker.start failed', err);
+  }
 
   // v0.1.66 attempted to call `app.configureWebAuthn({ touchID: { ... } })`
   // here to surface the macOS passkey sheet during Google sign-in (per
