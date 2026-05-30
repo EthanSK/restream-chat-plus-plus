@@ -407,6 +407,81 @@ export class TTSEngine {
     this.tick();
   }
 
+  /**
+   * v0.1.76 (Ethan voice 4414) — execute a single browser-speak command
+   * pushed from the MAIN-process dispatcher (`IPC.TTS_SPEAK_BROWSER`).
+   *
+   * The decision (whether to speak, which backend, rate-limit, filters) was
+   * ALREADY made in main — this method does NOT re-decide and does NOT
+   * re-rate-limit. It just speaks the supplied text through the SAME hardened
+   * Web-Speech path (`speakUtterance` — strong-ref + 60s watchdog +
+   * cancel-before-speak + 500ms onstart watchdog + onerror retry) so the
+   * background-dispatch path inherits all the Chromium-quirk defences the
+   * renderer engine accumulated over v0.1.40–v0.1.41.
+   *
+   * It honours EVERY setting from the payload — volume, voice, rate, AND pitch
+   * — which is exactly why the visible-window case keeps full setting fidelity
+   * after the dispatch moved to main. We temporarily point `this.settings` at
+   * the payload's snapshot for the duration of the speak so `speakUtterance`
+   * (which reads `this.settings.rate/pitch/volume/voiceURI`) uses the payload
+   * values. The payload comes from the same Settings source main read, so this
+   * snapshot matches what the user configured.
+   *
+   * Fire-and-forget: the main-process dispatcher serialises decisions; this
+   * engine serialises actual playback via its queue/watchdog. We push a
+   * synthetic ChatMessage onto the queue so multiple rapid commands are
+   * spoken in order (not overlapping) by the existing `tick()` drain.
+   */
+  speakBrowserCommand(payload: {
+    text: string;
+    voiceURI?: string;
+    rate: number;
+    pitch: number;
+    volume: number;
+    messageId: string;
+  }): void {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      log('speakBrowserCommand: no window.speechSynthesis — dropping', {
+        id: payload.messageId,
+      });
+      return;
+    }
+    // Adopt the payload's per-utterance settings so speakUtterance honours
+    // volume/voice/rate/pitch exactly. enabled/maxPerMinute are irrelevant
+    // here (decision + rate-limit already happened in main), but we keep the
+    // engine "enabled" so the queue drains.
+    this.settings = {
+      ...this.settings,
+      enabled: true,
+      voiceURI: payload.voiceURI,
+      rate: payload.rate,
+      pitch: payload.pitch,
+      volume: payload.volume,
+    };
+    // Synthetic message carrying the ALREADY-COMPOSED text. We pass it through
+    // composeUtterance with readSenderName=false so the text is spoken
+    // verbatim (main already applied the sender-name prefix if enabled).
+    const synthetic: ChatMessage = {
+      id: payload.messageId,
+      platform: 'unknown',
+      username: '',
+      text: payload.text,
+      ts: Date.now(),
+    };
+    // Bypass the maxPerMinute throttle entirely — main already rate-limited.
+    // Push directly and tick. We DON'T call enqueue() because enqueue checks
+    // settings.enabled (fine) but tick() applies the throttle; to skip the
+    // throttle for already-vetted commands we clear timestamps so the gate
+    // never trips on this path. Chat-volume protection lives in main now.
+    this.queue.push(synthetic);
+    while (this.queue.length > 50) this.queue.shift();
+    // Reset the throttle window so the main-side rate-limit is the only one
+    // that applies (avoids double-limiting that could silently drop messages —
+    // which would VIOLATE the never-miss guarantee for the visible path).
+    this.timestamps = [];
+    this.tick();
+  }
+
   cancel() {
     log('cancel');
     persistTtsEvent('cancel_called', { queuedAtCancel: this.queue.length });

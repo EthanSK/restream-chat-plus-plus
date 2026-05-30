@@ -13,6 +13,7 @@ import type {
   TtsLogEvent,
   TtsNativeEnqueuePayload,
   TtsNativeSettingsPayload,
+  TtsSpeakBrowserPayload,
   UpdateInfo,
 } from './shared/types';
 
@@ -303,6 +304,20 @@ const api = {
     },
     getVoices: (): Promise<NativeVoiceWire[]> =>
       ipcRenderer.invoke(IPC.TTS_NATIVE_GET_VOICES),
+  },
+  /**
+   * v0.1.76 (Ethan voice 4414) — subscribe to MAIN → renderer browser-speak
+   * commands. The main-process TtsDispatcher decides whether/what to speak and
+   * which backend to use; when it picks the BROWSER backend (window
+   * visible/covered) it pushes `IPC.TTS_SPEAK_BROWSER` with a full settings
+   * snapshot. The renderer's thin executor (App.tsx) speaks that ONE utterance
+   * via Web Speech, honouring volume/voice/rate/PITCH from the payload. The
+   * renderer no longer decides anything — it just executes.
+   */
+  onSpeakBrowser: (cb: (payload: TtsSpeakBrowserPayload) => void): Unsub => {
+    const h = (_: unknown, payload: TtsSpeakBrowserPayload) => cb(payload);
+    ipcRenderer.on(IPC.TTS_SPEAK_BROWSER, h);
+    return () => ipcRenderer.removeListener(IPC.TTS_SPEAK_BROWSER, h);
   },
 };
 

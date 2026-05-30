@@ -44,18 +44,34 @@
 //
 // Volume
 // ------
-// `say` has no `--volume` flag. Two routes considered:
-//   (a) Pipe `say --data-format=…` raw audio to `afplay` with a volume
-//       knob. Reliable but adds a second subprocess + audio buffering.
-//   (b) Accept that per-utterance volume is unsupported and document it.
-//       Users adjust the macOS system output volume (or the dedicated
-//       app volume in System Settings → Sound → app mixer) instead.
+// v0.1.76 (Ethan voice 4414, 2026-05-30) — VOLUME IS NOW HONOURED NATIVELY.
 //
-// Shipping with (b) for v0.1.42. Lower latency, less surface area,
-// matches what nearly every other macOS app does — system volume is the
-// right place for "how loud is RC++". The Settings UI keeps the slider
-// visible but it only applies to the browser-engine code path; we add a
-// note in the tooltip so users don't think it's broken.
+// HISTORY: v0.1.42 shipped without native volume because `say` has no
+// `--volume` CLI flag, and we wrongly concluded per-utterance volume was
+// unsupported (the old comment told users to use the macOS system volume).
+// That was a real regression for the "move all TTS to the background" plan:
+// Ethan's hard constraint is that the volume slider MUST keep working even
+// when the native fallback is the one speaking.
+//
+// FIX: `say` DOES support per-utterance volume via an INLINE TUNE-MANAGEMENT
+// command embedded in the spoken text — `[[volm <0.0–1.0>]]`. Prepending
+// `[[volm 0.35]] ` to the text scales that utterance's loudness to 35% with
+// NO extra subprocess (afplay piping was the other option — rejected for the
+// added latency + audio-buffering surface). `[[volm 1.0]]` is full volume
+// (the `say` default), `[[volm 0.0]]` is silent. We clamp the Web-Speech
+// 0.0–1.0 `volume` setting into that range and prepend the command in
+// `buildSayText()` below. Verified working on macOS 26 (Tahoe): `say
+// '[[volm 0.2]] testing'` audibly quieter than `[[volm 1.0]]`.
+//
+// WHY THIS MATTERS FOR THE ARCHITECTURE: with the v0.1.76 main-process
+// dispatch (see src/main/tts-dispatch.ts), the native path is the
+// genuinely-hidden fallback. Because volume now flows through `[[volm]]`,
+// the volume slider keeps working in BOTH the visible-window (browser voice)
+// AND the hidden-window (native `say`) cases — the slider is no longer a
+// browser-only control. The only setting the native path still can't honour
+// is PITCH (`say` has no pitch knob); that degrades only in the rare
+// genuinely-hidden state and is restored the instant the window is visible
+// again (browser voice handles pitch).
 //
 // Logging
 // -------
@@ -102,6 +118,50 @@ export function rateToWpm(rate: number): number {
 }
 
 /**
+ * v0.1.76 — clamp a Web-Speech-style `volume` (0.0–1.0) into the range
+ * `say`'s inline `[[volm n]]` command accepts. Web Speech and `say` both use
+ * 0.0 = silent, 1.0 = full, so this is a straight clamp (no rescaling).
+ *
+ * - undefined / non-finite → 1.0 (full volume; matches `say`'s default so a
+ *   missing setting never accidentally mutes the user).
+ * - <0 → 0, >1 → 1.
+ *
+ * Pinned by tts-native.test.ts so a future tweak to the clamp is visible.
+ */
+export function clampSayVolume(volume: number | undefined): number {
+  if (typeof volume !== 'number' || !Number.isFinite(volume)) return 1.0;
+  if (volume < 0) return 0;
+  if (volume > 1) return 1;
+  return volume;
+}
+
+/**
+ * v0.1.76 — build the actual string handed to `say`, prepending the inline
+ * `[[volm n]]` tune-management command so the utterance is spoken at the
+ * requested volume. This is THE mechanism that makes the volume slider work
+ * on the native (genuinely-hidden-window) fallback path — `say` has no
+ * `--volume` flag, but it honours `[[volm n]]` embedded in the text.
+ *
+ * We always emit the command (even at 1.0) so behaviour is explicit and
+ * testable; `[[volm 1.0]]` is a no-op loudness-wise. The trailing space
+ * separates the command from the spoken words. Rounded to 2 dp to keep the
+ * embedded command tidy in the logs.
+ *
+ * NOTE: `say` interprets `[[...]]` sequences anywhere in the text as
+ * commands, so in theory a chat message containing literal `[[volm 9]]`
+ * could inject its own volume. In practice chat text almost never contains
+ * that exact bracket syntax, and the worst case is a viewer making their own
+ * message louder/quieter — not a security issue. We accept that rather than
+ * escaping, which would risk mangling legitimate `[[` text. If abuse ever
+ * shows up, the guard is to strip `[[...]]` from `text` here.
+ */
+export function buildSayText(text: string, volume: number | undefined): string {
+  const v = clampSayVolume(volume);
+  const vStr = (Math.round(v * 100) / 100).toString();
+  return `[[volm ${vStr}]] ${text}`;
+}
+
+/**
  * Parsed entry from `say -v "?"`. The `sample` is the demo phrase the
  * voice ships with (e.g. "Hello! My name is Daniel.") — useful as a
  * preview-button accent if we ever wire one. `lang` is the locale
@@ -130,7 +190,12 @@ export interface NativeVoice {
 export interface NativeEnqueueOpts {
   voice?: string;
   rate?: number;
-  /** Per-Web-Speech volume — currently informational only; see module-top comment. */
+  /**
+   * Per-Web-Speech volume (0.0–1.0). v0.1.76 — NOW APPLIED via the inline
+   * `[[volm n]]` command (see `buildSayText`); was informational-only in
+   * v0.1.42–v0.1.75. Falls back to the engine's current settings volume
+   * when omitted.
+   */
   volume?: number;
   messageId?: string;
 }
@@ -325,12 +390,19 @@ export class NativeTtsEngine {
     const voice = next.opts.voice ?? this.settings.voiceURI;
     const rate = next.opts.rate ?? this.settings.rate;
     const wpm = rateToWpm(rate);
+    // v0.1.76 — resolve volume from the per-utterance opt first, then the
+    // engine's current settings (so a slider change with no new enqueue
+    // still applies to the next message), then default to full. Prepend the
+    // inline `[[volm n]]` command to the text — this is how the volume slider
+    // reaches the native `say` path. See `buildSayText` / `clampSayVolume`.
+    const volume = clampSayVolume(next.opts.volume ?? this.settings.volume);
+    const spokenText = buildSayText(next.text, volume);
     const args: string[] = [];
     if (voice) {
       args.push('-v', voice);
     }
     args.push('-r', String(wpm));
-    args.push('--', next.text);
+    args.push('--', spokenText);
     const seq = ++this.speakSeq;
     const startedAt = Date.now();
     this.log('native_speak_start', {
@@ -338,6 +410,9 @@ export class NativeTtsEngine {
       seq,
       voice: voice ?? null,
       rateWPM: wpm,
+      // Log the resolved volume so a forensic grep confirms the slider value
+      // actually reached the subprocess (the #1 thing Ethan wants verifiable).
+      volume,
       queue_size: this.queue.length,
     });
     let subproc: NativeSpawnedChild;

@@ -30,7 +30,10 @@ import {
 } from './chat-send-client';
 import { SettingsDrawer } from './SettingsDrawer';
 import { UpdateBanner } from './UpdateBanner';
-import { makeTtsEngine, RateLimiter, type TtsEngineLike } from './tts';
+// v0.1.76 — RateLimiter is no longer used in the renderer (rate-limiting moved
+// to main's TtsDispatcher). makeTtsEngine still backs the Settings voice
+// preview; TTSEngine backs the dedicated browser-speak command executor.
+import { makeTtsEngine, TTSEngine, type TtsEngineLike } from './tts';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
@@ -45,16 +48,9 @@ import {
   dedupeOptimisticOnEcho,
   pushOptimisticMessage,
 } from './chat-message-reducers';
-// v0.1.73 — decision-gate evaluator. Single source of truth for which
-// path a message takes through TTS / notifications. App.tsx logs the
-// decision result AND uses it to drive the engine call, so the log and
-// the actual behaviour are guaranteed to match.
-import {
-  composeDecisionLogData,
-  decideNotificationAction,
-  decideTtsAction,
-  type SideEffectContext,
-} from './side-effect-decision';
+// v0.1.76 — the TTS/notification decision-gate evaluator
+// (decideTtsAction / decideNotificationAction) now runs in the MAIN process
+// (src/main/tts-dispatch.ts), NOT here. The renderer no longer imports it.
 import {
   applyOptimisticSendTimeout,
   logOptimisticSendTimeout,
@@ -112,7 +108,20 @@ export function App(): React.ReactElement {
   // re-shows the banner if the user hasn't actually installed the new build.
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const ttsRef = useRef<TtsEngineLike | undefined>(undefined);
-  const notifyLimiterRef = useRef<RateLimiter>(new RateLimiter(DEFAULT_SETTINGS.notifications.maxPerMinute));
+  // v0.1.76 (Ethan voice 4414) — DEDICATED browser Web-Speech engine used
+  // ONLY to execute `IPC.TTS_SPEAK_BROWSER` commands pushed from the
+  // main-process dispatcher. This is intentionally SEPARATE from `ttsRef`
+  // (which now only backs the Settings-drawer voice preview). The main process
+  // decides whether/what to speak + the backend; when it picks 'browser' it
+  // pushes a command here and this engine speaks it through the hardened
+  // speak path. Always a browser TTSEngine regardless of the engine toggle,
+  // because browser-speak commands always need Web Speech. Lazily constructed
+  // on first command so it doesn't allocate before any chat arrives.
+  const browserSpeakRef = useRef<TTSEngine | undefined>(undefined);
+  // v0.1.76 — the notification rate limiter moved to the MAIN process
+  // (TtsDispatcher.notifLimiter) along with the whole notification decision,
+  // so the renderer no longer holds a notifyLimiterRef. Notifications fire from
+  // main now; the renderer only renders the feed + executes browser-speak.
   // v0.1.63 — one timeout per renderer-minted optimistic send. The map lives
   // in a ref because these handles are lifecycle bookkeeping, not render data:
   // changing them should not re-render the chat feed. Every handle is cleared
@@ -122,13 +131,9 @@ export function App(): React.ReactElement {
     new Map(),
   );
   const sendNoticeSeqRef = useRef(0);
-  // v0.1.60 — id of the message we most recently triggered side effects
-  // for (TTS speak + native notify). Used by the side-effect useEffect
-  // below to skip both (a) optimistic-placeholder inserts that haven't
-  // been confirmed by the server yet, and (b) re-fires whose last
-  // element didn't actually change identity (e.g. a dedupe-replace
-  // mid-array). See `shouldTriggerSideEffects` for the full reasoning.
-  const lastSpokenIdRef = useRef<string | undefined>(undefined);
+  // v0.1.76 — the same-id-reprocess guard (lastSpokenIdRef) moved to the MAIN
+  // process (TtsDispatcher.lastProcessedId) with the rest of the decision
+  // logic. The renderer no longer tracks which message it last "spoke".
 
   // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
   // and stash both in refs so the mount-only `onChatMessage` subscription
@@ -321,7 +326,6 @@ export function App(): React.ReactElement {
       // `makeTtsEngine` picks the right implementation; the renderer
       // talks to the polymorphic `TtsEngineLike` surface from here on.
       ttsRef.current = makeTtsEngine(s.tts);
-      notifyLimiterRef.current = new RateLimiter(s.notifications.maxPerMinute);
       // Pull-fetch the current connection state. The push channel
       // (onConnectionState) only delivers UPDATES — if the main process
       // already transitioned the WS to 'connecting' / 'connected' BEFORE we
@@ -475,11 +479,8 @@ export function App(): React.ReactElement {
         }
         return next;
       });
-      try {
-        notifyLimiterRef.current = new RateLimiter(next.notifications.maxPerMinute);
-      } catch (err) {
-        console.error('[App] rate limiter re-init on push failed', err);
-      }
+      // v0.1.76 — notification rate-limit lives in main now; nothing to
+      // re-init in the renderer on a settings push.
     });
     const offUpdate = rcpp.onUpdateStatus((info) => {
       setUpdateInfo((prev) => {
@@ -505,6 +506,31 @@ export function App(): React.ReactElement {
         return info;
       });
     });
+    // v0.1.76 (Ethan voice 4414) — execute browser-speak commands from main.
+    // The main-process dispatcher decides whether/what to speak + the backend.
+    // When it picks the BROWSER backend (window visible/covered) it pushes a
+    // command here with a full settings snapshot; we speak it via the
+    // dedicated browser engine, honouring volume/voice/rate/PITCH. The renderer
+    // no longer DECIDES — it just executes. (Genuinely-hidden windows are
+    // spoken via native `say` in main and never reach this listener — that's
+    // the never-miss path that doesn't depend on the renderer at all.)
+    const offSpeakBrowser = rcpp.onSpeakBrowser((payload) => {
+      try {
+        if (!browserSpeakRef.current) {
+          // Lazy construct the dedicated browser engine on first command.
+          browserSpeakRef.current = new TTSEngine({
+            ...settings.tts,
+            // Force browser semantics + enabled — main already gated the
+            // decision, this engine only ever executes vetted commands.
+            engine: 'browser',
+            enabled: true,
+          });
+        }
+        browserSpeakRef.current.speakBrowserCommand(payload);
+      } catch (err) {
+        console.error('[App] speakBrowserCommand failed', err);
+      }
+    });
     return () => {
       alive = false;
       offAuth();
@@ -516,6 +542,15 @@ export function App(): React.ReactElement {
       offClear();
       offSettingsPush();
       offUpdate();
+      offSpeakBrowser();
+      // v0.1.76 — tear down the browser-speak engine so its keep-alive timer
+      // doesn't leak across an unmount.
+      try {
+        browserSpeakRef.current?.cancel();
+      } catch {
+        /* defensive */
+      }
+      browserSpeakRef.current = undefined;
       clearAllOptimisticSendTimeouts('unmount');
       // v0.1.71 — drop cold-start spinner timers on unmount so they
       // can't fire setState after we've torn down (React would warn).
@@ -555,109 +590,34 @@ export function App(): React.ReactElement {
     dispatchEnqueueChatSend(text, clientId);
   };
 
-  // Forward each new message to TTS + native notifications, honouring the
-  // platform filter and the v0.1.26 regex-ignore lists.
+  // v0.1.76 (Ethan voice 4414, 2026-05-30) — TTS + NOTIFICATION DISPATCH MOVED
+  // TO THE MAIN PROCESS.
+  // ===========================================================================
+  // The renderer NO LONGER decides whether/what to speak or notify. That entire
+  // decision/filter/rate-limit/same-id/backend-choice ladder now lives in the
+  // BACKGROUND (main) process — see src/main/tts-dispatch.ts (TtsDispatcher),
+  // wired into `chat.on('message')` in main.ts. This is PRIORITY #1 from voice
+  // 4414: "it must NEVER miss a message". Running the decision in main means a
+  // wedged/dead/slow renderer can no longer swallow a message, and when the
+  // window is genuinely hidden main speaks it via native `say` with zero
+  // renderer involvement.
   //
-  // v0.1.73 (Ethan voice 4364, 2026-05-28) — every decision-gate now emits
-  // a `tts_decision` / `notification_decision` row to tts-events.jsonl
-  // BEFORE the engine is called (or BEFORE the skip is taken). The pure
-  // helper `decideTtsAction` / `decideNotificationAction` lives in
-  // `side-effect-decision.ts` and is the single source of truth for which
-  // path the message takes. We log the decision result AND use it to
-  // drive the engine call — so the log is GUARANTEED to match reality.
+  // What the renderer does now:
+  //   - Renders the feed (onChatMessage, above) — unchanged.
+  //   - Computes the `ignoredByTts` / `ignoredByNotifications` BADGE flags for
+  //     the feed via applyMessageFilters in onChatMessage — display-only, NOT a
+  //     side-effect decision. (The authoritative decision is main's.)
+  //   - Executes browser-speak COMMANDS pushed from main via
+  //     `IPC.TTS_SPEAK_BROWSER` (onSpeakBrowser, above) — speaking one
+  //     utterance through the hardened Web-Speech path, honouring every setting
+  //     (volume/voice/rate/PITCH) from the command payload. This is how the
+  //     visible-window case keeps full setting fidelity.
   //
-  // Why this rewrite was needed: Ethan's voice 4364 caught a case where a
-  // viewer message didn't get read aloud and the existing log had NO row
-  // explaining why. We could see `speak_called` rows for messages that
-  // DID get read, but skips were invisible. Now every message produces
-  // at least 2 rows (one tts_decision, one notification_decision) and a
-  // forensic grep can answer "why didn't this get read" in one step.
-  //
-  // Gate ladder (same as pre-v0.1.73 behaviour — pure-function refactor only):
-  //   pending-send → self → same-id → platform → hidden-user → engine-disabled
-  //   → username-regex → content-regex → READ
-  // See `side-effect-decision.ts` for the full per-gate docstring.
-  useEffect(() => {
-    if (messages.length === 0) return;
-    const m = messages[messages.length - 1];
-
-    // Build the immutable decision-context snapshot once per message.
-    // The refs are dereferenced HERE — the decision module is pure and
-    // doesn't know about React refs.
-    const ctx: SideEffectContext = {
-      settings,
-      hiddenUsersSet: hiddenUsersSetRef.current,
-      ttsContentPatterns: ttsIgnoreRef.current,
-      ttsUsernamePatterns: ttsUsernameIgnoreRef.current,
-      notifContentPatterns: notifIgnoreRef.current,
-      notifUsernamePatterns: notifUsernameIgnoreRef.current,
-      lastProcessedId: lastSpokenIdRef.current,
-    };
-
-    // --- TTS path ---
-    const ttsResult = decideTtsAction(m, ctx);
-    // Emit BEFORE the engine call so a crash inside the engine doesn't
-    // hide the decision row.
-    rcpp.ttsLog('tts_decision', composeDecisionLogData(m, ttsResult));
-
-    // --- Notification path ---
-    // Decide INDEPENDENTLY of TTS so a message that's TTS-skipped but
-    // notification-allowed (or vice versa, via the per-axis regex lists)
-    // produces two correctly-distinct rows.
-    const notifResult = decideNotificationAction(m, ctx);
-
-    // The same-id-reprocess gate is the SHARED-state gate — we want
-    // lastSpokenIdRef bumped exactly once per non-reprocess message,
-    // regardless of which side effect actually fired. Bump it now (after
-    // both gates evaluated against the OLD value via ctx.lastProcessedId)
-    // so subsequent useEffect re-fires for THIS id short-circuit at the
-    // same-id gate. NOTE: `ttsResult.reason === 'same-id-reprocess'` is
-    // the right test — if EITHER path saw the message as new (i.e. not
-    // same-id), we should remember it. We check the TTS path since both
-    // paths apply the same-id gate identically.
-    if (ttsResult.reason !== 'same-id-reprocess') {
-      lastSpokenIdRef.current = m.id;
-    }
-
-    // Fire TTS engine if the decision said so.
-    if (ttsResult.decision === 'read') {
-      ttsRef.current?.enqueue(m);
-    }
-
-    // Notification path has an additional rate-limit gate that lives in
-    // the renderer (not the pure decider) because RateLimiter holds
-    // mutable token-bucket state. Evaluate it as a post-decision filter:
-    // if the decider says 'notify' but the limiter rejects, we emit a
-    // SECOND notification_decision row with `decision: 'skip', reason:
-    // 'rate-limited'`. This means a rate-limited message has BOTH a
-    // 'notify' row (decider's verdict) AND a 'skip:rate-limited' row
-    // (limiter's verdict) — easier to spot a "the regex would have
-    // allowed it but rate limit blocked it" pattern in the log.
-    if (notifResult.decision === 'notify') {
-      if (notifyLimiterRef.current.tryConsume()) {
-        rcpp.ttsLog(
-          'notification_decision',
-          composeDecisionLogData(m, notifResult),
-        );
-        rcpp.notify(`${m.username} (${m.platform})`, m.text);
-      } else {
-        // Limiter said no — emit a `skip:rate-limited` row INSTEAD of
-        // the `notify` row so the log reflects what actually happened.
-        rcpp.ttsLog(
-          'notification_decision',
-          composeDecisionLogData(m, {
-            decision: 'skip',
-            reason: 'rate-limited',
-          }),
-        );
-      }
-    } else {
-      // Decider already said skip — log its reason as-is.
-      rcpp.ttsLog('notification_decision', composeDecisionLogData(m, notifResult));
-    }
-    // We only react to the freshest message; intentionally omitting `settings` from deps when it changes mid-batch is fine because the engine + limiter pick up updates via refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages]);
+  // Notifications likewise fire from main now (the dispatcher calls Electron's
+  // Notification directly, honouring soundEnabled). The old renderer-side
+  // decision useEffect + its renderer RateLimiter for notifications are gone;
+  // the rate limiters live in main (TtsDispatcher.ttsLimiter / notifLimiter) so
+  // they survive a renderer reload.
 
   // v0.1.72 — also drop messages whose `username` is in `hiddenUsers`
   // (case-insensitive exact match). Re-runs every render so historical
@@ -718,7 +678,7 @@ export function App(): React.ReactElement {
     } else {
       ttsRef.current?.updateSettings(next.tts);
     }
-    notifyLimiterRef.current = new RateLimiter(next.notifications.maxPerMinute);
+    // v0.1.76 — notification rate-limit lives in main now; nothing to re-init.
     await rcpp.setSettings(next);
   };
 

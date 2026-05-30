@@ -22,6 +22,8 @@ import {
   NATIVE_MAX_WPM,
   NATIVE_MIN_WPM,
   NativeTtsEngine,
+  buildSayText,
+  clampSayVolume,
   parseSayVoiceList,
   rateToWpm,
   ttsToNativeSettings,
@@ -164,7 +166,11 @@ describe('NativeTtsEngine', () => {
     expect(child.args[2]).toBe('-r');
     expect(child.args[3]).toBe(String(NATIVE_BASE_WPM));
     expect(child.args[4]).toBe('--');
-    expect(child.args[5]).toBe('hello world');
+    // v0.1.76 — spoken text now carries the inline `[[volm n]]` volume command.
+    // At volume 1.0 the prefix is `[[volm 1]] ` (full loudness; no-op on volume
+    // but always emitted so behaviour is explicit + testable).
+    expect(child.args[5]).toBe(buildSayText('hello world', 1.0));
+    expect(child.args[5]).toBe('[[volm 1]] hello world');
   });
 
   it('omits the -v flag when no voice is configured', () => {
@@ -179,7 +185,8 @@ describe('NativeTtsEngine', () => {
     // Argv shape with no voice: ['-r', '<wpm>', '--', '<text>'].
     expect(child.args[0]).toBe('-r');
     expect(child.args[2]).toBe('--');
-    expect(child.args[3]).toBe('hello');
+    // v0.1.76 — volume prefix (baseSettings volume is DEFAULT_SETTINGS 1.0).
+    expect(child.args[3]).toBe(buildSayText('hello', baseSettings.volume));
   });
 
   it('queues subsequent enqueues and starts each one after the previous exits', async () => {
@@ -193,16 +200,18 @@ describe('NativeTtsEngine', () => {
     engine.enqueue('three', { messageId: 'm3' });
     // Only one subprocess running at a time.
     expect(spawns.length).toBe(1);
-    expect(spawns[0].args[spawns[0].args.length - 1]).toBe('one');
+    // v0.1.76 — spoken text now carries the `[[volm n]]` prefix; assert via
+    // buildSayText so the test tracks the volume-command format automatically.
+    expect(spawns[0].args[spawns[0].args.length - 1]).toBe(buildSayText('one', baseSettings.volume));
     // First exits → next pops on next-tick drain.
     spawns[0].exit(0);
     await new Promise((r) => setImmediate(r));
     expect(spawns.length).toBe(2);
-    expect(spawns[1].args[spawns[1].args.length - 1]).toBe('two');
+    expect(spawns[1].args[spawns[1].args.length - 1]).toBe(buildSayText('two', baseSettings.volume));
     spawns[1].exit(0);
     await new Promise((r) => setImmediate(r));
     expect(spawns.length).toBe(3);
-    expect(spawns[2].args[spawns[2].args.length - 1]).toBe('three');
+    expect(spawns[2].args[spawns[2].args.length - 1]).toBe(buildSayText('three', baseSettings.volume));
     spawns[2].exit(0);
     await new Promise((r) => setImmediate(r));
     // Queue is empty; no further spawns.
@@ -345,7 +354,56 @@ describe('NativeTtsEngine', () => {
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
     expect(spawns.length).toBe(1);
-    expect(spawns[0].args[spawns[0].args.length - 1]).toBe('two');
+    // v0.1.76 — volume-prefixed spoken text.
+    expect(spawns[0].args[spawns[0].args.length - 1]).toBe(buildSayText('two', baseSettings.volume));
+  });
+});
+
+// v0.1.76 (Ethan voice 4414) — native volume application via `[[volm n]]`.
+// This is the load-bearing test for Ethan's hard constraint: the volume slider
+// MUST keep working even when the native `say` fallback is what's speaking.
+describe('native volume application (v0.1.76)', () => {
+  it('clampSayVolume clamps to [0,1] and defaults undefined/NaN to 1.0', () => {
+    expect(clampSayVolume(0.5)).toBe(0.5);
+    expect(clampSayVolume(0)).toBe(0);
+    expect(clampSayVolume(1)).toBe(1);
+    expect(clampSayVolume(-0.3)).toBe(0); // below range → 0
+    expect(clampSayVolume(2)).toBe(1); // above range → 1
+    expect(clampSayVolume(undefined)).toBe(1.0); // missing → full (never mute)
+    expect(clampSayVolume(Number.NaN)).toBe(1.0);
+  });
+
+  it('buildSayText prepends the inline [[volm n]] command', () => {
+    expect(buildSayText('hi', 0.35)).toBe('[[volm 0.35]] hi');
+    expect(buildSayText('hi', 1)).toBe('[[volm 1]] hi');
+    expect(buildSayText('hi', 0)).toBe('[[volm 0]] hi');
+    // Out-of-range clamps before formatting.
+    expect(buildSayText('hi', 2)).toBe('[[volm 1]] hi');
+  });
+
+  it('per-utterance volume opt flows into the spoken `say` text', () => {
+    const { spawner, last } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({
+      settings: { voiceURI: undefined, rate: 1.0, volume: 1.0 },
+      spawner,
+    });
+    // A specific per-message volume (e.g. from settings.tts.volume = 0.2).
+    engine.enqueue('quiet please', { volume: 0.2 });
+    const child = last();
+    // Last arg is the spoken text — must carry the requested volume command.
+    expect(child.args[child.args.length - 1]).toBe('[[volm 0.2]] quiet please');
+  });
+
+  it('falls back to engine settings volume when the opt is omitted', () => {
+    const { spawner, last } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({
+      // Engine-level volume the slider set; no per-utterance override.
+      settings: { voiceURI: undefined, rate: 1.0, volume: 0.6 },
+      spawner,
+    });
+    engine.enqueue('medium volume');
+    const child = last();
+    expect(child.args[child.args.length - 1]).toBe('[[volm 0.6]] medium volume');
   });
 });
 

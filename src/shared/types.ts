@@ -543,6 +543,24 @@ export const IPC = {
   TTS_NATIVE_CANCEL: 'tts-native:cancel',
   TTS_NATIVE_UPDATE_SETTINGS: 'tts-native:update-settings',
   TTS_NATIVE_GET_VOICES: 'tts-native:get-voices',
+  /**
+   * v0.1.76 (Ethan voice 4414, 2026-05-30) — MAIN → renderer push. Asks the
+   * renderer to speak ONE utterance via the browser Web-Speech engine.
+   *
+   * This is the inversion that moves TTS dispatch into the background: the
+   * main process now OWNS the decision (filters, rate-limit, same-id guard,
+   * visibility-based backend choice — see src/main/tts-dispatch.ts). When the
+   * window is visible/covered, main picks the BROWSER backend and pushes this
+   * channel with a full snapshot of the utterance's TTS settings
+   * (`TtsSpeakBrowserPayload` — voice/rate/pitch/volume). The renderer is now
+   * a THIN executor: it just speaks what it's told, honouring every setting in
+   * the payload. It no longer decides anything.
+   *
+   * Fire-and-forget. If the window is genuinely hidden main NEVER uses this
+   * channel — it speaks via native `say` directly (renderer-independent), which
+   * is the never-miss guarantee.
+   */
+  TTS_SPEAK_BROWSER: 'tts:speak-browser',
 } as const;
 
 /**
@@ -586,6 +604,25 @@ export interface TtsNativeSettingsPayload {
   voiceURI?: string;
   rate: number;
   volume: number;
+}
+
+/**
+ * v0.1.76 — wire payload for `IPC.TTS_SPEAK_BROWSER` (MAIN → renderer). One
+ * utterance the renderer should speak via Web Speech, carrying a full snapshot
+ * of the TTS settings the utterance needs. The decision (whether to speak at
+ * all, which backend) was already made in main — the renderer just executes.
+ * Carrying the settings in the payload is what keeps volume/voice/rate/PITCH
+ * all working in the visible-window case without the renderer re-reading state.
+ */
+export interface TtsSpeakBrowserPayload {
+  /** Already-composed text (sender-name prefix already applied if enabled). */
+  text: string;
+  voiceURI?: string;
+  rate: number;
+  pitch: number;
+  volume: number;
+  /** For log correlation with the main-process decision row. */
+  messageId: string;
 }
 
 /**

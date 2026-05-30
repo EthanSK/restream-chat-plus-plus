@@ -58,6 +58,11 @@ import {
   ttsToNativeSettings,
   type NativeVoice,
 } from './tts-native';
+// v0.1.76 — main-process TTS + notification dispatcher (Ethan voice 4414).
+// Owns the decision/filter/rate-limit/backend-choice logic that used to live
+// in the renderer, so the never-miss guarantee + native fallback don't depend
+// on the renderer being alive. See src/main/tts-dispatch.ts.
+import { TtsDispatcher } from './tts-dispatch';
 import {
   DEFAULT_SETTINGS,
   IPC,
@@ -1028,6 +1033,69 @@ app.on('ready', async () => {
     console.warn('[main] native voice pre-warm failed', err);
   });
 
+  // ----- v0.1.76 main-process TTS + notification dispatcher (voice 4414) -----
+  // The dispatcher OWNS the chat→speak decision now (filters, rate-limit,
+  // same-id guard, backend choice). It's wired into `chat.on('message')` below
+  // so EVERY incoming chat message is decided + dispatched from the background
+  // process. The never-miss guarantee: when the window is genuinely hidden, the
+  // dispatcher speaks via the native `say` engine here in main — no renderer
+  // involvement — so a dead/wedged renderer can never swallow a message.
+  const ttsDispatcher = new TtsDispatcher({
+    loadSettings,
+    // GENUINELY hidden = Web Speech is suspended (minimised / on another macOS
+    // Space / app hidden via Cmd-H). A merely-COVERED window is NOT hidden:
+    // the app disables Chromium occlusion (--disable-features=
+    // MacWebContentsOcclusion) so a covered window keeps reporting 'visible'
+    // and Web Speech keeps working — that's Ethan's preferred background path
+    // (browser voice honours the volume slider). We mirror that here using the
+    // BrowserWindow's native state: a window that is NOT minimised AND IS
+    // visible is one Web Speech can still drive. `isVisible()` is false when
+    // the app is hidden via Cmd-H or the window is closed; `isMinimized()` is
+    // true when minimised to the Dock. We deliberately do NOT try to detect
+    // "on another Space" from main (Electron has no portable API for it) — the
+    // renderer's own `document.hidden` check (the v0.1.74 layer in tts.ts) is
+    // the second safety net for that specific state, and even if BOTH miss it,
+    // the worst case is the browser voice (already chosen) and the renderer's
+    // own native-fallback in tts.ts catches it. Belt and suspenders.
+    isWindowGenuinelyHidden: () => {
+      const w = mainWindow;
+      if (!w || w.isDestroyed()) return true; // no window → must use native
+      try {
+        if (w.isMinimized()) return true;
+        if (!w.isVisible()) return true;
+        return false;
+      } catch {
+        // If the window state query throws, prefer native (never-miss).
+        return true;
+      }
+    },
+    speakNative: (text, opts) => {
+      nativeTts.enqueue(text, opts);
+    },
+    speakBrowser: (payload) => {
+      // Push to the renderer's thin Web-Speech executor. Best-effort — if the
+      // window vanished between the visibility check and here, the message is
+      // lost, but that race is vanishingly small and only happens when the
+      // window is ALSO being hidden (in which case native would've been used).
+      try {
+        mainWindow?.webContents.send(IPC.TTS_SPEAK_BROWSER, payload);
+      } catch (err) {
+        console.warn('[main] TTS_SPEAK_BROWSER send failed', err);
+      }
+    },
+    notify: (title, body, silent) => {
+      try {
+        if (!Notification.isSupported()) return;
+        new Notification({ title, body, silent }).show();
+      } catch (err) {
+        console.warn('[main] dispatcher notify failed', err);
+      }
+    },
+    log: (event, data) => {
+      appendTtsLog({ event: event as TtsLogEvent['event'], data });
+    },
+  });
+
   ipcMain.on(IPC.TTS_NATIVE_ENQUEUE, (_evt, payload: TtsNativeEnqueuePayload) => {
     if (!payload || typeof payload.text !== 'string') return;
     nativeTts.enqueue(payload.text, {
@@ -1667,16 +1735,23 @@ app.on('ready', async () => {
   });
 
   // ----- IPC: notifications (renderer asks main to fire native notif) -----
-  ipcMain.handle(IPC.NOTIFY, (_evt, payload: { title: string; body: string }) => {
-    if (!Notification.isSupported()) return false;
-    const n = new Notification({
-      title: payload.title,
-      body: payload.body,
-      silent: false,
-    });
-    n.show();
-    return true;
-  });
+  // v0.1.76: the main-process ttsDispatcher now fires chat notifications
+  // DIRECTLY (it owns the decision). This IPC handler stays for any remaining
+  // renderer/MCP callers; `silent` is honoured when provided (defaults to
+  // not-silent to preserve pre-v0.1.76 behaviour for callers that omit it).
+  ipcMain.handle(
+    IPC.NOTIFY,
+    (_evt, payload: { title: string; body: string; silent?: boolean }) => {
+      if (!Notification.isSupported()) return false;
+      const n = new Notification({
+        title: payload.title,
+        body: payload.body,
+        silent: payload.silent === true,
+      });
+      n.show();
+      return true;
+    },
+  );
 
   // ----- IPC: connections (channels panel pull-fetch) -----
   ipcMain.handle(IPC.CONNECTIONS_GET, () => chat.getConnections());
@@ -2121,7 +2196,21 @@ app.on('ready', async () => {
   });
 
   // ----- Forward chat & state to renderer -----
-  chat.on('message', (m) => mainWindow?.webContents.send(IPC.CHAT_MESSAGE, m));
+  // v0.1.76 — chat now drives TWO things from main:
+  //   1. CHAT_MESSAGE → renderer (so the visible feed renders the row).
+  //   2. ttsDispatcher.handleMessage(m) → the background TTS + notification
+  //      decision/dispatch. This is the never-miss path: it runs in MAIN, so
+  //      even if the renderer is wedged/dead it still decides + (when hidden)
+  //      speaks via native `say`. The renderer's old side-effect useEffect is
+  //      gone — it no longer decides anything, it only renders + executes
+  //      browser-speak commands pushed back via IPC.TTS_SPEAK_BROWSER.
+  // Order: forward to the feed FIRST (so the row appears), then dispatch TTS.
+  // handleMessage is wrapped in its own try/catch internally so a dispatch
+  // error can never break the feed forward.
+  chat.on('message', (m) => {
+    mainWindow?.webContents.send(IPC.CHAT_MESSAGE, m);
+    ttsDispatcher.handleMessage(m);
+  });
   chat.on('state', (s) => mainWindow?.webContents.send(IPC.CONN_STATE, s));
   chat.on('connections', (cs) =>
     mainWindow?.webContents.send(IPC.CONNECTIONS, cs),

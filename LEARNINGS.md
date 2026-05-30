@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-30T16:46:12Z
+**Trigger:** Ethan voice 4414, 2026-05-30
+**Symptom:** TTS robustness depended on the renderer: chat→speak decision/filter/queue/rate-limit lived in the renderer (App.tsx + side-effect-decision.ts), so a wedged/slow/dead renderer could swallow a message. Native say fallback also ignored the volume slider. Ethan voice 4414: must NEVER miss a message; move ALL TTS decision/dispatch to background (main) process; volume + every other control must still work.
+**Root cause:** Decision logic was renderer-side; main only forwarded CHAT_MESSAGE. Native engine (tts-native.ts) built say args as -v/-r only, never applying volume (say has no --volume flag and the v0.1.42 code chose to document it as unsupported).
+**Fix:** v0.1.76. (1) Moved the pure deciders to src/shared/ (message-filters.ts + side-effect-decision.ts) with re-export shims left at the old src/renderer/ paths so all imports/tests keep working. (2) New src/main/tts-dispatch.ts (TtsDispatcher) runs decideTtsAction/decideNotificationAction in MAIN, owns the rate limiters (MainRateLimiter) + same-id guard, and picks the backend by window visibility: visible/covered -> push IPC.TTS_SPEAK_BROWSER to renderer (browser Web-Speech honours volume/voice/rate/PITCH); genuinely hidden (mainWindow.isMinimized()||!isVisible()) -> nativeTts.enqueue (renderer-independent never-miss path). Wired into chat.on('message') in main.ts alongside the existing feed-forward. (3) tts-native.ts now applies volume via the inline say command [[volm 0.0-1.0]] (buildSayText + clampSayVolume) prepended to the spoken text — verified working on Tahoe. (4) Renderer side-effect useEffect deleted; renderer is now a thin executor: TTSEngine.speakBrowserCommand(payload) speaks one utterance through the hardened speak path honouring payload settings; notifications fire from main. Removed dead renderer refs (lastSpokenIdRef, notifyLimiterRef, RateLimiter import).
+**Commit:** 0cb3dff
+**Guard:** src/__tests__/tts-dispatch.test.ts (17 cases: backend flips on visibility, all-settings-flow-through for both paths, pitch-only-degrades-when-hidden, decision gates suppress, main-side rate-limit cap+recovery, notification silent honours soundEnabled, thrown backend swallowed). tts-native.test.ts updated + 4 new volume cases (clampSayVolume, buildSayText, per-utterance + settings-fallback volume in say text). 611/611 tests pass, typecheck clean. VERDICT: volume + every control work in the normal visible case (incl pitch); only PITCH degrades, and ONLY in the rare genuinely-hidden state (say has no pitch knob) — restored instantly when window visible. Live Mini verification still recommended: minimise window, send chat, confirm native say speaks at slider volume.
+---
+
+---
 **Date:** 2026-05-30T14:27:02Z
 **Trigger:** Ethan voice 4407 follow-up, 2026-05-30
 **Symptom:** Ethan PREFERS the browser (Web Speech) voice in the background, not the native 'say' voice — v0.1.74 made native the default for ALL backgrounded/occluded states. He asked 'is there actually nothing we can do?'
