@@ -161,4 +161,102 @@ describe('checkForUpdatesInteractive — GH-Releases reconciliation (v0.1.37)', 
     expect(opts.type).toBe('warning');
     expect(opts.detail).toContain('503');
   });
+
+  /**
+   * v0.1.83 regression test — Codex menu-bar review (🟡 low):
+   *
+   * THE BUG: the "Update available" dialog uses
+   * `buttons = ['Open Release Page', 'OK']` (index 0 = Open Release Page)
+   * and acts on the result with `if (response === 0) shell.openExternal(url)`.
+   * `safeMessageBox`'s catch USED to return `{ response: 0 }` on a
+   * dialog-SHOW failure — so if `dialog.showMessageBox` threw (e.g. no
+   * usable parent, native dialog subsystem error), the catch returned
+   * `response: 0` and the browser opened to the release page UNPROMPTED.
+   *
+   * THE FIX: `safeMessageBox` now returns the sentinel `{ response: -1 }`
+   * on a thrown dialog. `-1` matches no `response === <n>` action at any
+   * call site, so a dialog failure maps to "no action taken". This test
+   * forces `showMessageBox` to throw on the "available" path and asserts
+   * the browser is NOT opened.
+   */
+  it('does NOT open the browser when the "Update available" dialog itself throws', async () => {
+    performGithubUpdateCheckMock.mockResolvedValue({
+      kind: 'available',
+      currentVersion: '0.1.34',
+      latestVersion: '0.1.36',
+      releaseUrl: 'https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.36',
+      checkedAt: Date.now(),
+    });
+
+    const { checkForUpdatesInteractive } = await import('../main/updater');
+    const electron = await import('electron');
+
+    // Force the native dialog to fail at show time — the exact condition
+    // that previously fell through to `response: 0` → unprompted browser.
+    (electron.dialog.showMessageBox as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('dialog subsystem unavailable'),
+    );
+
+    await checkForUpdatesInteractive(null);
+
+    // The dialog was attempted exactly once...
+    expect((electron.dialog.showMessageBox as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    // ...but because it THREW, the release page must NOT have been opened.
+    expect((electron.shell.openExternal as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+  });
+
+  /**
+   * Positive control for the fix above: when the dialog SUCCEEDS and the
+   * user clicks "Open Release Page" (index 0), the browser DOES open. This
+   * guards against an over-correction that breaks the legitimate action.
+   */
+  it('DOES open the browser when the dialog succeeds and the user picks "Open Release Page"', async () => {
+    performGithubUpdateCheckMock.mockResolvedValue({
+      kind: 'available',
+      currentVersion: '0.1.34',
+      latestVersion: '0.1.36',
+      releaseUrl: 'https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.36',
+      checkedAt: Date.now(),
+    });
+
+    const { checkForUpdatesInteractive } = await import('../main/updater');
+    const electron = await import('electron');
+
+    // User clicks index 0 = "Open Release Page".
+    (electron.dialog.showMessageBox as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      response: 0,
+    });
+
+    await checkForUpdatesInteractive(null);
+
+    expect((electron.shell.openExternal as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    expect((electron.shell.openExternal as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
+      'https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.36',
+    );
+  });
+
+  /**
+   * Also confirm clicking "OK" (index 1) on a successful dialog does NOT
+   * open the browser — i.e. the action is correctly scoped to index 0.
+   */
+  it('does NOT open the browser when the user picks "OK" (index 1)', async () => {
+    performGithubUpdateCheckMock.mockResolvedValue({
+      kind: 'available',
+      currentVersion: '0.1.34',
+      latestVersion: '0.1.36',
+      releaseUrl: 'https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.36',
+      checkedAt: Date.now(),
+    });
+
+    const { checkForUpdatesInteractive } = await import('../main/updater');
+    const electron = await import('electron');
+
+    (electron.dialog.showMessageBox as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      response: 1,
+    });
+
+    await checkForUpdatesInteractive(null);
+
+    expect((electron.shell.openExternal as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+  });
 });

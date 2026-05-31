@@ -498,6 +498,27 @@ async function createMainWindow() {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+
+  // v0.1.83 — null the module-level `mainWindow` handle the moment the
+  // BrowserWindow is closed. WHY this matters:
+  //   On macOS, closing the only window does NOT quit the app — the
+  //   `window-all-closed` handler (below) only calls `app.quit()` on
+  //   non-darwin. So the app + the application menu stay alive with no
+  //   visible window. Without this listener, `mainWindow` would remain a
+  //   NON-NULL reference to a DESTROYED BrowserWindow. Every `mainWindow?.…`
+  //   guard sprinkled through this file uses optional chaining, which only
+  //   short-circuits on `null`/`undefined` — it does NOT detect a destroyed
+  //   window. Calling `.webContents` on a destroyed window throws
+  //   synchronously, and inside a menu-click handler Electron surfaces that
+  //   throw as the cryptic macOS alert "this command is disabled and cannot
+  //   be executed" (the exact symptom that hit the Preferences… item).
+  //   Setting the handle back to `null` on `closed` makes every existing
+  //   `mainWindow?.` guard genuinely short-circuit after the window is gone,
+  //   and the `app.on('activate')` handler recreates + reassigns it when the
+  //   user re-opens via the Dock.
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
 }
 
 /**
@@ -511,6 +532,34 @@ function broadcastChatClear(win: BrowserWindow | null): void {
     win?.webContents.send(IPC.CHAT_CLEAR);
   } catch (err) {
     console.error('[main] broadcastChatClear failed', err);
+  }
+}
+
+/**
+ * Open the renderer's settings panel from the application-menu
+ * "Preferences…" item (Cmd+,). v0.1.83.
+ *
+ * Extracted into a named helper (mirroring `broadcastChatClear`) so the
+ * defensive guard is unit-testable WITHOUT spinning up a real Electron
+ * menu. The bug this guards against: on macOS the app + menu outlive the
+ * only window, so `win` can be a NON-NULL but DESTROYED BrowserWindow.
+ * `win?.` only short-circuits `null`, not a destroyed window, and touching
+ * `.webContents` on a destroyed window throws synchronously — which
+ * Electron's menu dispatcher surfaces as the macOS "this command is
+ * disabled and cannot be executed" alert. We therefore (1) bail on a null
+ * OR destroyed window, and (2) wrap the send in try/catch as a final
+ * safety net (a window can be torn down between the isDestroyed() check
+ * and the send in a re-entrant edge case). Exported for tests only.
+ */
+export function openSettingsFromMenu(win: BrowserWindow | null): void {
+  // Guard BOTH null (window never created / already nulled on `closed`)
+  // and destroyed (stale handle that the `closed` listener hasn't cleared
+  // yet) before touching webContents.
+  if (!win || win.isDestroyed()) return;
+  try {
+    win.webContents.send('menu:open-settings');
+  } catch (err) {
+    console.error('[main] openSettingsFromMenu failed', err);
   }
 }
 
@@ -559,7 +608,17 @@ function buildMenu(onRevealLogs: () => void) {
               {
                 label: 'Preferences…',
                 accelerator: 'CmdOrCtrl+,',
-                click: () => mainWindow?.webContents.send('menu:open-settings'),
+                // v0.1.83 — belt-and-suspenders guard mirroring the other
+                // menu click handlers (check-for-updates, reveal-logs,
+                // clear-chat are all defensively wrapped). The root fix is
+                // the `closed → mainWindow = null` listener in
+                // createMainWindow(), but we ALSO guard here so that even a
+                // stale/destroyed handle (e.g. a `closed` event that hasn't
+                // fired yet, or a future refactor that drops the listener)
+                // can never throw out of the click dispatcher. A sync throw
+                // here would surface as the macOS "this command is disabled
+                // and cannot be executed" alert — see openSettingsFromMenu.
+                click: () => openSettingsFromMenu(mainWindow),
               },
               { type: 'separator' as const },
               { role: 'services' as const },
@@ -2079,7 +2138,12 @@ app.on('ready', async () => {
   // gets full system keyboard navigation for free. v0.1.18.
   ipcMain.handle(IPC.CHAT_SHOW_CONTEXT_MENU, () => {
     try {
-      if (!mainWindow) return;
+      // v0.1.83 — guard a DESTROYED window too, not just null. With the
+      // `closed → mainWindow = null` fix this is normally covered, but a
+      // stale non-null-yet-destroyed handle would make `menu.popup({ window
+      // })` throw; the surrounding try/catch swallows it, but bailing early
+      // is cleaner and matches the openSettingsFromMenu guard.
+      if (!mainWindow || mainWindow.isDestroyed()) return;
       const menu = Menu.buildFromTemplate([
         {
           label: 'Clear Chat',

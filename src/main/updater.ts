@@ -844,7 +844,18 @@ async function safeMessageBox(
       : await dialog.showMessageBox(opts);
   } catch (err) {
     log.error('[updater] showMessageBox failed', err);
-    return { response: 0, checkboxChecked: false };
+    // v0.1.83 — on a dialog-SHOW FAILURE return a sentinel `response: -1`
+    // (NOT `0`). WHY: button index 0 is a real, actionable choice at some
+    // call sites — for the "Update available" dialog index 0 is "Open
+    // Release Page", and the caller does `if (response === 0) await
+    // shell.openExternal(releaseUrl)`. If a thrown dialog mapped to `0`,
+    // a FAILED dialog would silently open the user's browser to the
+    // release page with no prompt — a confusing, unrequested side effect.
+    // `-1` matches no `response === <n>` check at any call site, so a
+    // dialog failure now correctly maps to "no action taken". The other
+    // call sites ignore the return value entirely, so this is safe for
+    // them too.
+    return { response: -1, checkboxChecked: false };
   }
 }
 
@@ -904,6 +915,8 @@ export async function checkForUpdatesInteractive(
           ? "The update is downloading in the background — you'll be prompted to restart once it's ready."
           : 'Open the release page to install manually (this build is not connected to the in-app update feed).');
       const buttons = ['Open Release Page', 'OK'];
+      // Index 0 = "Open Release Page", index 1 = "OK" (default/cancel).
+      const OPEN_RELEASE_PAGE = 0;
       const { response } = await safeMessageBox(owner, {
         type: 'info',
         message: `Update available (${latest}).`,
@@ -912,7 +925,14 @@ export async function checkForUpdatesInteractive(
         defaultId: 1,
         cancelId: 1,
       });
-      if (response === 0) await shell.openExternal(releaseUrl);
+      // v0.1.83 — only open the browser when the dialog ACTUALLY succeeded
+      // AND the user picked "Open Release Page". On a dialog-show failure
+      // `safeMessageBox` now returns the sentinel `-1` (see its catch),
+      // which deliberately does NOT equal `OPEN_RELEASE_PAGE`, so a failed
+      // dialog no longer opens the release page unprompted. The strict
+      // `=== OPEN_RELEASE_PAGE` check also means any future button reorder
+      // is the only thing that can change which action this triggers.
+      if (response === OPEN_RELEASE_PAGE) await shell.openExternal(releaseUrl);
 
       // 3. Kick Squirrel in the background if it can actually run.
       //    Wrapped in a try/catch because the native autoUpdater
