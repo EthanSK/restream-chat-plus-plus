@@ -156,6 +156,25 @@ describe('voice-list parsers', () => {
     expect(out[2].lang).toBe('zh-CN');
   });
 
+  // v0.1.82 regression: macOS ships voices whose locale uses a UN M49 NUMERIC
+  // region (`ar_001`, `en_001`, `es_419`) instead of an ISO alpha country code.
+  // The old anchor `[A-Z]{2,4}` required uppercase letters, dropping every such
+  // voice from the dropdown. The region group now also admits digits.
+  it('parseSayVoiceList keeps voices with numeric regions (ar_001, es_419)', () => {
+    const out = parseSayVoiceList(
+      'Majed               ar_001   # مرحبا، اسمي ماجد.\n' +
+        'Montse              ca_ES    # Hola, em dic Montse.\n' +
+        'Paulina             es_419   # Hola, me llamo Paulina.\n' +
+        'Eddy                en_001   # Hi there!\n',
+    );
+    // All four parse — the two numeric-region voices are no longer dropped.
+    expect(out).toHaveLength(4);
+    expect(out[0]).toEqual({ name: 'Majed', lang: 'ar_001', sample: 'مرحبا، اسمي ماجد.' });
+    expect(out.map((v) => v.lang)).toEqual(['ar_001', 'ca_ES', 'es_419', 'en_001']);
+    // And the alpha-region forms still work alongside them.
+    expect(out[1].name).toBe('Montse');
+  });
+
   it('parseWindowsVoiceList parses "name|culture" rows, drops junk', () => {
     const out = parseWindowsVoiceList(
       'Microsoft Zira Desktop|en-US\n' +
@@ -363,6 +382,11 @@ describe('SECURITY: untrusted text handling', () => {
     // Numeric rate/intensity flags.
     expect(c.spec.args[c.spec.args.indexOf('-r') + 1]).toBe(String(rateToSpdRate(1.0)));
     expect(c.spec.args[c.spec.args.indexOf('-i') + 1]).toBe(String(volumeToSpdIntensity(0.5)));
+    // v0.1.82: the NAMED synthesis voice goes via `-y` (matches `spd-say -L`
+    // names), NOT `-t` (which is a generic voice *type* and ignores the name).
+    expect(c.spec.args).toContain('-y');
+    expect(c.spec.args[c.spec.args.indexOf('-y') + 1]).toBe('english-us');
+    expect(c.spec.args).not.toContain('-t'); // the old, wrong flag is gone
     // text is the LAST entry, right after `--`, verbatim.
     expect(lastArg(c)).toBe(evil);
     expect(c.spec.args[c.spec.args.length - 2]).toBe('--');
@@ -416,6 +440,74 @@ describe('NativeTtsEngine — queue / cancel / lifecycle', () => {
     expect(spawns.length).toBe(1);
     expect(engine.queueDepth).toBe(0);
     expect(engine.isSpeaking).toBe(false);
+  });
+
+  // v0.1.82 regression: cancel → enqueue → (killed child's exit fires) → the
+  // queued item MUST play. Before the fix, the killed child's exit hit
+  // `if (cancelling) { cancelling=false; return; }` and bailed BEFORE drain(),
+  // so the item enqueued during the cancelling window sat idle until the next
+  // enqueue. The FakeChild.kill() defers `exit` via setImmediate, which exactly
+  // reproduces the real race ordering (cancel & enqueue run synchronously; the
+  // SIGTERMed child exits a tick later).
+  it('cancel → enqueue → killed-child exit → queued item plays (race fix)', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: macAdapter });
+    engine.enqueue('first'); // starts speaking immediately (spawn #1)
+    expect(spawns.length).toBe(1);
+    // Cancel (SIGTERMs spawn#1; its exit is deferred to a later tick) THEN
+    // enqueue a new item synchronously — mirrors preview()'s cancel-then-enqueue.
+    engine.cancel();
+    engine.enqueue('second');
+    // Nothing new spawned yet: `second` is queued but couldn't self-start
+    // because `current` still references the dying spawn#1.
+    expect(spawns.length).toBe(1);
+    expect(engine.queueDepth).toBe(1);
+    // Let the killed child's deferred exit fire → settle() must now drain.
+    await new Promise((r) => setImmediate(r));
+    // A drain was scheduled via setImmediate inside settle(); flush it.
+    await new Promise((r) => setImmediate(r));
+    expect(spawns.length).toBe(2); // `second` finally spoke
+    expect(lastArg(spawns[1])).toBe(buildSayText('second', baseSettings.volume));
+    expect(engine.queueDepth).toBe(0);
+  });
+
+  // Sister-case: a PLAIN cancel with NO follow-up enqueue must stay idle (mute /
+  // quit semantics). Guards against the race fix accidentally resurrecting the
+  // queue when the user genuinely wanted silence.
+  it('cancel with no follow-up enqueue stays idle (no spurious drain)', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: macAdapter });
+    engine.enqueue('one');
+    engine.enqueue('two'); // queued behind `one`
+    expect(spawns.length).toBe(1);
+    engine.cancel(); // clears queue + SIGTERMs `one`
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    // No new spawn — the killed child's exit found an empty queue and stayed put.
+    expect(spawns.length).toBe(1);
+    expect(engine.queueDepth).toBe(0);
+    expect(engine.isSpeaking).toBe(false);
+  });
+
+  // End-to-end via preview(): spam-clicking the voice-preview button does
+  // cancel()+enqueue() each time. The LAST sample must always speak. This is
+  // the user-visible symptom the race fix addresses (dropped preview samples).
+  it('preview() while a preview is mid-play still speaks the new sample (race fix)', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({
+      settings: { voiceURI: 'Daniel', rate: 1.0, volume: 1.0 },
+      spawner,
+      adapter: macAdapter,
+    });
+    engine.preview('Daniel'); // sample #1 starts (cancel is a no-op: nothing playing)
+    expect(spawns.length).toBe(1);
+    // Second preview while #1 is still "speaking": cancel(#1) + enqueue(sample#2).
+    engine.preview('Alice');
+    expect(spawns.length).toBe(1); // sample#2 queued, #1 dying
+    await new Promise((r) => setImmediate(r)); // #1's killed exit
+    await new Promise((r) => setImmediate(r)); // drain scheduled by settle()
+    expect(spawns.length).toBe(2);
+    expect(lastArg(spawns[1])).toBe('[[volm 1]] Hello, my name is Alice');
   });
 
   it('emits native_speak_killed when cancel kills mid-play', async () => {

@@ -22,6 +22,13 @@ import {
   reduceAuthBootOnStatus,
   shouldRenderBootOverlay,
 } from './auth-bootstate';
+// v0.1.82 — pure predicate that says whether a Settings change just toggled TTS
+// INTO silence (mute-on / disable-off). Used by updateSettings to additionally
+// CANCEL in-flight + queued native speech (the decideTtsAction gates only stop
+// FUTURE messages; this kills what's already playing). Lives in the shared
+// decision module next to decideTtsAction so the logic stays in one place + is
+// unit-tested without a React render.
+import { shouldCancelNativeTtsOnSettingsChange } from '../shared/side-effect-decision';
 import { ChannelsPanel } from './ChannelsPanel';
 import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
@@ -627,7 +634,36 @@ export function App(): React.ReactElement {
   };
 
   const updateSettings = async (next: Settings) => {
+    // Snapshot the PREVIOUS tts flags BEFORE setSettings(next) flips state, so
+    // we can detect a "silence NOW" transition (mute-on / disable-off) below.
+    const prevTts = settings.tts;
     setSettings(next);
+    // v0.1.82 — MUTE / DISABLE must STOP speech that's already playing or
+    // queued, not merely suppress future messages.
+    //
+    // Background: the native engine in main holds a FIFO queue + a speaking
+    // subprocess. The decideTtsAction `muted`/`engine-disabled` gates only run
+    // when a NEW chat message arrives, so before this fix hitting 🔇 (or
+    // turning TTS off) left the current utterance playing to the end and every
+    // already-queued message still spoke. Mute didn't actually shut it up.
+    //
+    // Fix: when this settings change is a transition INTO silence
+    // (shouldCancelNativeTtsOnSettingsChange — mute false→true, OR enabled
+    // true→false), fire the existing TTS_NATIVE_CANCEL IPC. NativeTtsEngine
+    // .cancel() SIGTERMs the speaking child AND empties the pending queue, so
+    // playback stops immediately and the backlog is dropped. We do this BEFORE
+    // pushing updateSettings so there's no window where a just-dequeued message
+    // slips through. Un-muting / re-enabling does NOT hit this branch (the
+    // predicate only returns true on the INTO-silence direction), so turning
+    // sound back on never replays the muted backlog — exactly the requirement.
+    if (shouldCancelNativeTtsOnSettingsChange(prevTts, next.tts)) {
+      try {
+        rcpp.ttsNative?.cancel?.();
+      } catch (err) {
+        // Never let a cancel IPC failure block the settings persist below.
+        console.error('[App] ttsNative.cancel on mute/disable failed', err);
+      }
+    }
     // v0.1.81 — no renderer engine to swap. Push the voice/rate/volume slice to
     // the MAIN native engine so the Settings voice-PREVIEW (which the engine
     // speaks using its own current rate/volume) reflects live slider changes

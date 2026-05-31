@@ -540,7 +540,17 @@ const setTtsRate: ToolDefinition = {
 
 const setTtsPitch: ToolDefinition = {
   name: 'set_tts_pitch',
-  description: 'Set TTS pitch in [0, 2]. 1.0 = natural pitch.',
+  // v0.1.82: pitch is INERT for spoken output since v0.1.81. Speech now uses
+  // the native OS voice on every platform (macOS `say` / Windows System.Speech
+  // / Linux spd-say|espeak), and there is no cross-platform native pitch knob,
+  // so the stored value no longer changes how chat is read aloud. The tool +
+  // the `tts.pitch` setting are kept ONLY for backward compatibility (older
+  // saved configs / MCP clients that still call it) — calling it persists the
+  // value harmlessly but has no audible effect.
+  description:
+    'Set TTS pitch in [0, 2] (retained for back-compat). NOTE: pitch has NO ' +
+    'effect on spoken output in v0.1.81+ — speech uses the native OS voice, ' +
+    'which has no cross-platform pitch control. The value is stored but inert.',
   inputSchema: {
     type: 'object',
     properties: { pitch: { type: 'number', minimum: 0, maximum: 2 } },

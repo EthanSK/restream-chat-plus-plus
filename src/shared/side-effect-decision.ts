@@ -213,12 +213,22 @@ export function decideTtsAction(
   }
   // Gate 6b (v0.1.77, Ethan voice 4438): ONE-CLICK MUTE.
   //
-  // The header 🔊/🔇 button flips `settings.tts.muted`. This gate is the
-  // SINGLE source of truth that genuinely silences ALL spoken chat — because
-  // it sits in the shared decider that the MAIN-process TtsDispatcher runs
-  // BEFORE it ever picks a backend, a `muted` skip suppresses BOTH the browser
-  // Web-Speech path AND the native `say` path. So muting works regardless of
+  // The header 🔊/🔇 button flips `settings.tts.muted`. This gate suppresses
+  // the speaking of FUTURE messages: it sits in the shared decider the
+  // MAIN-process TtsDispatcher runs BEFORE it picks a backend, so a `muted`
+  // skip stops the next message from ever being enqueued — regardless of
   // whether the window is visible or hidden.
+  //
+  // IMPORTANT (corrected v0.1.82): this gate alone does NOT stop speech that is
+  // ALREADY playing or ALREADY queued — it only governs the NEXT message. The
+  // "shut up RIGHT NOW" behaviour (kill the in-flight utterance + flush the
+  // queue the instant the user mutes / disables) is handled SEPARATELY in the
+  // renderer: App.tsx's updateSettings calls rcpp.ttsNative.cancel() on the
+  // mute-on / disable-off transition (see shouldCancelNativeTtsOnSettingsChange
+  // below). The two work together — this gate for future messages, the cancel
+  // for the in-flight + queued ones. (The old comment here claimed this gate
+  // "genuinely silences ALL spoken chat", which was wrong: queued/in-flight
+  // speech kept playing through a mute until the cancel-on-toggle was added.)
   //
   // It is deliberately SEPARATE from gate 6 (`engine-disabled`): mute is a
   // temporary "shut up now" switch that leaves the user's whole TTS config
@@ -336,6 +346,54 @@ export function decideNotificationAction(
     };
   }
   return { decision: 'notify', reason: 'notify' };
+}
+
+/**
+ * v0.1.82 — decide whether a Settings change should IMMEDIATELY stop speech
+ * that is already in flight / already queued (NOT just suppress future
+ * messages).
+ *
+ * THE BUG THIS FIXES: through v0.1.81 the `muted` and `enabled` gates in
+ * decideTtsAction only ran when a NEW chat message arrived — they suppressed
+ * FUTURE enqueues. The native engine (src/main/tts-native.ts) holds a FIFO
+ * queue and a currently-speaking subprocess. So when the user hit the header
+ * 🔇 mute (or turned TTS off in Settings) WHILE something was being read
+ * aloud, the in-flight utterance kept playing to completion and every
+ * already-queued message still spoke afterwards. Mute felt broken — it didn't
+ * "shut up now", it only "shut up eventually".
+ *
+ * The fix is to detect the specific transitions where the user just expressed
+ * "be silent NOW" and have App.tsx call `rcpp.ttsNative.cancel()` (which
+ * SIGTERMs the speaking child AND clears the pending queue — see
+ * NativeTtsEngine.cancel). This pure predicate is the single source of truth
+ * for "was this a silence-now transition?", kept here next to decideTtsAction
+ * and unit-tested directly (no React render needed).
+ *
+ * Returns TRUE only on a transition INTO silence:
+ *   - muted:   false/undefined → true   (user just muted)
+ *   - enabled: true            → false  (user just turned TTS off)
+ *
+ * Returns FALSE for the reverse transitions and for no-change, because:
+ *   - Un-muting / re-enabling must NOT replay anything — turning sound back ON
+ *     should never spew the backlog the user muted to escape. We only ever
+ *     cancel; we never re-enqueue. (Explicit requirement.)
+ *   - An unrelated settings edit (voice, rate, volume, a regex, a notification
+ *     toggle) with mute/enabled unchanged must not interrupt the current
+ *     utterance.
+ *
+ * NOTE: this complements (does NOT replace) the decideTtsAction gates — those
+ * still stop the NEXT message from enqueuing. This predicate only governs the
+ * extra "kill what's already playing/queued" action at the moment of toggling.
+ */
+export function shouldCancelNativeTtsOnSettingsChange(
+  prev: Pick<Settings['tts'], 'muted' | 'enabled'>,
+  next: Pick<Settings['tts'], 'muted' | 'enabled'>,
+): boolean {
+  // Transition INTO muted (treat missing/false as "not muted").
+  const mutedOnTransition = prev.muted !== true && next.muted === true;
+  // Transition INTO disabled (TTS feature switched off).
+  const disabledOnTransition = prev.enabled === true && next.enabled !== true;
+  return mutedOnTransition || disabledOnTransition;
 }
 
 /**

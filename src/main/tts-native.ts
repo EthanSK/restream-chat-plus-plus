@@ -36,8 +36,10 @@
 //       voices: same synth, $s.GetInstalledVoices() | %{ $_.VoiceInfo.Name }
 //       volume: $s.Volume 0-100; rate: $s.Rate -10..10; voice: SelectVoice
 //   - Linux: prefer `spd-say` (speech-dispatcher), else `espeak-ng`/`espeak`.
-//       spd-say: `spd-say -w -r <-100..100> -i <-100..100> -t <name?> -- <text>`
-//                (-w waits, -r rate, -i volume/intensity, -t voice "type")
+//       spd-say: `spd-say -w -r <-100..100> -i <-100..100> -y <name?> -- <text>`
+//                (-w waits, -r rate, -i volume/intensity, -y NAMED synthesis
+//                 voice — matches the names `spd-say -L` lists. NOT `-t`, which
+//                 selects a generic voice *type* and ignores synthesis names.)
 //       espeak:  `espeak -a <0-200> -s <wpm> -v <name?> -- <text>`
 //       voices:  `spd-say -L`  /  `espeak --voices`
 //       If NONE of these binaries exist → we log ONCE and no-op (never crash,
@@ -385,7 +387,16 @@ const linuxSpdAdapter: PlatformAdapter = {
     const args: string[] = ['-w']; // -w = wait for speech to complete
     args.push('-r', String(rateToSpdRate(rate)));
     args.push('-i', String(volumeToSpdIntensity(volume)));
-    if (voice) args.push('-t', voice); // -t = voice "type"/name
+    // v0.1.82 fix: select the named SYNTHESIS voice with `-y`
+    // (`--synthesis-voice`), NOT `-t`. `-t` (`--voice-type`) picks a generic
+    // voice *type* (male1/female2/child1/…), but the names we offer the user
+    // come from `parseSpdVoiceList(spd-say -L)`, which lists synthesis-voice
+    // *names* (e.g. `english-us`, `Alan`). Passing such a name via `-t` is
+    // ignored / falls back to the default voice, so the user's chosen voice
+    // never took effect on Linux. `-y <name>` is the matching flag for those
+    // names. (Linux is untested from our dev machines — this is a
+    // correctness-by-inspection fix; the flag now matches the list source.)
+    if (voice) args.push('-y', voice); // -y = named synthesis voice (matches -L)
     args.push('--', text); // `--` then literal text; shell:false → no injection
     return { command: 'spd-say', args };
   },
@@ -670,9 +681,36 @@ export class NativeTtsEngine {
           ...payload,
         });
       }
-      // If a cancel() raced this exit, don't pop the next entry.
+      // If a cancel() raced this exit, clear the flag — but do NOT
+      // unconditionally bail. There's a subtle race (the v0.1.82 fix):
+      //
+      //   cancel()  → cancelling=true, queue cleared, child SIGTERMed
+      //              (its `exit` fires ASYNCHRONOUSLY, on a later tick)
+      //   enqueue() → pushes a NEW entry; its `if (!this.current) drain()`
+      //               guard is FALSE because `this.current` still points at
+      //               the dying (not-yet-exited) child, so it does NOT start
+      //   <killed child's exit fires here> → settle() runs
+      //
+      // The OLD code did `if (cancelling) { cancelling=false; return; }`,
+      // returning BEFORE drain(). `this.current` was just set to null above,
+      // so the freshly-enqueued entry sat idle in the queue until the NEXT
+      // enqueue happened to call drain(). Symptom: spam-clicking the Settings
+      // voice-preview button (preview() does cancel() THEN enqueue()
+      // synchronously) dropped samples — the sample queued during the
+      // cancelling window never spoke. So: after clearing the flag, if an item
+      // got enqueued during the window (queue non-empty) and nothing is
+      // running (current === null, set above), kick the drain. drain() itself
+      // re-guards on `this.current` and shift()s, so this can't double-start or
+      // double-pop; the killed child already settled (settled=true) so it won't
+      // re-enter. We schedule via setImmediate to match the normal exit path's
+      // ordering (drain on a fresh tick, never re-entrantly inside settle()).
       if (this.cancelling) {
         this.cancelling = false;
+        // Only drain if cancel() was followed by an enqueue() that couldn't
+        // self-start. No pending item → genuine cancel, stay idle (mute/quit).
+        if (!this.current && this.queue.length > 0) {
+          setImmediate(() => this.drain());
+        }
         return;
       }
       setImmediate(() => this.drain());
@@ -728,14 +766,25 @@ function spawnCollectStdout(command: string, args: string[]): Promise<string> {
  * Parse `say -v "?"` output (macOS). Lines look like:
  *   Daniel              en_GB    # Hello! My name is Daniel.
  *   Eddy (English (UK)) en_GB    # Hello! My name is Eddy.
+ *   Majed               ar_001   # مرحبا اسمي ماجد.   ← NUMERIC region!
  * Voice names contain spaces/parens, so we anchor on the locale token (the only
  * column with a consistent `xx_YY` shape). Stray header/footer lines are
  * dropped. Exported for unit testing without spawning.
+ *
+ * v0.1.82 fix: the region group now allows DIGITS, not just uppercase letters.
+ * macOS ships voices whose locale uses a UN M49 numeric region instead of an
+ * ISO alpha-2 country — e.g. `ar_001` (Majed, "Arabic – World"), `en_001`,
+ * `es_419` ("Spanish – Latin America"). The old anchor `[A-Z]{2,4}` required
+ * uppercase letters in the region, so every numeric-region voice failed to
+ * match and was silently dropped from the dropdown. `[A-Z0-9]{2,4}` keeps the
+ * alpha forms (`en_GB`, `zh-CN`) AND admits the numeric ones.
  */
 export function parseSayVoiceList(stdout: string): NativeVoice[] {
   const out: NativeVoice[] = [];
   const lines = stdout.split(/\r?\n/);
-  const localeRe = /\s([a-z]{2,3}[_-][A-Z]{2,4})\s/;
+  // Region group is [A-Z0-9]{2,4}: alpha countries (GB, US) + numeric M49
+  // regions (001, 419). Language stays lowercase alpha (en, ar, zh, yue).
+  const localeRe = /\s([a-z]{2,3}[_-][A-Z0-9]{2,4})\s/;
   for (const raw of lines) {
     const line = raw.replace(/\s+$/u, '');
     if (!line.trim()) continue;

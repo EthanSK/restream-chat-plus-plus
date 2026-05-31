@@ -23,6 +23,7 @@ import {
   composeDecisionLogData,
   decideNotificationAction,
   decideTtsAction,
+  shouldCancelNativeTtsOnSettingsChange,
   type SideEffectContext,
 } from '../renderer/side-effect-decision';
 import { DEFAULT_SETTINGS, type ChatMessage, type Settings } from '../shared/types';
@@ -402,5 +403,70 @@ describe('replay — Ethan voice 4364 (2026-05-28) cases', () => {
     const r = decideTtsAction(m, ctx);
     expect(r.decision).toBe('skip');
     expect(r.reason).toBe('content-regex');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.1.82 — shouldCancelNativeTtsOnSettingsChange
+//
+// Governs the EXTRA "stop speech NOW" action App.tsx takes when the user
+// toggles into silence: muting (false→true) or disabling TTS (enabled
+// true→false) must cancel the in-flight utterance + flush the queue. The
+// reverse transitions (un-mute / re-enable) and unrelated edits must NOT —
+// turning sound back on never replays the muted backlog.
+// ---------------------------------------------------------------------------
+describe('shouldCancelNativeTtsOnSettingsChange (mute/disable kills in-flight)', () => {
+  const tts = (m: boolean, e: boolean) => ({ muted: m, enabled: e });
+
+  it('returns true on mute-ON transition (false → true)', () => {
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(false, true), tts(true, true))).toBe(true);
+  });
+
+  it('returns true on disable transition (enabled true → false)', () => {
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(false, true), tts(false, false))).toBe(true);
+  });
+
+  it('returns FALSE on un-mute (true → false) — must not replay backlog', () => {
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(true, true), tts(false, true))).toBe(false);
+  });
+
+  it('returns FALSE on re-enable (enabled false → true) — must not replay backlog', () => {
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(false, false), tts(false, true))).toBe(false);
+  });
+
+  it('returns FALSE when neither muted nor enabled changed (e.g. voice/rate edit)', () => {
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(false, true), tts(false, true))).toBe(false);
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(true, true), tts(true, true))).toBe(false);
+  });
+
+  it('treats missing/undefined `muted` as "not muted" (older persisted config)', () => {
+    // A pre-v0.1.77 saved blob has no `muted` field. Going undefined → true is
+    // still a mute-ON transition; undefined → undefined is not.
+    expect(
+      shouldCancelNativeTtsOnSettingsChange(
+        { muted: undefined as unknown as boolean, enabled: true },
+        { muted: true, enabled: true },
+      ),
+    ).toBe(true);
+    expect(
+      shouldCancelNativeTtsOnSettingsChange(
+        { muted: undefined as unknown as boolean, enabled: true },
+        { muted: undefined as unknown as boolean, enabled: true },
+      ),
+    ).toBe(false);
+  });
+
+  it('mute-ON while ALSO disabling in the same change still cancels (either trigger)', () => {
+    // Defensive: a single settings patch that flips both still returns true.
+    expect(shouldCancelNativeTtsOnSettingsChange(tts(false, true), tts(true, false))).toBe(true);
+  });
+
+  it('uses real DEFAULT_SETTINGS.tts shape as the "before" baseline', () => {
+    // Sanity: muting from the shipped default (enabled may be false, muted
+    // false) is a no-op for the mute trigger UNLESS muted actually flips on.
+    const base = DEFAULT_SETTINGS.tts;
+    expect(
+      shouldCancelNativeTtsOnSettingsChange(base, { ...base, muted: true }),
+    ).toBe(base.muted !== true); // true iff default isn't already muted
   });
 });
