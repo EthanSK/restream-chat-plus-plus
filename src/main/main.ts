@@ -1042,6 +1042,15 @@ app.on('ready', async () => {
   // involvement — so a dead/wedged renderer can never swallow a message.
   const ttsDispatcher = new TtsDispatcher({
     loadSettings,
+    // v0.1.80 (Ethan 2026-05-31) — on macOS, ALWAYS speak via the native `say`
+    // subprocess (foreground + background), NEVER the renderer Web-Speech
+    // engine. Reason: Chromium throttles/suspends the renderer's speechSynthesis
+    // whenever the window isn't foreground (and can silently latch even when it
+    // is), so the old browser path produced NO AUDIO for Ethan. The OS `say`
+    // process is immune to that and honours volume ([[volm]]) / rate (-r) /
+    // voice (-v). On win/linux this is false so the dispatcher keeps the old
+    // visibility-based browser/native selection (those builds have no `say`).
+    isMacNative: () => process.platform === 'darwin',
     // GENUINELY hidden = Web Speech is suspended (minimised / on another macOS
     // Space / app hidden via Cmd-H). A merely-COVERED window is NOT hidden:
     // the app disables Chromium occlusion (--disable-features=

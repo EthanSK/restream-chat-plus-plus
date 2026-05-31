@@ -121,6 +121,39 @@ export interface TtsDispatchDeps {
   /** Current persisted settings. Called once per message + on settings change. */
   loadSettings(): Settings;
   /**
+   * v0.1.80 (Ethan 2026-05-31: "i havent been hearing the voice stuff yet …
+   * should it always use system voice, can volume n stuff work with that") —
+   * TRUE on macOS, FALSE on every other platform. Wired to
+   * `process.platform === 'darwin'` in main.ts.
+   *
+   * WHY THIS GATE EXISTS / THE WHOLE POINT OF v0.1.80:
+   * --------------------------------------------------
+   * Through v0.1.79 the dispatcher used the BROWSER (renderer Web-Speech)
+   * voice whenever the window was visible-or-merely-covered, and only fell
+   * back to native `say` when the window was GENUINELY hidden. That was
+   * Ethan's stated preference at the time (v0.1.75) — but it relies on
+   * Chromium's `speechSynthesis` actually producing audio in the renderer,
+   * which it frequently does NOT: Chromium throttles/suspends the renderer's
+   * speech engine the moment the window loses foreground focus (covered by
+   * another window, on another Space, app in the background, screen-locked,
+   * etc.), and on Electron 42 it can silently latch even in the foreground.
+   * Net result for Ethan: he heard NOTHING — `speak()` fired but no sound
+   * came out, because the renderer engine was suspended/dormant.
+   *
+   * The fix Ethan chose (and the decision is final): on macOS, ALWAYS speak
+   * via the native main-process `say` subprocess — never the renderer. `say`
+   * is an OS-level process that is immune to Chromium renderer throttling, so
+   * it plays foreground AND background, uses the same macOS system voices, and
+   * (since v0.1.76) honours volume via the inline `[[volm]]` command plus rate
+   * via `-r` and voice via `-v`. So we drop background-detection ENTIRELY on
+   * macOS — there is no longer any "is the window hidden?" branch to get wrong.
+   *
+   * NON-macOS: this returns FALSE, so the dispatcher keeps the OLD
+   * visibility-based behaviour (browser voice — the ONLY speech engine a
+   * win/linux build has; there is no `say` binary there). See `dispatchSpeak`.
+   */
+  isMacNative(): boolean;
+  /**
    * True when the app window is GENUINELY hidden (minimised / on another
    * macOS Space / app hidden via Cmd-H) — i.e. Chromium has suspended Web
    * Speech and the browser voice cannot run. False when visible OR merely
@@ -128,6 +161,11 @@ export interface TtsDispatchDeps {
    * Web Speech). When true the dispatcher MUST use the native `say` path so
    * the message is never silently lost. Implemented in main.ts off the
    * BrowserWindow state (isMinimized / isVisible) — see wireTtsDispatch.
+   *
+   * v0.1.80 NOTE: on macOS this predicate is now UNUSED for backend choice
+   * (macOS always goes native via `isMacNative()`), but it's kept wired so
+   * the non-macOS path (where `isMacNative()` is false) still works exactly
+   * as before — browser when visible, native when hidden.
    */
   isWindowGenuinelyHidden(): boolean;
   /**
@@ -378,17 +416,58 @@ export class TtsDispatcher {
   }
 
   /**
-   * Pick the speak backend by window visibility and dispatch. Returns the
-   * backend chosen. This is THE never-miss decision: genuinely-hidden →
-   * native (renderer-independent); otherwise → browser (all settings honoured).
+   * Pick the speak backend and dispatch. Returns the backend chosen.
+   *
+   * v0.1.80 BACKEND-SELECTION RULES (Ethan 2026-05-31):
+   * ---------------------------------------------------
+   *   macOS (isMacNative() === true)  → ALWAYS native `say`. No
+   *     background-detection: foreground and background both go through the
+   *     OS-level subprocess, which is immune to Chromium renderer throttling
+   *     (the thing that made Ethan hear nothing on the old browser path). All
+   *     of volume (`[[volm]]`), rate (`-r`) and voice (`-v`) are honoured; the
+   *     ONLY Web-Speech control native can't do is pitch (`say` has no pitch
+   *     knob), an intentional, accepted trade for "actually plays audio".
+   *
+   *   non-macOS (isMacNative() === false) → the PRE-v0.1.80 behaviour, unchanged:
+   *     genuinely-hidden → native (never-miss), otherwise → browser
+   *     (full-fidelity Web Speech). win/linux have no `say` binary, so in
+   *     practice the native branch there is a near-no-op; we keep the exact
+   *     old code path so those builds behave identically to before.
+   *
+   * This split is the entire v0.1.80 change: macOS stops using the renderer
+   * Web-Speech engine for chat playback entirely. The renderer engine + its
+   * `speakBrowserCommand`/`trySpeakViaNativeWhileHidden` layers remain in the
+   * codebase for non-macOS and for the in-Settings voice-preview button, but
+   * incoming chat on macOS never reaches them now — so there is no
+   * double-speak risk (main fires exactly one backend per message).
    */
   private dispatchSpeak(m: ChatMessage, settings: Settings): TtsBackendChoice {
     const text = composeUtteranceForDispatch(m, settings.tts.readSenderName);
+
+    // --- macOS: ALWAYS native `say` (foreground + background). ---
+    // This is the v0.1.80 fix for "I hear nothing": the renderer Web-Speech
+    // engine gets throttled/suspended by Chromium when the window isn't
+    // foreground (and can silently latch even when it is), so it was producing
+    // no audio. The OS `say` subprocess always plays. Volume via [[volm]],
+    // rate via -r, voice via -v — see src/main/tts-native.ts.
+    if (this.deps.isMacNative()) {
+      this.deps.speakNative(text, {
+        voice: settings.tts.voiceURI,
+        rate: settings.tts.rate,
+        volume: settings.tts.volume,
+        messageId: m.id,
+      });
+      return 'native';
+    }
+
+    // --- non-macOS: original visibility-based selection (unchanged). ---
     const hidden = this.deps.isWindowGenuinelyHidden();
     if (hidden) {
       // Genuinely hidden — Web Speech is suspended. Native `say` is immune to
       // renderer visibility, so this is the never-miss path. Volume flows via
-      // the inline `[[volm]]` command in the native engine.
+      // the inline `[[volm]]` command in the native engine. (On win/linux
+      // there is no `say` binary; the native engine's spawn fails and is
+      // swallowed — a known limitation of those platforms, not a regression.)
       this.deps.speakNative(text, {
         voice: settings.tts.voiceURI,
         rate: settings.tts.rate,

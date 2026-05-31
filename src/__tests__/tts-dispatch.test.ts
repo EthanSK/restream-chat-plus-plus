@@ -37,9 +37,15 @@ function msg(overrides: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 // A capturing test harness around TtsDispatcher.
+//
+// `macNative` (v0.1.80) maps to deps.isMacNative(). It DEFAULTS to false so the
+// pre-existing visibility-based suite below exercises the NON-macOS code path
+// unchanged (browser when visible, native when hidden). The dedicated v0.1.80
+// suite passes `macNative: true` to assert the always-native macOS behaviour.
 function makeHarness(opts: {
   settings: Settings;
   hidden: boolean;
+  macNative?: boolean;
   now?: () => number;
 }) {
   const nativeCalls: Array<{ text: string; opts: Record<string, unknown> }> = [];
@@ -50,6 +56,7 @@ function makeHarness(opts: {
 
   const deps: TtsDispatchDeps = {
     loadSettings: () => opts.settings,
+    isMacNative: () => opts.macNative ?? false,
     isWindowGenuinelyHidden: () => hidden,
     speakNative: (text, o) => nativeCalls.push({ text, opts: o as Record<string, unknown> }),
     speakBrowser: (payload) => browserCalls.push(payload),
@@ -128,6 +135,110 @@ describe('TtsDispatcher backend choice (v0.1.76)', () => {
     });
     h.dispatcher.handleMessage(msg({ id: 'm', username: 'bob', text: 'yo' }));
     expect(h.browserCalls[0].text).toBe('bob says yo');
+  });
+});
+
+// ===========================================================================
+// v0.1.80 (Ethan 2026-05-31: "i havent been hearing the voice stuff yet …
+// should it always use system voice, can volume n stuff work with that") —
+// on macOS the dispatcher ALWAYS speaks via the native `say` subprocess,
+// regardless of window visibility. The renderer Web-Speech engine is bypassed
+// for chat playback entirely (it was being throttled/suspended by Chromium
+// when the window wasn't foreground → Ethan heard nothing). These tests pin
+// the new selection rule + prove volume/voice/rate still flow to native.
+// ===========================================================================
+describe('TtsDispatcher macOS always-native backend (v0.1.80)', () => {
+  it('macOS + window VISIBLE → still NATIVE say (NOT browser) — the core fix', () => {
+    // Pre-v0.1.80 a visible window used the browser voice; v0.1.80 forces
+    // native even when visible because the browser voice was silently dropping.
+    const h = makeHarness({
+      settings: settingsWith({ voiceURI: 'Daniel', rate: 1.3, pitch: 0.7, volume: 0.6 }),
+      hidden: false,
+      macNative: true,
+    });
+    const backend = h.dispatcher.handleMessage(msg({ id: 'mac1', text: 'foreground msg' }));
+    expect(backend).toBe('native');
+    expect(h.browserCalls).toHaveLength(0); // renderer is NEVER used on macOS now
+    expect(h.nativeCalls).toHaveLength(1);
+    const c = h.nativeCalls[0];
+    expect(c.text).toBe('foreground msg');
+    // Volume + voice + rate all flow to native — answers Ethan's "can volume n
+    // stuff work with that". (pitch is intentionally NOT passed; `say` has no
+    // pitch knob — the one accepted trade-off.)
+    expect(c.opts.voice).toBe('Daniel');
+    expect(c.opts.rate).toBe(1.3);
+    expect(c.opts.volume).toBe(0.6);
+    expect(c.opts.pitch).toBeUndefined();
+    expect(c.opts.messageId).toBe('mac1');
+  });
+
+  it('macOS + window HIDDEN → NATIVE say (same as visible — visibility is irrelevant on macOS)', () => {
+    const h = makeHarness({
+      settings: settingsWith({ volume: 0.2 }),
+      hidden: true,
+      macNative: true,
+    });
+    expect(h.dispatcher.handleMessage(msg({ id: 'mac2' }))).toBe('native');
+    expect(h.browserCalls).toHaveLength(0);
+    expect(h.nativeCalls).toHaveLength(1);
+    expect(h.nativeCalls[0].opts.volume).toBe(0.2);
+  });
+
+  it('macOS: backend stays NATIVE across a visibility flip (no browser path ever)', () => {
+    const h = makeHarness({ settings: settingsWith(), hidden: false, macNative: true });
+    expect(h.dispatcher.handleMessage(msg({ id: 'a' }))).toBe('native');
+    h.setHidden(true);
+    expect(h.dispatcher.handleMessage(msg({ id: 'b' }))).toBe('native');
+    h.setHidden(false);
+    expect(h.dispatcher.handleMessage(msg({ id: 'c' }))).toBe('native');
+    expect(h.browserCalls).toHaveLength(0);
+    expect(h.nativeCalls).toHaveLength(3);
+  });
+
+  it('macOS: undefined voiceURI passes through undefined (native falls back to system default voice)', () => {
+    // voiceURI defaults to undefined; native engine omits the `-v` flag so
+    // macOS uses the system default voice. Proves the graceful voice fallback.
+    const h = makeHarness({
+      settings: settingsWith({ voiceURI: undefined }),
+      hidden: false,
+      macNative: true,
+    });
+    h.dispatcher.handleMessage(msg({ text: 'no voice set' }));
+    expect(h.nativeCalls[0].opts.voice).toBeUndefined();
+  });
+
+  it('macOS: mute still silences the native path (decision gate runs before backend choice)', () => {
+    const h = makeHarness({
+      settings: settingsWith({ muted: true }),
+      hidden: false,
+      macNative: true,
+    });
+    expect(h.dispatcher.handleMessage(msg())).toBe('skip');
+    expect(h.nativeCalls).toHaveLength(0);
+    expect(h.browserCalls).toHaveLength(0);
+  });
+
+  it('macOS: TTS disabled still skips (enabled kill-switch respected on native path)', () => {
+    const h = makeHarness({
+      settings: { ...DEFAULT_SETTINGS, tts: { ...DEFAULT_SETTINGS.tts, enabled: false } },
+      hidden: false,
+      macNative: true,
+    });
+    expect(h.dispatcher.handleMessage(msg())).toBe('skip');
+    expect(h.nativeCalls).toHaveLength(0);
+  });
+
+  it('NON-macOS regression: visible window still uses the BROWSER voice (unchanged)', () => {
+    // The win/linux path must behave EXACTLY as before v0.1.80 — browser when
+    // visible. This guards against accidentally forcing native everywhere.
+    const h = makeHarness({
+      settings: settingsWith({ volume: 0.5 }),
+      hidden: false,
+      macNative: false,
+    });
+    expect(h.dispatcher.handleMessage(msg({ text: 'win msg' }))).toBe('browser');
+    expect(h.browserCalls).toHaveLength(1);
+    expect(h.nativeCalls).toHaveLength(0);
   });
 });
 
@@ -300,6 +411,7 @@ describe('TtsDispatcher robustness (v0.1.76)', () => {
     const dispatcher = new TtsDispatcher(
       {
         loadSettings: () => settingsWith(),
+        isMacNative: () => true, // macOS path → speakNative is the one that throws
         isWindowGenuinelyHidden: () => true,
         speakNative: () => {
           throw new Error('boom');
