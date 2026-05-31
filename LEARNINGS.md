@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-31T15:47:33Z
+**Trigger:** Ethan: havent been hearing voice, should it always use system voice instead of electron, can volume n stuff work with that
+**Symptom:** no TTS audio heard at all; spoken-chat feature silent on macOS
+**Root cause:** main-process TtsDispatcher used the renderer Web-Speech (Chromium speechSynthesis) voice whenever the window was visible-or-merely-covered, only using native say when genuinely hidden. Chromium throttles/suspends the renderer speech engine whenever the window is not foreground (covered, other Space, backgrounded, locked) and can silently latch even in foreground on Electron 42, so speak() fired but produced no sound.
+**Fix:** v0.1.80: added isMacNative() dep to TtsDispatcher; dispatchSpeak() now ALWAYS routes to the native macOS say subprocess on darwin (foreground AND background), dropping background-detection on macOS entirely. say is immune to renderer throttling + honours volume (inline [[volm]]), rate (-r), voice (-v); only pitch is unsupported. Non-macOS keeps the prior visibility-based browser/native selection unchanged. main.ts wires isMacNative: () => process.platform === 'darwin'. Renderer Web-Speech engine stays for non-mac + the Settings voice-preview button; incoming chat on macOS never reaches it so no double-speak.
+**Commit:** 72e4331
+**Guard:** src/__tests__/tts-dispatch.test.ts v0.1.80 suite: 7 cases pinning macOS-always-native (visible+hidden+flip), volume/voice/rate flow-through to native, undefined-voiceURI→system-default-voice fallback, mute+disabled still skip on native path, and a non-macOS regression guard (visible still uses browser). 630 tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-05-31T14:48:15Z
 **Trigger:** Ethan: did u remove it from speaking out my own messages? should be an option, maybe regex configurable
 **Symptom:** own messages not spoken by TTS / wanted it configurable
