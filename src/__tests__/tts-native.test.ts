@@ -529,6 +529,42 @@ describe('NativeTtsEngine — queue / cancel / lifecycle', () => {
     expect(logs.find((l) => l.event === 'native_speak_killed')?.data?.reason).toBe('cancel');
   });
 
+  // v0.1.84 — Linux (spd-say) daemon stop. SIGTERM-ing the spd-say CLIENT does
+  // NOT stop speech the speech-dispatcher DAEMON has already started, so on the
+  // spd-say adapter cancel() must ALSO spawn `spd-say --cancel` to tell the
+  // daemon to stop. (Untested from mac — correctness-by-inspection; this test
+  // pins the wiring: the extra cancel spawn fires, with the right argv, ONLY on
+  // the linux-spd adapter, and uses shell:false-style args array.)
+  it('cancel() also spawns `spd-say --cancel` on the linux-spd adapter (daemon stop)', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    // Force the spd-say adapter via detectPlatformAdapter('linux', whichSync→true).
+    const spdAdapter = detectPlatformAdapter('linux', () => true) as PlatformAdapter;
+    expect(spdAdapter.id).toBe('linux-spd');
+    const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: spdAdapter });
+    engine.enqueue('hello'); // spawn #1 = the speaking client
+    expect(spawns.length).toBe(1);
+    engine.cancel();
+    // spawn #2 = the daemon-cancel call (`spd-say --cancel`).
+    expect(spawns.length).toBe(2);
+    expect(spawns[1].spec.command).toBe('spd-say');
+    expect(spawns[1].spec.args).toEqual(['--cancel']);
+    await new Promise((r) => setImmediate(r));
+  });
+
+  // Sister-guard: the daemon-cancel spawn must NOT fire on non-Linux adapters
+  // (macOS `say` / Windows SAPI have no detached daemon — only the SIGTERM path
+  // applies). Without this guard the extra spawn could leak onto every platform.
+  it('cancel() does NOT spawn spd-say --cancel on the macOS adapter', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: macAdapter });
+    engine.enqueue('hello');
+    expect(spawns.length).toBe(1);
+    engine.cancel();
+    // Still just the one (killed) speaking child — no daemon-cancel spawn.
+    expect(spawns.length).toBe(1);
+    await new Promise((r) => setImmediate(r));
+  });
+
   it('drops empty / whitespace-only text without spawning', () => {
     const { spawner, spawns } = makeFakeSpawner();
     const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: macAdapter });

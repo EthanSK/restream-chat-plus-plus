@@ -556,6 +556,35 @@ export class NativeTtsEngine {
       }
       this.log('native_speak_killed', { pid, reason: 'cancel' });
     }
+    // v0.1.84 — Linux (spd-say) daemon stop.
+    //
+    // On the spd-say adapter the child we SIGTERM above is only the *client*
+    // (`spd-say -w …`). It has already handed the utterance to the
+    // speech-dispatcher DAEMON, which keeps synthesising/playing even after the
+    // client dies — so SIGTERM alone does NOT stop audio that's already
+    // started. `spd-say --cancel` tells the daemon to stop the current message
+    // (and clear its queue), which is what actually silences playback.
+    //
+    // We fire it as a fresh short-lived child (args array, shell:false → no
+    // injection, consistent with every other spawn in this file). Fire-and-
+    // forget: errors are swallowed because a failed cancel must never break the
+    // queue-clear / kill-child path above.
+    //
+    // NOTE: untested from our dev machines (no Linux user in the loop) — this is
+    // a correctness-by-inspection fix mirroring the spd-say documented behaviour.
+    if (this.adapter?.id === 'linux-spd') {
+      try {
+        const canceller = this.spawner({ command: 'spd-say', args: ['--cancel'] });
+        // Reap quietly so a spawn-level error (e.g. spd-say vanished) doesn't
+        // surface as an unhandled 'error' event and crash main.
+        canceller.on('error', () => undefined);
+      } catch (err) {
+        this.log('native_speak_error', {
+          stage: 'cancel-daemon',
+          error: String((err as Error)?.message ?? err),
+        });
+      }
+    }
     if (cleared > 0) this.log('native_queue_size', { queue_size: 0, cleared });
   }
 

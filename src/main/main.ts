@@ -63,6 +63,12 @@ import {
 // in the renderer, so the never-miss guarantee + native fallback don't depend
 // on the renderer being alive. See src/main/tts-dispatch.ts.
 import { TtsDispatcher } from './tts-dispatch';
+// v0.1.84 — shared predicate that decides whether a settings write is a
+// transition INTO silence (mute false→true OR enabled true→false). Used to be
+// applied only in the renderer (App.tsx); moved into the MAIN saveSettings path
+// so the cancel is ATOMIC with the persist and covers EVERY entry point
+// (renderer toggle, header mute button, MCP set_tts_enabled). See saveSettings.
+import { shouldCancelNativeTtsOnSettingsChange } from '../shared/side-effect-decision';
 import {
   DEFAULT_SETTINGS,
   IPC,
@@ -1581,7 +1587,40 @@ app.on('ready', async () => {
   // a setting change via SETTINGS_SET (UI) or the MCP path picks up
   // immediately for the next enqueue, with no restart needed.
   function saveSettings(settings: Settings): Settings {
+    // v0.1.84 — cancel in-flight/queued native TTS on a "silence" transition,
+    // ATOMICALLY with the persist, from the MAIN process.
+    //
+    // Why this moved here from the renderer (App.tsx updateSettings):
+    //   1. Renderer race — the renderer used to fire `ttsNative.cancel()` and
+    //      THEN `setSettings(next)` as TWO separate IPCs. A chat message arriving
+    //      in main BETWEEN them read the still-unmuted settings, enqueued, and
+    //      the v0.1.82 drain spoke it AFTER the user hit mute. Doing the cancel
+    //      inside the same synchronous saveSettings call that flips the flags
+    //      closes that window — there is no longer a moment where the persisted
+    //      settings say "muted" but the queue hasn't been cleared.
+    //   2. MCP bypass — `set_tts_enabled(false)` (and any other MCP settings
+    //      write) goes through saveSettings via the live bridge, which only ever
+    //      called `updateSettings()` (future-utterance config) and NEVER
+    //      cancelled. So disabling TTS over MCP left the current utterance + the
+    //      whole backlog playing. Centralising the cancel here covers it.
+    //
+    // We snapshot the PREVIOUS persisted tts flags BEFORE overwriting the store,
+    // then use the SHARED `shouldCancelNativeTtsOnSettingsChange` predicate (the
+    // single source of truth, also imported by the renderer) to decide. The
+    // predicate only returns true on the INTO-silence direction, so un-muting /
+    // re-enabling never cancels (and never replays the muted backlog).
+    const prevTts = (store.get('settings') as Settings | undefined)?.tts;
     store.set('settings', settings);
+    if (prevTts && shouldCancelNativeTtsOnSettingsChange(prevTts, settings.tts)) {
+      try {
+        // cancel() SIGTERMs the speaking child + empties the pending FIFO queue,
+        // so playback stops immediately and the backlog is dropped.
+        nativeTts.cancel();
+      } catch (err) {
+        // Never let a cancel failure block the settings persist / update below.
+        console.warn('[main] nativeTts.cancel on silence transition failed', err);
+      }
+    }
     try {
       nativeTts.updateSettings(ttsToNativeSettings(settings.tts));
     } catch (err) {
@@ -2377,5 +2416,18 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+  // v0.1.84 — recreate the MAIN window on Dock re-activation whenever it's gone,
+  // keyed off `mainWindow === null` rather than the old
+  // `BrowserWindow.getAllWindows().length === 0`.
+  //
+  // Why the old check was wrong: since v0.1.83 the main window's `closed`
+  // listener sets `mainWindow = null`. If the user closes the main window while
+  // an OAuth helper window (see oauth.ts) is still open, `mainWindow` is null
+  // but `getAllWindows().length` is still > 0 (the OAuth window counts). The old
+  // length-based guard then short-circuits and Dock re-activation does NOTHING —
+  // the user is left with no main window and no way to get it back without
+  // quitting. Keying off `mainWindow` directly fixes that edge while preserving
+  // the existing behaviour when a main window already exists (no double-spawn).
+  // `createMainWindow()` reassigns `mainWindow`, so the next activate is a no-op.
+  if (!mainWindow) createMainWindow();
 });
