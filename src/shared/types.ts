@@ -197,6 +197,43 @@ export interface Settings {
      * `enabled`, not this flag).
      */
     muted: boolean;
+    /**
+     * v0.1.79 (Ethan 2026-05-31: "did u remove it from speaking out my own
+     * messages? that should be an option") — SPEAK MY OWN MESSAGES toggle.
+     *
+     * Controls whether the user's OWN outgoing chat (Restream's
+     * `reply_created` echo, normalised with `self: true` in
+     * src/main/normalize.ts) is read aloud by TTS.
+     *
+     *   - true  (DEFAULT) → own messages ARE spoken.
+     *   - false           → own messages are skipped (the v0.1.72 behaviour).
+     *
+     * WHY this exists / history of the flip-flop:
+     *   - v0.1.10 skipped self messages for TTS+notifications.
+     *   - v0.1.26 reverted that — read ALL messages including own.
+     *   - v0.1.72 (voice 4352, 2026-05-28) re-added a HARD self-skip with no
+     *     way to turn it back on (the docstring of that change explicitly
+     *     said "no setting re-enables self-speak today (YAGNI)").
+     *   - v0.1.79 makes it a real user-configurable toggle and defaults it
+     *     back to ON, because Ethan explicitly asked for his own messages to
+     *     be spoken again and to have it be an option.
+     *
+     * THE GATE (source of truth = MAIN process):
+     *   The authoritative self-skip lives in `decideTtsAction`
+     *   (src/shared/side-effect-decision.ts, gate 2). That gate now skips a
+     *   `self` message ONLY when `settings.tts.speakSelf === false`. When
+     *   true, the self message falls through to the normal regex/mute/etc.
+     *   gates like any other message. The NOTIFICATION path is intentionally
+     *   left self-skipping unconditionally — this toggle is about the app
+     *   SPEAKING your own messages, not about getting OS notifications for
+     *   your own messages (which would be pure noise from your own action).
+     *
+     * Persisted via electron-store. The shallow per-section merge in
+     * main.ts `loadSettings` (`tts: { ...DEFAULT_SETTINGS.tts, ...stored.tts }`)
+     * injects this default for existing users' blobs automatically, so no
+     * one-time migration is needed.
+     */
+    speakSelf: boolean;
   };
   notifications: {
     enabled: boolean;
@@ -304,6 +341,10 @@ export const DEFAULT_SETTINGS: Settings = {
     // v0.1.77 — not muted out of the box. The header 🔊/🔇 button flips this;
     // the main-process dispatcher gates speech on `enabled && !muted`.
     muted: false,
+    // v0.1.79 — speak the user's OWN messages by default. Ethan asked for his
+    // own outgoing chat to be read aloud again (it was hard-skipped in v0.1.72)
+    // and to make it a toggle. Set false to restore the v0.1.72 self-skip.
+    speakSelf: true,
   },
   notifications: {
     enabled: false,

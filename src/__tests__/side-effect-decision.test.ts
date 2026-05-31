@@ -93,10 +93,38 @@ describe('decideTtsAction — gate ordering', () => {
     expect(r).toEqual({ decision: 'skip', reason: 'pending-send' });
   });
 
-  it('2. self wins over same-id-reprocess', () => {
+  it('2. self wins over same-id-reprocess (when speakSelf is OFF)', () => {
+    // v0.1.79: the self-skip is now gated by settings.tts.speakSelf. With it
+    // OFF, a self message still skips with reason 'self' and that gate still
+    // sits ABOVE same-id-reprocess in the ladder — pin that ordering.
     const m = makeMessage({ self: true, id: 'x' });
-    const r = decideTtsAction(m, makeCtx({ lastProcessedId: 'x' }));
+    const ctx = makeCtx({ lastProcessedId: 'x' });
+    ctx.settings.tts.speakSelf = false;
+    const r = decideTtsAction(m, ctx);
     expect(r.reason).toBe('self');
+  });
+
+  it('2b. self message READS when speakSelf is ON (v0.1.79 default)', () => {
+    // The whole point of the v0.1.79 toggle: with speakSelf=true (the default
+    // shipped in DEFAULT_SETTINGS), the user's OWN messages are spoken — the
+    // self gate does NOT fire and the message falls through to READ.
+    const m = makeMessage({ self: true, id: 'self-1' });
+    const ctx = makeCtx(); // speakSelf defaults to true via DEFAULT_SETTINGS
+    expect(ctx.settings.tts.speakSelf).toBe(true);
+    const r = decideTtsAction(m, ctx);
+    expect(r.decision).toBe('read');
+    expect(r.reason).toBe('read');
+  });
+
+  it('2c. self message still respects the TTS content regex skip-filter', () => {
+    // Even with speakSelf ON, a self message whose body matches a TTS ignore
+    // regex is skipped — this is exactly Ethan's "speak my own messages but
+    // skip my !commands via regex" use case (gate 8 still applies to self).
+    const m = makeMessage({ self: true, text: '!sr never gonna give you up' });
+    const ctx = makeCtx({ ttsContentPatterns: compileIgnorePatterns(['^!']) });
+    const r = decideTtsAction(m, ctx);
+    expect(r.decision).toBe('skip');
+    expect(r.reason).toBe('content-regex');
   });
 
   it('3. same-id wins over platform filter', () => {

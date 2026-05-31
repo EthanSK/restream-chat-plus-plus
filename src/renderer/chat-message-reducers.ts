@@ -132,10 +132,19 @@ export function applyFailedSendStatus(
  *      notifications, full stop — that's noise from the user's own
  *      action. This is NOT user-configurable; it's a hard default. The
  *      previous v0.1.26 product direction ("read ALL messages including
- *      self") was reverted here per Ethan voice 4352. Users who DO want
- *      self-speak can drop a regex against their own username into the
- *      v0.1.72 `ignoreUsernameRegex` list to PREVENT it (the inverse) —
- *      but no setting re-enables self-speak today (YAGNI).
+ *      self") was reverted here per Ethan voice 4352.
+ *
+ * IMPORTANT — this function is NO LONGER on the live TTS path. v0.1.76 moved
+ * the entire chat→speak decision into the MAIN process (`decideTtsAction` in
+ * src/shared/side-effect-decision.ts, run by src/main/tts-dispatch.ts). The
+ * App.tsx side-effect useEffect that used to call this was deleted. This
+ * reducer is retained only for the pure unit tests that pin the historical
+ * v0.1.60/v0.1.72 contract (src/__tests__/self-ignore.test.ts,
+ * chat-message-reducers.test.ts). The AUTHORITATIVE, user-configurable
+ * self-speak gate now lives in `decideTtsAction` gate 2 and keys off
+ * `settings.tts.speakSelf` (v0.1.79 — default ON; set false to skip own
+ * messages). Do NOT treat the hard `self === true` skip below as the live
+ * behaviour — it isn't.
  *
  * Returns `true` when the side effect should fire. `lastProcessedId`
  * is the id we most-recently spoke (or `undefined` on first call).

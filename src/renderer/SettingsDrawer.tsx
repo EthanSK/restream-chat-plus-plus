@@ -274,6 +274,32 @@ export function SettingsDrawer({
                 onChange={(e) => patchTts({ muted: e.target.checked })}
               />
             </div>
+            {/*
+             * v0.1.79 (Ethan 2026-05-31: "did u remove it from speaking out my
+             * own messages? that should be an option") — Speak my own messages.
+             *
+             * Writes settings.tts.speakSelf. When ON (default), the user's own
+             * outgoing chat (self: true echoes) is read aloud like any other
+             * message. When OFF, own messages are skipped — the v0.1.72
+             * behaviour. The authoritative gate is decideTtsAction gate 2 in
+             * src/shared/side-effect-decision.ts (runs in the main process).
+             * `?? true` defends against an older persisted blob that predates
+             * this field, so the control renders checked rather than blank
+             * before loadSettings' shallow-merge injects the default.
+             */}
+            <div className="row">
+              <label
+                title="When on, the app reads YOUR own sent messages aloud too. Turn off to skip your own messages. To speak your own messages but skip specific ones (e.g. your !commands), leave this on and add a regex to the TTS filters below."
+              >
+                Speak my own messages
+              </label>
+              <input
+                className="switch"
+                type="checkbox"
+                checked={settings.tts.speakSelf ?? true}
+                onChange={(e) => patchTts({ speakSelf: e.target.checked })}
+              />
+            </div>
             <div className="row">
               <label
                 title={

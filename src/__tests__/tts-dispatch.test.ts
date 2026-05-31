@@ -220,10 +220,22 @@ describe('TtsDispatcher decision gates still suppress (v0.1.76)', () => {
     expect(h.notifyCalls).toHaveLength(1); // notification still fires
   });
 
-  it('self message → skip (own outgoing echo)', () => {
-    const h = makeHarness({ settings: settingsWith(), hidden: false });
+  it('self message → skip when speakSelf is OFF (own outgoing echo)', () => {
+    // v0.1.79: own messages are skipped only when the user has turned the
+    // "Speak my own messages" toggle OFF (settings.tts.speakSelf === false).
+    const h = makeHarness({ settings: settingsWith({ speakSelf: false }), hidden: false });
     expect(h.dispatcher.handleMessage(msg({ self: true }))).toBe('skip');
     expect(h.browserCalls).toHaveLength(0);
+  });
+
+  it('self message → SPEAKS when speakSelf is ON (v0.1.79 default)', () => {
+    // The default flipped in v0.1.79: with speakSelf=true the dispatcher reads
+    // the user's own messages aloud, dispatching to the browser backend when
+    // the window is visible. This is the behaviour Ethan asked to restore.
+    const h = makeHarness({ settings: settingsWith(), hidden: false });
+    expect(h.dispatcher.handleMessage(msg({ self: true, text: 'my own msg' }))).toBe('browser');
+    expect(h.browserCalls).toHaveLength(1);
+    expect(h.browserCalls[0].text).toBe('my own msg');
   });
 
   it('platform disabled → skip', () => {

@@ -134,9 +134,11 @@ function findFirstMatch(
  * same order App.tsx historically did. Returns the FIRST gate that
  * resolved the outcome — caller logs the decision + reason.
  *
- * Gate order (matches v0.1.72 App.tsx behaviour exactly):
+ * Gate order:
  *   1. pendingSend !== undefined → SKIP 'pending-send'
- *   2. self === true             → SKIP 'self' (v0.1.72 hard default)
+ *   2. self === true AND settings.tts.speakSelf === false → SKIP 'self'
+ *      (v0.1.79 — was an unconditional hard skip in v0.1.72; now gated by
+ *       the "Speak my own messages" toggle, default ON)
  *   3. id === lastProcessedId    → SKIP 'same-id-reprocess'
  *   4. !settings.filter.platforms[platform] → SKIP 'platform-disabled'
  *   5. hiddenUsersSet.has(username.toLowerCase()) → SKIP 'hidden-user'
@@ -158,10 +160,29 @@ export function decideTtsAction(
   if (message.pendingSend !== undefined) {
     return { decision: 'skip', reason: 'pending-send' };
   }
-  // Gate 2: self-ignore. v0.1.72 hard default — the user's own outgoing
-  // reply (Restream's reply_created echo, normalised with `self: true`)
-  // never wakes side effects.
-  if (message.self === true) {
+  // Gate 2: self-ignore.
+  //
+  // The user's own outgoing reply is Restream's `reply_created` echo,
+  // normalised with `self: true` in src/main/normalize.ts.
+  //
+  // v0.1.72 (voice 4352) HARD-skipped these — own messages never spoke,
+  // with no way to turn it back on. v0.1.79 (Ethan 2026-05-31: "did u remove
+  // it from speaking out my own messages? that should be an option") makes
+  // it user-configurable via `settings.tts.speakSelf` (defaults to true):
+  //   - speakSelf === false → SKIP here (the v0.1.72 behaviour, opt-in now).
+  //   - speakSelf === true  → fall through; the self message is treated like
+  //     any other message and continues down the gate ladder (platform
+  //     filter, hidden-user, engine-disabled, mute, regex skip-filters).
+  //
+  // So a user who wants their own messages spoken EXCEPT for certain ones
+  // (e.g. their own "!commands" or bot triggers) just leaves speakSelf on and
+  // adds a regex to the TTS content/username ignore list (gates 7/8 below) —
+  // exactly what Ethan suggested ("maybe with regex you supported for that").
+  //
+  // NOTE: the NOTIFICATION decider (decideNotificationAction) deliberately
+  // keeps an UNCONDITIONAL self-skip — this toggle is about the app SPEAKING
+  // your own messages, not about firing OS notifications for them.
+  if (message.self === true && ctx.settings.tts.speakSelf === false) {
     return { decision: 'skip', reason: 'self' };
   }
   // Gate 3: same-id reprocess. useEffect re-fires on array-identity

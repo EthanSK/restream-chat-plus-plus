@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.1.79 — "Speak my own messages" toggle (2026-05-31)
+
+Ethan (2026-05-31):
+> did u remove it from speaking out my own messages? that should be an
+> option. maybe with regex you supported for that so its user configurable
+
+**Yes — own-message TTS was deliberately removed in v0.1.72** (commit
+`9121eee`, voice 4352, 2026-05-28), which added a HARD self-skip with no
+way to re-enable it. v0.1.79 makes it a real, user-configurable option and
+defaults it back ON.
+
+### What's new
+
+- **"Speak my own messages" toggle** in Settings → Text-to-Speech. New
+  `settings.tts.speakSelf` boolean (default `true`). When ON, your own
+  outgoing chat (Restream's `self: true` echo) is read aloud like any other
+  message; when OFF, it's skipped (the v0.1.72 behaviour).
+- The authoritative gate is `decideTtsAction` gate 2 in
+  `src/shared/side-effect-decision.ts` (runs in the main process), so the
+  toggle silences/enables BOTH the browser-voice and native `say` paths.
+- The existing **regex skip-filter** (`Settings → Filters → "Ignore TTS for
+  messages matching"`, backed by `settings.filters.tts.ignoreRegex`) already
+  covers Ethan's "skip via regex" ask and now ALSO applies to your own
+  messages: leave "Speak my own messages" ON and add a regex (e.g. `^!` for
+  your own commands) to skip just those. Invalid patterns are compiled
+  safely (try/catch) and surfaced with a red border + tooltip — they never
+  crash TTS, they're just treated as "no filter".
+- The notification path keeps skipping your own messages unconditionally —
+  this toggle is only about the app SPEAKING your own chat, not about firing
+  OS notifications for it.
+
+### Guard
+
+- New tests pin both directions of the toggle through the pure decider AND
+  the main-process dispatcher (`src/__tests__/side-effect-decision.test.ts`
+  cases 2/2b/2c, `src/__tests__/tts-dispatch.test.ts`), plus a case proving
+  the TTS content-regex still skips a matching self message. 623 tests pass,
+  typecheck clean.
+
 ## v0.1.71 — cold-start auth flicker fix (voice 4198, 2026-05-26)
 
 Ethan voice 4198 (2026-05-26):
