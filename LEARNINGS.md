@@ -29,7 +29,7 @@ Each entry looks like:
 **Symptom:** own messages not spoken by TTS / wanted it configurable
 **Root cause:** v0.1.72 (commit 9121eee, voice 4352) added a HARD self-skip in decideTtsAction gate 2 (src/shared/side-effect-decision.ts) — message.self===true returned skip:'self' unconditionally, with the docstring explicitly stating 'no setting re-enables self-speak (YAGNI)'. The legacy shouldTriggerSideEffects self-gate in chat-message-reducers.ts is dead (v0.1.76 moved all TTS decisions to the main-process TtsDispatcher); the live gate was the decider's gate 2.
 **Fix:** Added settings.tts.speakSelf boolean (types.ts + DEFAULT_SETTINGS, default true, persisted via existing electron-store shallow-merge). decideTtsAction gate 2 (src/shared/side-effect-decision.ts) now skips self messages ONLY when speakSelf===false; otherwise they fall through the normal ladder so the existing TTS regex skip-filter (settings.filters.tts.ignoreRegex, safe try/catch compile + invalid-pattern UI hint) also applies to own messages. 'Speak my own messages' toggle added in SettingsDrawer.tsx Text-to-Speech section. Notification path still self-skips unconditionally (toggle is SPEECH-only). v0.1.79.
-**Commit:** 54a56fb
+**Commit:** 422c811
 **Guard:** side-effect-decision.test.ts cases 2/2b/2c + tts-dispatch.test.ts self speaks/skips; 623 tests pass, typecheck clean
 ---
 
