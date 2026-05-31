@@ -131,8 +131,29 @@ body {
 
 .toolbar {
   display: flex;
+  /* flex-wrap: wrap so the header items wrap onto a new row instead of being
+   * clipped when they overflow horizontally.
+   *
+   * WHY: the toolbar is a single flex row holding a growing set of controls —
+   * status dot + label, Reconnect, ChannelsPanel (one chip per connected
+   * platform), the spacer, the 🔊/🔇 Mute button (added v0.1.77), Logs,
+   * Settings, and Sign out / "Sign in to Restream". On a narrow window (and
+   * cha++ is often run in a slim sidebar window) those add up past the
+   * available width. Without wrapping, the row overflows and the rightmost
+   * items (Settings / Sign out) get cut off at the window edge with no way to
+   * reach them. `flex-wrap: wrap` lets the overflowing items drop to a second
+   * row instead. The toolbar has no fixed `height` and no `overflow: hidden`,
+   * so when a second row appears the toolbar simply grows taller and the chat
+   * area below flows down — the wrapped row stays visible.
+   *
+   * `row-gap: 8px` matches the existing horizontal `gap` so wrapped rows get
+   * the same vertical breathing room. The `.spacer` (flex: 1) still pushes the
+   * right-hand cluster to the far edge on the first row; once wrapping kicks
+   * in the spacer just absorbs the remaining first-row width. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  row-gap: 8px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-1);
