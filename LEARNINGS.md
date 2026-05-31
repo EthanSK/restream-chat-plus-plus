@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-31T16:18:43Z
+**Trigger:** Ethan: 'lets just use system voice for everything then. no more browser one. do it.'
+**Symptom:** Spoken chat (TTS) silent / unreliable: renderer Chromium window.speechSynthesis fired but produced no audio whenever the window wasn't foreground (covered/other-Space/minimised/backgrounded/locked) and could silently latch even in foreground on Electron 42. Browser engine was win/linux path + Settings preview + voice enumeration.
+**Root cause:** The app still depended on the renderer Web-Speech engine for non-mac chat playback, the Settings voice preview, and voice-list enumeration (speechSynthesis.getVoices()). Chromium throttles/suspends that engine off-foreground, so speak() was swallowed. v0.1.80 had already made macOS always-native but kept browser for everything else.
+**Fix:** v0.1.81: removed the renderer Web-Speech engine ENTIRELY; speak ALL chat + the Settings preview via the native OS voice on every platform. Generalised src/main/tts-native.ts into a cross-platform engine (macOS say; Windows PowerShell System.Speech; Linux spd-say>espeak-ng>espeak; no-engine => log once + no-op). dispatchSpeak() always native (dropped isMacNative/isWindowGenuinelyHidden/speakBrowser + the TTS_SPEAK_BROWSER IPC + onSpeakBrowser + speakBrowserCommand + isPageHidden fallback). Repointed preview to native via new IPC.TTS_NATIVE_PREVIEW; voice dropdown to native TTS_NATIVE_GET_VOICES (App fetches once). Removed tts.engine setting + Engine dropdown + Pitch slider (no cross-platform native pitch; tts.pitch kept inert for back-compat + MCP). Removed the now-pointless --disable-features=MacWebContentsOcclusion switch. SECURITY: untrusted chat text never reaches a shell — args array + shell:false everywhere; macOS/Linux pass text as a --guarded argv slot; Windows passes text+voice as base64 ENV VARS decoded inside the PS script (only self-generated integer volume/rate spliced literally).
+**Commit:** c939a5b
+**Guard:** src/__tests__/tts-dispatch.test.ts (always-native, no browser path) + src/__tests__/tts-native.test.ts (per-platform adapter selection incl. Linux which-probe fallback, rate/volume mapping for all platform scales, 4 voice-list parsers, and a SECURITY suite proving untrusted text is argv-only on mac/linux + base64-env-not-script on Windows). 584 tests pass, typecheck + lint clean. CAVEAT: Windows/Linux native paths are unit-tested only — not runtime-verified from macOS (macOS say path smoke-tested live).
+---
+
+---
 **Date:** 2026-05-31T15:47:33Z
 **Trigger:** Ethan: havent been hearing voice, should it always use system voice instead of electron, can volume n stuff work with that
 **Symptom:** no TTS audio heard at all; spoken-chat feature silent on macOS
