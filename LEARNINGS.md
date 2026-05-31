@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-31T14:37:00Z
+**Trigger:** Ethan: "need flex wrap on header of cha++ coz it gets cut off"
+**Symptom:** App header content cut off / clipped — on a narrow window the rightmost toolbar items (Settings / Sign out) overflowed past the window edge and became unreachable.
+**Root cause:** `.toolbar` is a single `display: flex` row (`align-items: center`, NO `flex-wrap`) whose child controls grew over successive versions — status dot + label, Reconnect, ChannelsPanel (one chip per connected platform), spacer, the v0.1.77 🔊/🔇 Mute button, Logs, Settings, and Sign out / "Sign in to Restream". cha++ is often run in a slim sidebar window, so they overflowed horizontally and clipped. The toolbar has no fixed `height` and no `overflow: hidden`, so wrapping was simply never enabled — items just ran off the edge.
+**Fix:** src/renderer/styles.css:132 `.toolbar` — added `flex-wrap: wrap` + `row-gap: 8px`. Overflowing items now drop to a second row; the toolbar grows taller (no fixed height/overflow) and the chat area below flows down so the wrapped row stays visible. The `.spacer` (flex:1) still right-aligns the cluster on the first row. Shipped in v0.1.78 (version bump commit eef4b4d).
+**Commit:** 4d34503
+**Guard:** Thorough inline comment block at `.toolbar` explaining why wrap is needed + the no-fixed-height/overflow invariant that keeps wrapped rows visible. 620/620 vitest tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-05-30T22:30:17Z
 **Trigger:** voice 4438
 **Symptom:** No fast way to silence the app speaking incoming chat aloud (TTS) without quitting or digging into Settings
