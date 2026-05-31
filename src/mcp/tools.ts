@@ -372,17 +372,22 @@ const getStatus: ToolDefinition = {
 // Tool: get_voices
 // ---------------------------------------------------------------------------
 //
-// Voice enumeration is a renderer-only API (`speechSynthesis.getVoices()`).
-// The MCP process has no access to that. We surface a clear note rather
-// than fabricating a list.
+// v0.1.81 — voices are now the NATIVE OS voice list (macOS `say -v "?"` /
+// Windows System.Speech / Linux spd-say|espeak), enumerated in the MAIN
+// process (src/main/tts-native.ts). When the MCP runs in-process and the host
+// wires `getRuntimeStatus().voices`, we surface the real list; otherwise (or
+// when not yet populated) we return the selected voiceURI + a note. We no
+// longer claim this is a renderer/Web-Speech-only capability — that was the
+// pre-v0.1.81 architecture.
 
 const getVoices: ToolDefinition = {
   name: 'get_voices',
   description:
-    'List available TTS voices. Currently requires the running GUI to ' +
-    'enumerate (Web Speech API lives in the renderer) — the standalone ' +
-    'MCP process cannot reach it. Returns the persisted voiceURI so ' +
-    'agents can confirm which one is selected.',
+    'List available TTS voices (the native OS system voices — macOS Speech, ' +
+    'Windows narrator voices, or Linux speech-dispatcher/espeak). Returns the ' +
+    'currently-selected voiceURI plus, when the live app is reachable, the ' +
+    'enumerated voice list. To select a voice, call `set_voice` with the ' +
+    'desired platform voice name.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
     const s = readSettingsVia(ctx);
@@ -393,10 +398,11 @@ const getVoices: ToolDefinition = {
       hint:
         runtime?.voices != null
           ? undefined
-          : 'Voice enumeration requires the live renderer process. Open the ' +
-            'Settings drawer in Restream Chat++ to see the full list. To ' +
-            'select a voice, call `set_voice` with the desired voiceURI ' +
-            '(e.g. "com.apple.voice.compact.en-GB.Daniel" on macOS).',
+          : 'Voice list not currently available from this MCP context. Open ' +
+            'the Settings drawer in Restream Chat++ to see the full native ' +
+            'voice list. To select a voice, call `set_voice` with the desired ' +
+            'platform voice name (e.g. "Daniel" on macOS, "Microsoft Zira ' +
+            'Desktop" on Windows).',
     };
   },
 };
@@ -474,9 +480,13 @@ const listConnections: ToolDefinition = {
 const setVoice: ToolDefinition = {
   name: 'set_voice',
   description:
-    'Set the TTS voice by Web Speech API voiceURI. Pass the full URI ' +
-    '(e.g. "com.apple.voice.compact.en-GB.Daniel"). Use `get_voices` ' +
-    'to find the current selection.',
+    // v0.1.81 — the voice is now the NATIVE OS voice NAME, not a Web-Speech URI
+    // (the browser engine was removed). macOS: a `say` voice name like ' +
+    // "Daniel"; Windows: a System.Speech name like "Microsoft Zira Desktop"; ' +
+    // Linux: an spd-say/espeak voice name. Empty/omitted → OS default voice.
+    'Set the TTS voice by its native OS voice name (e.g. "Daniel" on macOS, ' +
+    '"Microsoft Zira Desktop" on Windows). Use `get_voices` to find the ' +
+    'available names + current selection.',
   inputSchema: {
     type: 'object',
     properties: { voiceURI: { type: 'string' } },

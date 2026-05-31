@@ -14,12 +14,15 @@ import path from 'node:path';
  * setting with no audible feedback.
  *
  * v0.1.27 extracts a shared `previewOnRelease` handler object and spreads it
- * onto all three sliders so every slider previews on release. This test
- * asserts at the source level that:
+ * onto the sliders so every slider previews on release.
+ *
+ * v0.1.81 — the PITCH slider was REMOVED (the native OS voice engines have no
+ * cross-platform pitch knob, so pitch is no longer a setting with audible
+ * effect). Only the Rate + Volume sliders remain. This test now asserts:
  *   1. Rate slider has `{...previewOnRelease}` spread on it.
- *   2. Pitch slider has `{...previewOnRelease}` spread on it.
- *   3. Volume slider still has `{...previewOnRelease}` (regression guard).
- *   4. The shared handler exists and calls `onPreviewVoice?.(settings.tts.voiceURI)`.
+ *   2. Volume slider still has `{...previewOnRelease}` (regression guard).
+ *   3. The shared handler exists and calls `onPreviewVoice?.(settings.tts.voiceURI)`.
+ *   4. There is NO Pitch slider anymore.
  *
  * Source-level asserts (not render tests) match the codebase convention —
  * the renderer tests run under vitest `environment: 'node'` with no jsdom
@@ -65,10 +68,9 @@ describe('SettingsDrawer — slider preview wiring (v0.1.27)', () => {
     expect(block).toMatch(/\{\.\.\.previewOnRelease\}/);
   });
 
-  it('Pitch slider spreads {...previewOnRelease} so it previews on release', () => {
-    const block = sliderInputBlock('Pitch');
-    expect(block).toContain('type="range"');
-    expect(block).toMatch(/\{\.\.\.previewOnRelease\}/);
+  it('Pitch slider was removed (v0.1.81 — no native cross-platform pitch knob)', () => {
+    // The Pitch <label>/<input> must NOT be present anymore.
+    expect(code).not.toMatch(/<label>Pitch<\/label>/);
   });
 
   it('Volume slider still spreads {...previewOnRelease} (v0.1.11 guard)', () => {

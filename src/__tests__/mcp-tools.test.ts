@@ -264,10 +264,13 @@ describe('mcp tools: runtime-only stubs return guiNotIntrospectable', () => {
   });
 
   it('get_voices returns currentVoiceURI + null list + hint', async () => {
-    await call('set_voice', { voiceURI: 'com.apple.voice.compact.en-GB.Daniel' });
+    await call('set_voice', { voiceURI: 'Daniel' });
     const r = (await call('get_voices', {})) as any;
-    expect(r.currentVoiceURI).toBe('com.apple.voice.compact.en-GB.Daniel');
+    expect(r.currentVoiceURI).toBe('Daniel');
+    // No live runtime wired in this unit test, so the list is null + a hint
+    // points the agent at the Settings drawer / `set_voice`. v0.1.81: the hint
+    // refers to the native voice list (no more "renderer"/Web-Speech wording).
     expect(r.voices).toBeNull();
-    expect(r.hint).toMatch(/renderer/);
+    expect(r.hint).toMatch(/native voice list/);
   });
 });

@@ -114,69 +114,40 @@ describe('Settings migration', () => {
   });
 
   // -------------------------------------------------------------------------
-  // v0.1.42 → v0.1.44 — `tts.engine` toggle (native | browser).
-  //
-  // History:
-  //   v0.1.42 introduced the native `say` engine and flipped the default
-  //   to `'native'` because the Web Speech path had recurring "TTS just
-  //   stopped working" bugs.
-  //   v0.1.44 flipped the default BACK to `'browser'` after the
-  //   v0.1.40 strong-ref + v0.1.41 cancel-before-speak + 8s keep-alive +
-  //   500ms onstart watchdog + onerror retry layers made the browser
-  //   engine reliable. The deciding factor: the volume slider doesn't
-  //   apply to `say` (no `--volume` flag), and Ethan wants slider control.
-  //
-  // Pre-v0.1.42 settings blobs have no `engine` field. The migration must
-  // back-fill from `DEFAULT_SETTINGS.tts.engine` so the user lands on the
-  // current default. Users who explicitly chose `'native'` on v0.1.42 /
-  // v0.1.43 must keep their choice — the default flip in v0.1.44 only
-  // applies to users who never explicitly picked.
+  // v0.1.81 — `tts.engine` REMOVED. The browser/native engine toggle is gone;
+  // speech is always the native OS voice now, so DEFAULT_SETTINGS has no
+  // `engine` field. A legacy persisted blob may STILL carry `engine:
+  // 'browser'|'native'`. The shallow per-section merge
+  // (`{ ...DEFAULT_SETTINGS.tts, ...stored.tts }`) carries that stale key
+  // through onto the merged object, which is HARMLESS — nothing reads `engine`
+  // anymore (the dispatcher always uses the native engine). What matters is
+  // that migration doesn't error and the user's REAL settings survive intact.
   // -------------------------------------------------------------------------
-  it("DEFAULT_SETTINGS.tts.engine is 'browser' (v0.1.44 default)", () => {
-    expect(DEFAULT_SETTINGS.tts.engine).toBe('browser');
+  it("DEFAULT_SETTINGS.tts no longer defines an 'engine' field (v0.1.81 removal)", () => {
+    expect('engine' in DEFAULT_SETTINGS.tts).toBe(false);
   });
 
-  it('defaults tts.engine to browser when absent in persisted blob', () => {
+  it('migrating a legacy blob that still carries tts.engine is harmless (real settings survive)', () => {
     const legacy = {
       tts: {
         enabled: true,
-        readSenderName: false,
-        rate: 1.0,
+        engine: 'native', // legacy key no longer in the type — must not break migration
+        readSenderName: true,
+        rate: 1.25,
         pitch: 1.0,
-        volume: 1.0,
+        volume: 0.7,
         maxPerMinute: 20,
       },
     } as unknown as Partial<Settings>;
 
+    // Must not throw, and the user's real TTS settings come through unchanged.
     const merged = migrate(legacy);
-    expect(merged.tts.engine).toBe('browser');
-  });
-
-  it("preserves a user-set tts.engine='browser' across migration", () => {
-    const stored: Partial<Settings> = {
-      tts: {
-        ...DEFAULT_SETTINGS.tts,
-        engine: 'browser',
-      },
-    };
-    const merged = migrate(stored);
-    expect(merged.tts.engine).toBe('browser');
-  });
-
-  // v0.1.44 default-flip regression pin: a user who explicitly chose
-  // 'native' on v0.1.42 or v0.1.43 must NOT be force-flipped back to
-  // 'browser' just because we changed DEFAULT_SETTINGS. Object-spread
-  // semantics already give us this (stored.tts.engine overrides the
-  // default), but we pin it explicitly so a future refactor that swaps
-  // the merge order (e.g. defaults-win) breaks loudly.
-  it("preserves a user-set tts.engine='native' across the v0.1.44 default flip", () => {
-    const stored: Partial<Settings> = {
-      tts: {
-        ...DEFAULT_SETTINGS.tts,
-        engine: 'native',
-      },
-    };
-    const merged = migrate(stored);
-    expect(merged.tts.engine).toBe('native');
+    expect(merged.tts.enabled).toBe(true);
+    expect(merged.tts.readSenderName).toBe(true);
+    expect(merged.tts.rate).toBe(1.25);
+    expect(merged.tts.volume).toBe(0.7);
+    // Defaults for fields the legacy blob lacked are still back-filled.
+    expect(merged.tts.muted).toBe(false);
+    expect(merged.tts.speakSelf).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import {
   ChatMessage,
   ConnectionState,
   DEFAULT_SETTINGS,
+  NativeVoiceWire,
   Platform,
   Settings,
   UpdateInfo,
@@ -30,10 +31,12 @@ import {
 } from './chat-send-client';
 import { SettingsDrawer } from './SettingsDrawer';
 import { UpdateBanner } from './UpdateBanner';
-// v0.1.76 — RateLimiter is no longer used in the renderer (rate-limiting moved
-// to main's TtsDispatcher). makeTtsEngine still backs the Settings voice
-// preview; TTSEngine backs the dedicated browser-speak command executor.
-import { makeTtsEngine, TTSEngine, type TtsEngineLike } from './tts';
+// v0.1.81 — the renderer no longer owns ANY speech engine. Speech is the native
+// OS voice in the MAIN process (src/main/tts-native.ts); the browser Web-Speech
+// `TTSEngine` + `makeTtsEngine` factory were deleted. The Settings voice list
+// is fetched from main over IPC and the voice preview is an IPC call too. The
+// only thing still imported from ./tts is nothing (it's now just pure helpers
+// used by SettingsDrawer directly).
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
@@ -107,21 +110,16 @@ export function App(): React.ReactElement {
   // we want a soft nag, not a sticky one. The next launch re-checks and
   // re-shows the banner if the user hasn't actually installed the new build.
   const [updateDismissed, setUpdateDismissed] = useState(false);
-  const ttsRef = useRef<TtsEngineLike | undefined>(undefined);
-  // v0.1.76 (Ethan voice 4414) — DEDICATED browser Web-Speech engine used
-  // ONLY to execute `IPC.TTS_SPEAK_BROWSER` commands pushed from the
-  // main-process dispatcher. This is intentionally SEPARATE from `ttsRef`
-  // (which now only backs the Settings-drawer voice preview). The main process
-  // decides whether/what to speak + the backend; when it picks 'browser' it
-  // pushes a command here and this engine speaks it through the hardened
-  // speak path. Always a browser TTSEngine regardless of the engine toggle,
-  // because browser-speak commands always need Web Speech. Lazily constructed
-  // on first command so it doesn't allocate before any chat arrives.
-  const browserSpeakRef = useRef<TTSEngine | undefined>(undefined);
-  // v0.1.76 — the notification rate limiter moved to the MAIN process
-  // (TtsDispatcher.notifLimiter) along with the whole notification decision,
-  // so the renderer no longer holds a notifyLimiterRef. Notifications fire from
-  // main now; the renderer only renders the feed + executes browser-speak.
+  // v0.1.81 — the renderer holds NO speech engine anymore. All speech (incoming
+  // chat AND the Settings voice preview) goes through the native OS voice in the
+  // MAIN process. The only TTS-adjacent renderer state is the native VOICE LIST
+  // shown in the Settings dropdown, fetched once from main over IPC. undefined =
+  // not yet fetched (drawer shows "Loading…"); [] = fetched-but-none/failed.
+  const [nativeVoices, setNativeVoices] = useState<NativeVoiceWire[] | undefined>(undefined);
+  // v0.1.76 — the notification rate limiter + the whole TTS/notification
+  // decision live in the MAIN process now (TtsDispatcher). The renderer only
+  // renders the feed + computes display-only badge flags; it neither decides
+  // nor speaks anything.
   // v0.1.63 — one timeout per renderer-minted optimistic send. The map lives
   // in a ref because these handles are lifecycle bookkeeping, not render data:
   // changing them should not re-render the chat feed. Every handle is cleared
@@ -322,10 +320,18 @@ export function App(): React.ReactElement {
       const s = await rcpp.getSettings();
       if (!alive) return;
       setSettings(s);
-      // v0.1.42 — engine kind comes from settings (native | browser).
-      // `makeTtsEngine` picks the right implementation; the renderer
-      // talks to the polymorphic `TtsEngineLike` surface from here on.
-      ttsRef.current = makeTtsEngine(s.tts);
+      // v0.1.81 — fetch the native OS voice list from main (cached there) for
+      // the Settings dropdown. No renderer speech engine to construct anymore.
+      // Best-effort: a failure leaves the dropdown on "System default" only.
+      void rcpp.ttsNative
+        ?.getVoices?.()
+        .then((list) => {
+          if (alive) setNativeVoices(list);
+        })
+        .catch((err) => {
+          console.error('[App] getVoices failed', err);
+          if (alive) setNativeVoices([]);
+        });
       // Pull-fetch the current connection state. The push channel
       // (onConnectionState) only delivers UPDATES — if the main process
       // already transitioned the WS to 'connecting' / 'connected' BEFORE we
@@ -452,35 +458,14 @@ export function App(): React.ReactElement {
     //      surface.
     // Live Settings push from the in-process HTTP MCP server (v0.1.36+).
     // Fires when an MCP client (Claude Code, etc.) mutates Settings via
-    // tools like `set_voice` / `set_tts_volume`. We replace local
-    // settings state + re-init the TTS engine + rate limiter so the
-    // changes take effect immediately — no restart required.
+    // tools like `set_voice` / `set_tts_volume`. We just replace local
+    // settings state so the UI reflects the change. v0.1.81 — there's no
+    // renderer TTS engine to re-init anymore: the live native engine in MAIN
+    // reads the persisted settings per-utterance + gets a settings push of its
+    // own, so MCP voice/volume/rate changes take effect on the next message
+    // with no renderer involvement.
     const offSettingsPush = rcpp.onSettingsPush((next) => {
-      setSettings((prev) => {
-        // v0.1.42 — if the engine kind changed (native ↔ browser), tear
-        // down the old engine and construct a fresh one. The factory in
-        // `makeTtsEngine` picks the right backing implementation; both
-        // satisfy `TtsEngineLike` so App.tsx never needs to know which
-        // is in use beyond this swap site.
-        const engineChanged = prev?.tts?.engine !== next.tts.engine;
-        if (engineChanged) {
-          try {
-            ttsRef.current?.cancel();
-          } catch (err) {
-            console.error('[App] TTSEngine.cancel on engine swap failed', err);
-          }
-          ttsRef.current = makeTtsEngine(next.tts);
-        } else {
-          try {
-            ttsRef.current?.updateSettings(next.tts);
-          } catch (err) {
-            console.error('[App] TTSEngine.updateSettings on push failed', err);
-          }
-        }
-        return next;
-      });
-      // v0.1.76 — notification rate-limit lives in main now; nothing to
-      // re-init in the renderer on a settings push.
+      setSettings(next);
     });
     const offUpdate = rcpp.onUpdateStatus((info) => {
       setUpdateInfo((prev) => {
@@ -506,31 +491,10 @@ export function App(): React.ReactElement {
         return info;
       });
     });
-    // v0.1.76 (Ethan voice 4414) — execute browser-speak commands from main.
-    // The main-process dispatcher decides whether/what to speak + the backend.
-    // When it picks the BROWSER backend (window visible/covered) it pushes a
-    // command here with a full settings snapshot; we speak it via the
-    // dedicated browser engine, honouring volume/voice/rate/PITCH. The renderer
-    // no longer DECIDES — it just executes. (Genuinely-hidden windows are
-    // spoken via native `say` in main and never reach this listener — that's
-    // the never-miss path that doesn't depend on the renderer at all.)
-    const offSpeakBrowser = rcpp.onSpeakBrowser((payload) => {
-      try {
-        if (!browserSpeakRef.current) {
-          // Lazy construct the dedicated browser engine on first command.
-          browserSpeakRef.current = new TTSEngine({
-            ...settings.tts,
-            // Force browser semantics + enabled — main already gated the
-            // decision, this engine only ever executes vetted commands.
-            engine: 'browser',
-            enabled: true,
-          });
-        }
-        browserSpeakRef.current.speakBrowserCommand(payload);
-      } catch (err) {
-        console.error('[App] speakBrowserCommand failed', err);
-      }
-    });
+    // v0.1.81 — there is no longer a renderer speech listener. Speech happens
+    // entirely in MAIN via the native OS voice engine; the old
+    // `IPC.TTS_SPEAK_BROWSER` channel + the renderer's browser-speak executor
+    // were removed when the Web-Speech engine was deleted.
     return () => {
       alive = false;
       offAuth();
@@ -542,15 +506,6 @@ export function App(): React.ReactElement {
       offClear();
       offSettingsPush();
       offUpdate();
-      offSpeakBrowser();
-      // v0.1.76 — tear down the browser-speak engine so its keep-alive timer
-      // doesn't leak across an unmount.
-      try {
-        browserSpeakRef.current?.cancel();
-      } catch {
-        /* defensive */
-      }
-      browserSpeakRef.current = undefined;
       clearAllOptimisticSendTimeouts('unmount');
       // v0.1.71 — drop cold-start spinner timers on unmount so they
       // can't fire setState after we've torn down (React would warn).
@@ -590,34 +545,27 @@ export function App(): React.ReactElement {
     dispatchEnqueueChatSend(text, clientId);
   };
 
-  // v0.1.76 (Ethan voice 4414, 2026-05-30) — TTS + NOTIFICATION DISPATCH MOVED
-  // TO THE MAIN PROCESS.
+  // TTS + NOTIFICATION DISPATCH LIVE ENTIRELY IN THE MAIN PROCESS.
   // ===========================================================================
-  // The renderer NO LONGER decides whether/what to speak or notify. That entire
-  // decision/filter/rate-limit/same-id/backend-choice ladder now lives in the
-  // BACKGROUND (main) process — see src/main/tts-dispatch.ts (TtsDispatcher),
-  // wired into `chat.on('message')` in main.ts. This is PRIORITY #1 from voice
-  // 4414: "it must NEVER miss a message". Running the decision in main means a
-  // wedged/dead/slow renderer can no longer swallow a message, and when the
-  // window is genuinely hidden main speaks it via native `say` with zero
-  // renderer involvement.
+  // The renderer NO LONGER decides whether/what to speak or notify, and (as of
+  // v0.1.81) it no longer SPEAKS anything either. The whole decision/filter/
+  // rate-limit/same-id ladder + the actual speech run in the BACKGROUND (main)
+  // process — see src/main/tts-dispatch.ts (TtsDispatcher) + src/main/
+  // tts-native.ts (the cross-platform native OS voice engine), wired into
+  // `chat.on('message')` in main.ts. This is PRIORITY #1 from voice 4414: "it
+  // must NEVER miss a message" — a wedged/dead/slow renderer can't swallow a
+  // message because nothing about speech depends on the renderer.
   //
   // What the renderer does now:
   //   - Renders the feed (onChatMessage, above) — unchanged.
   //   - Computes the `ignoredByTts` / `ignoredByNotifications` BADGE flags for
   //     the feed via applyMessageFilters in onChatMessage — display-only, NOT a
   //     side-effect decision. (The authoritative decision is main's.)
-  //   - Executes browser-speak COMMANDS pushed from main via
-  //     `IPC.TTS_SPEAK_BROWSER` (onSpeakBrowser, above) — speaking one
-  //     utterance through the hardened Web-Speech path, honouring every setting
-  //     (volume/voice/rate/PITCH) from the command payload. This is how the
-  //     visible-window case keeps full setting fidelity.
+  //   - Shows the native voice list + fires the voice-preview IPC in Settings.
   //
-  // Notifications likewise fire from main now (the dispatcher calls Electron's
-  // Notification directly, honouring soundEnabled). The old renderer-side
-  // decision useEffect + its renderer RateLimiter for notifications are gone;
-  // the rate limiters live in main (TtsDispatcher.ttsLimiter / notifLimiter) so
-  // they survive a renderer reload.
+  // Notifications likewise fire from main (the dispatcher calls Electron's
+  // Notification directly, honouring soundEnabled). The rate limiters live in
+  // main (TtsDispatcher.ttsLimiter / notifLimiter) so they survive a reload.
 
   // v0.1.72 — also drop messages whose `username` is in `hiddenUsers`
   // (case-insensitive exact match). Re-runs every render so historical
@@ -679,23 +627,21 @@ export function App(): React.ReactElement {
   };
 
   const updateSettings = async (next: Settings) => {
-    // v0.1.42: detect engine-kind change BEFORE setState so we can swap
-    // the engine instance synchronously rather than racing the next
-    // render. Avoids a brief window where the new engine setting is in
-    // state but the old engine is still attached.
-    const engineChanged = settings.tts.engine !== next.tts.engine;
     setSettings(next);
-    if (engineChanged) {
-      try {
-        ttsRef.current?.cancel();
-      } catch (err) {
-        console.error('[App] TTSEngine.cancel on engine swap failed', err);
-      }
-      ttsRef.current = makeTtsEngine(next.tts);
-    } else {
-      ttsRef.current?.updateSettings(next.tts);
+    // v0.1.81 — no renderer engine to swap. Push the voice/rate/volume slice to
+    // the MAIN native engine so the Settings voice-PREVIEW (which the engine
+    // speaks using its own current rate/volume) reflects live slider changes
+    // immediately. Chat playback reads settings per-message in main, so this
+    // push is only load-bearing for the preview's rate/volume. Fire-and-forget.
+    try {
+      rcpp.ttsNative?.updateSettings?.({
+        voiceURI: next.tts.voiceURI,
+        rate: next.tts.rate,
+        volume: next.tts.volume,
+      });
+    } catch (err) {
+      console.error('[App] ttsNative.updateSettings failed', err);
     }
-    // v0.1.76 — notification rate-limit lives in main now; nothing to re-init.
     await rcpp.setSettings(next);
   };
 
@@ -1013,14 +959,11 @@ export function App(): React.ReactElement {
           settings={settings}
           onChange={updateSettings}
           onClose={() => setDrawerOpen(false)}
-          voices={ttsRef.current?.voices() ?? []}
-          onPreviewVoice={(uri) => ttsRef.current?.previewVoice(uri)}
-          // v0.1.42 — native engine has its own voice fetch over IPC.
-          // We feed the function down regardless of engine kind; the
-          // drawer only calls it when `settings.tts.engine === 'native'`.
-          getNativeVoices={() =>
-            rcpp.ttsNative?.getVoices?.() ?? Promise.resolve([])
-          }
+          // v0.1.81 — the voice list is the NATIVE OS voice list fetched from
+          // main (undefined while loading, [] if none/failed). Preview speaks
+          // through the native engine in main via IPC. No renderer engine.
+          nativeVoices={nativeVoices}
+          onPreviewVoice={(uri) => rcpp.ttsNative?.preview?.(uri)}
         />
       )}
     </div>

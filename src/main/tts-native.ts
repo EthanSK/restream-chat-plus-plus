@@ -1,114 +1,100 @@
-// v0.1.42 — Native macOS `say`-backed TTS engine for the main process.
+// CROSS-PLATFORM NATIVE OS TTS ENGINE (main process).
 //
-// Why this exists
-// ----------------
-// Through v0.1.41 the renderer used Chromium's `window.speechSynthesis` for
-// TTS. That API on Electron 42 macOS is flaky in well-documented ways:
-// dormant-engine swallows, GC-collected utterances dropping onend events,
-// silent latching after idle cancel() calls, etc. v0.1.40 + v0.1.41 layered
-// defensive scaffolding (strong-ref, 60s watchdog, cancel-before-speak,
-// 8s keep-alive, 500ms onstart watchdog, onerror retry, JSONL disk log) on
-// top of the Web Speech engine but never actually solved the underlying
-// fragility — we were fighting browser bugs.
+// v0.1.81 (Ethan 2026-05-31: "lets just use system voice for everything then.
+// no more browser one. do it.") — THIS ENGINE NOW SPEAKS ON EVERY PLATFORM.
+// ============================================================================
 //
-// The macOS OS-level `say(1)` CLI does exactly what we want, reliably:
-// spawn a subprocess, hand it text + voice + rate, the user hears audio,
-// the process exits. No internal state machine to wedge. No GC. No
-// "engine went dormant". The only state we own is a small FIFO queue.
+// WHY THE BROWSER (Web-Speech) ENGINE WAS REMOVED
+// ------------------------------------------------
+// Through v0.1.80 incoming chat was spoken via Chromium's renderer
+// `window.speechSynthesis` on win/linux (and, briefly, macOS). Chromium
+// THROTTLES / SUSPENDS the renderer speech engine whenever the window isn't
+// foreground (covered by another window, on another Space/desktop, minimised,
+// app backgrounded, screen-locked) and on Electron 42 it can silently latch
+// even in the foreground — `speak()` fires but NO AUDIO comes out. Ethan kept
+// hearing nothing. The decision (final) was: drop the renderer engine entirely
+// and use the OS-level system voice on ALL platforms. An OS subprocess is
+// immune to Chromium renderer throttling, so it always plays regardless of
+// window state. This module is that engine.
 //
-// This module replaces the browser speech engine for chat playback when
-// `settings.tts.engine === 'native'` (the new default on macOS). The
-// browser engine stays in place behind the toggle so a future Linux /
-// Windows build can keep working.
+// HISTORY: v0.1.42 introduced this as a macOS-only `say` engine behind a
+// toggle; v0.1.76 made it the genuinely-hidden fallback (+ volume via
+// `[[volm]]`); v0.1.80 made macOS always-native. v0.1.81 generalises it to
+// Windows + Linux and makes it THE one and only speech path everywhere.
 //
-// Design
-// ------
-//   - Singleton `NativeTtsEngine` instance per main process.
-//   - `enqueue(text, opts)` pushes onto an internal queue; if nothing's
-//     speaking we kick off `say` immediately. If a subprocess is already
-//     running, we wait for its exit before popping the next one.
-//   - `cancel()` SIGTERMs the running subprocess + clears the queue. The
-//     SIGTERM handler on the subprocess still resolves the in-flight
-//     queue advance so the runloop unblocks; we just don't pop another
-//     entry after.
-//   - `updateSettings(s)` updates voice/rate/volume the NEXT utterance
-//     will use. We don't mutate the running utterance — `say` doesn't
-//     expose live-update knobs, and chat messages are short enough that
-//     waiting for the current one to finish is fine.
-//   - `getAvailableVoices()` shells out `say -v "?"` once per process,
-//     caches the parsed result. The output is one voice per line:
-//       Daniel              en_GB    # Hello! My name is Daniel.
-//     Some voice names contain spaces and qualifiers ("Eddy (English
-//     (UK))"), so we parse by character class boundaries — the `lang`
-//     locale (e.g. `en_GB` / `en_US`) is the reliable column separator.
+// PER-PLATFORM BACKENDS (see PlatformAdapter below for the exact commands):
+//   - macOS  (darwin): `say` CLI.
+//       speak: `say -v <voice> -r <wpm> -- "[[volm n]] <text>"`
+//       voices: `say -v "?"`  (one per line; locale is the column anchor)
+//       volume: inline `[[volm 0.0-1.0]]` tune-management command in the text
+//       rate:   `-r <wpm>` (words/min); voice: `-v <name>`
+//   - Windows (win32): PowerShell System.Speech.Synthesis.SpeechSynthesizer.
+//       speak: powershell -NoProfile -Command <script>  where the script does
+//              Add-Type System.Speech; $s=New-Object …SpeechSynthesizer;
+//              $s.Volume=<0-100>; $s.Rate=<-10..10>; $s.SelectVoice(<name>);
+//              $s.Speak(<text>)
+//       voices: same synth, $s.GetInstalledVoices() | %{ $_.VoiceInfo.Name }
+//       volume: $s.Volume 0-100; rate: $s.Rate -10..10; voice: SelectVoice
+//   - Linux: prefer `spd-say` (speech-dispatcher), else `espeak-ng`/`espeak`.
+//       spd-say: `spd-say -w -r <-100..100> -i <-100..100> -t <name?> -- <text>`
+//                (-w waits, -r rate, -i volume/intensity, -t voice "type")
+//       espeak:  `espeak -a <0-200> -s <wpm> -v <name?> -- <text>`
+//       voices:  `spd-say -L`  /  `espeak --voices`
+//       If NONE of these binaries exist → we log ONCE and no-op (never crash,
+//       never fall back to a browser engine — there is no browser engine now).
 //
-// Volume
-// ------
-// v0.1.76 (Ethan voice 4414, 2026-05-30) — VOLUME IS NOW HONOURED NATIVELY.
+// !!! SECURITY — UNTRUSTED CHAT TEXT MUST NEVER REACH A SHELL !!!
+// --------------------------------------------------------------
+// Chat message text is fully attacker-controlled (any viewer can type
+// anything). We MUST guarantee it can never be interpreted as a shell command
+// or a PowerShell expression. Two rules, enforced below and asserted by tests:
 //
-// HISTORY: v0.1.42 shipped without native volume because `say` has no
-// `--volume` CLI flag, and we wrongly concluded per-utterance volume was
-// unsupported (the old comment told users to use the macOS system volume).
-// That was a real regression for the "move all TTS to the background" plan:
-// Ethan's hard constraint is that the volume slider MUST keep working even
-// when the native fallback is the one speaking.
+//   1. We ALWAYS spawn with an ARGS ARRAY and NEVER `shell: true`. With
+//      `shell:false` (the Node default) argv entries are passed to the child
+//      verbatim — no shell parsing, no glob/quote/`;`/`$()` interpretation.
+//      So for `say`/`espeak`/`spd-say` the message text is just one argv slot
+//      after a `--` end-of-options separator; it cannot inject anything.
 //
-// FIX: `say` DOES support per-utterance volume via an INLINE TUNE-MANAGEMENT
-// command embedded in the spoken text — `[[volm <0.0–1.0>]]`. Prepending
-// `[[volm 0.35]] ` to the text scales that utterance's loudness to 35% with
-// NO extra subprocess (afplay piping was the other option — rejected for the
-// added latency + audio-buffering surface). `[[volm 1.0]]` is full volume
-// (the `say` default), `[[volm 0.0]]` is silent. We clamp the Web-Speech
-// 0.0–1.0 `volume` setting into that range and prepend the command in
-// `buildSayText()` below. Verified working on macOS 26 (Tahoe): `say
-// '[[volm 0.2]] testing'` audibly quieter than `[[volm 1.0]]`.
+//   2. WINDOWS IS THE DANGEROUS ONE. We invoke `powershell -Command <script>`,
+//      and PowerShell DOES parse its `-Command` argument as code. If we
+//      interpolated the message text into that script string, a message like
+//      `"; Remove-Item C:\ -Recurse; "` would execute. To make injection
+//      structurally impossible we NEVER put message text (or the voice name)
+//      into the script as a literal. Instead the script reads them from
+//      ENVIRONMENT VARIABLES we set on the spawned process
+//      (`RCPP_TTS_TEXT`, `RCPP_TTS_VOICE`) and decodes them from BASE64 inside
+//      PowerShell ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(
+//      $env:RCPP_TTS_TEXT))). Base64 is a fixed `[A-Za-z0-9+/=]` alphabet, so
+//      the value we place in the env var can NEVER contain a PowerShell
+//      metacharacter — and env vars aren't evaluated as code anyway. The only
+//      values spliced into the script literally are NUMBERS we generate
+//      ourselves (volume 0-100, rate -10..10), which are clamped + integer-cast
+//      so they're always plain digits. Result: no chat text and no voice name
+//      ever touches the PowerShell parser as code.
 //
-// WHY THIS MATTERS FOR THE ARCHITECTURE: with the v0.1.76 main-process
-// dispatch (see src/main/tts-dispatch.ts), the native path is the
-// genuinely-hidden fallback. Because volume now flows through `[[volm]]`,
-// the volume slider keeps working in BOTH the visible-window (browser voice)
-// AND the hidden-window (native `say`) cases — the slider is no longer a
-// browser-only control. The only setting the native path still can't honour
-// is PITCH (`say` has no pitch knob); that degrades only in the rare
-// genuinely-hidden state and is restored the instant the window is visible
-// again (browser voice handles pitch).
-//
-// Logging
-// -------
-// Every spawn / exit / kill / queue mutation lands in
-// `~/Library/Logs/Restream Chat Plus Plus/tts-events.jsonl` via the same
-// `appendTtsLog` path the renderer side uses (forwarded through
-// `IPC.TTS_LOG`). Events:
-//   - `native_speak_start`   { message_id?, voice?, rateWPM, queue_size }
-//   - `native_speak_end`     { message_id?, exitCode, durationMs }
-//   - `native_speak_error`   { message_id?, error }
-//   - `native_speak_killed`  { message_id?, reason }
-//   - `native_queue_size`    { queue_size }
-//
-// Rate mapping
-// ------------
-// Web Speech rate is unitless (1.0 = "normal"). `say -r` is words-per-
-// minute (default ~175 on most macOS voices, premium voices vary). We
-// map by multiplying: `wpm = round(180 * rate)`. Clamped to [80, 720]
-// to avoid `say` rejecting absurd values. Test coverage pins the math.
+// Everything else (the FIFO queue, cancel = SIGTERM the child + drop the queue,
+// kill-on-quit, mute/enabled handled UPSTREAM in the dispatcher) is unchanged
+// from the macOS-only engine — those semantics are identical across platforms.
 
 import * as nodeProc from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import type { Settings, TtsLogEvent } from '../shared/types';
 
+// ============================================================================
+// Rate / volume mapping constants
+// ============================================================================
+
 /**
- * Words-per-minute that maps to a Web-Speech `rate` of 1.0. macOS `say`'s
- * built-in default is ~175 for most legacy voices and ~200 for the newer
- * premium ones — 180 is a sensible middle ground. The chosen constant is
- * pinned by `tts-native.test.ts` so a future tweak is visible.
+ * Words-per-minute that maps to a unitless `rate` of 1.0 on the macOS `say`
+ * + Linux `espeak` paths (both take WPM). macOS `say` defaults ~175-200; 180
+ * is a sensible middle ground. Pinned by tts-native.test.ts.
  */
 export const NATIVE_BASE_WPM = 180;
-
-/** Clamp range for `say -r`. Outside this `say` either rejects or sounds broken. */
+/** Clamp range for WPM-based engines. Outside this `say`/espeak misbehave. */
 export const NATIVE_MIN_WPM = 80;
 export const NATIVE_MAX_WPM = 720;
 
-/** Map a Web Speech `rate` (unitless, 0.5–2.0 typical) → `say` WPM. */
+/** Map a unitless `rate` (0.5–2.0 typical, the Settings slider range) → WPM. */
 export function rateToWpm(rate: number): number {
   if (!Number.isFinite(rate) || rate <= 0) return NATIVE_BASE_WPM;
   const wpm = Math.round(NATIVE_BASE_WPM * rate);
@@ -118,15 +104,10 @@ export function rateToWpm(rate: number): number {
 }
 
 /**
- * v0.1.76 — clamp a Web-Speech-style `volume` (0.0–1.0) into the range
- * `say`'s inline `[[volm n]]` command accepts. Web Speech and `say` both use
- * 0.0 = silent, 1.0 = full, so this is a straight clamp (no rescaling).
- *
- * - undefined / non-finite → 1.0 (full volume; matches `say`'s default so a
- *   missing setting never accidentally mutes the user).
- * - <0 → 0, >1 → 1.
- *
- * Pinned by tts-native.test.ts so a future tweak to the clamp is visible.
+ * Clamp a Web-Speech-style `volume` (0.0–1.0) to the same range. macOS `say`'s
+ * inline `[[volm n]]` uses 0.0 = silent, 1.0 = full, so it's a straight clamp.
+ * undefined / non-finite → 1.0 (full volume; a missing setting never mutes).
+ * Pinned by tts-native.test.ts.
  */
 export function clampSayVolume(volume: number | undefined): number {
   if (typeof volume !== 'number' || !Number.isFinite(volume)) return 1.0;
@@ -136,24 +117,18 @@ export function clampSayVolume(volume: number | undefined): number {
 }
 
 /**
- * v0.1.76 — build the actual string handed to `say`, prepending the inline
- * `[[volm n]]` tune-management command so the utterance is spoken at the
- * requested volume. This is THE mechanism that makes the volume slider work
- * on the native (genuinely-hidden-window) fallback path — `say` has no
- * `--volume` flag, but it honours `[[volm n]]` embedded in the text.
+ * macOS `say` text builder — prepend the inline `[[volm n]]` tune-management
+ * command so the utterance plays at the requested volume (`say` has no
+ * `--volume` flag but honours `[[volm n]]` embedded in the spoken text). We
+ * always emit it (even at 1.0) so behaviour is explicit + testable. Rounded to
+ * 2 dp to keep the embedded command tidy in logs.
  *
- * We always emit the command (even at 1.0) so behaviour is explicit and
- * testable; `[[volm 1.0]]` is a no-op loudness-wise. The trailing space
- * separates the command from the spoken words. Rounded to 2 dp to keep the
- * embedded command tidy in the logs.
- *
- * NOTE: `say` interprets `[[...]]` sequences anywhere in the text as
- * commands, so in theory a chat message containing literal `[[volm 9]]`
- * could inject its own volume. In practice chat text almost never contains
- * that exact bracket syntax, and the worst case is a viewer making their own
- * message louder/quieter — not a security issue. We accept that rather than
- * escaping, which would risk mangling legitimate `[[` text. If abuse ever
- * shows up, the guard is to strip `[[...]]` from `text` here.
+ * NOTE: `say` treats any `[[...]]` in the text as a command, so a chat message
+ * containing literal `[[volm 9]]` could change its own volume. That's a cosmetic
+ * abuse (viewer makes their own line louder/quieter), NOT a security issue —
+ * `say` runs `[[...]]` as TUNE commands, never shell. We accept it rather than
+ * escaping (which would risk mangling legitimate `[[` text). The guard if abuse
+ * ever appears is to strip `[[...]]` from `text` here.
  */
 export function buildSayText(text: string, volume: number | undefined): string {
   const v = clampSayVolume(volume);
@@ -162,106 +137,331 @@ export function buildSayText(text: string, volume: number | undefined): string {
 }
 
 /**
- * Parsed entry from `say -v "?"`. The `sample` is the demo phrase the
- * voice ships with (e.g. "Hello! My name is Daniel.") — useful as a
- * preview-button accent if we ever wire one. `lang` is the locale
- * identifier (`en_GB`, `fr_CA`, etc.) — the `_` separator is what `say`
- * uses on macOS; the Web Speech API uses `-` (e.g. `en-GB`). We keep the
- * raw `say` form here.
+ * Map unitless `volume` (0.0–1.0) → an integer percentage (0–100). Used by the
+ * Windows (System.Speech `$s.Volume`) and the Linux `espeak -a` (0..200, we use
+ * 0..100 of its range) / `spd-say -i` (we map 0-1 → -100..+100) paths. Integer
+ * so it splices into the PowerShell script as a plain digit run (see security
+ * note). Pinned by tts-native.test.ts.
  */
-export interface NativeVoice {
-  /** Display name including any qualifier — e.g. `Daniel`, `Eddy (English (UK))`. */
-  name: string;
-  /** Locale identifier in `say` form, e.g. `en_GB`, `fr_FR`. */
-  lang: string;
-  /** Demo phrase shipped by macOS for this voice. May be empty. */
-  sample: string;
+export function volumeToPercent(volume: number | undefined): number {
+  const v = clampSayVolume(volume);
+  return Math.round(v * 100);
 }
 
 /**
- * Per-utterance enqueue options. `messageId` is propagated into the JSONL
- * log so we can correlate a queue entry through to its `say` exit, which
- * mirrors what the v0.1.41 renderer-side log already does.
- *
- * `voice` is optional — falls through to whatever the engine's current
- * settings say. `rate` is the Web-Speech-style unitless rate, the same
- * value the Settings slider produces.
+ * Map unitless `rate` (0.5–2.0 typical) → the Windows System.Speech rate scale
+ * (-10..+10, where 0 is normal). We treat 1.0 → 0, <1 slower (negative), >1
+ * faster (positive), linear: rate 0.5 → -5, rate 2.0 → +10. Clamped + integer
+ * (so it's a safe literal in the PS script). Pinned by tests.
  */
+export function rateToWindowsRate(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return 0;
+  // 1.0 = 0; scale so 2.0→+10 and 0.5→-5 (10 units per 1.0 above, mirrored).
+  const scaled = Math.round((rate - 1) * 10);
+  if (scaled < -10) return -10;
+  if (scaled > 10) return 10;
+  return scaled;
+}
+
+/**
+ * Map unitless `volume`/`rate` → speech-dispatcher's -100..+100 scales used by
+ * `spd-say` (-i intensity for volume, -r rate where 0 is normal). volume 0-1 →
+ * 0..100 is too quiet relative to its default of 0, so we map 0→-100, 1→0
+ * (speech-dispatcher 0 is "normal/full", negative is quieter). rate 1.0→0,
+ * 0.5→-50, 2.0→+100. Clamped to [-100,100]. Pinned by tests.
+ */
+export function volumeToSpdIntensity(volume: number | undefined): number {
+  const v = clampSayVolume(volume); // 0..1
+  // 0 → -100 (quietest spd allows), 1 → 0 (spd "normal" == full).
+  return Math.round(-100 + v * 100);
+}
+export function rateToSpdRate(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return 0;
+  const scaled = Math.round((rate - 1) * 100);
+  if (scaled < -100) return -100;
+  if (scaled > 100) return 100;
+  return scaled;
+}
+
+// ============================================================================
+// Shared types
+// ============================================================================
+
+/**
+ * Parsed voice entry. `sample` is the demo phrase a voice ships with (macOS
+ * only; empty elsewhere). `lang` is the locale identifier in whatever shape the
+ * platform reports (`en_GB` on `say`, `en-GB`/`en` on espeak; may be empty on
+ * Windows where System.Speech reports culture separately — we best-effort it).
+ */
+export interface NativeVoice {
+  /** Display name — e.g. `Daniel`, `Microsoft Zira Desktop`, `english-us`. */
+  name: string;
+  /** Locale identifier in the platform's native shape. May be empty. */
+  lang: string;
+  /** Demo phrase shipped by the OS for this voice. Usually empty off macOS. */
+  sample: string;
+}
+
+/** Per-utterance enqueue options. `messageId` is propagated into the JSONL log. */
 export interface NativeEnqueueOpts {
   voice?: string;
+  /** Unitless rate (Settings slider value). */
   rate?: number;
-  /**
-   * Per-Web-Speech volume (0.0–1.0). v0.1.76 — NOW APPLIED via the inline
-   * `[[volm n]]` command (see `buildSayText`); was informational-only in
-   * v0.1.42–v0.1.75. Falls back to the engine's current settings volume
-   * when omitted.
-   */
+  /** Unitless volume 0.0–1.0 (Settings slider value). */
   volume?: number;
   messageId?: string;
 }
 
-/**
- * Subset of Settings.tts the native engine actually cares about. Pulled
- * out so the caller can update only the relevant fields without having
- * to re-construct the engine.
- */
+/** Subset of Settings.tts the native engine consumes. */
 export interface NativeTtsSettings {
   voiceURI?: string;
   rate: number;
   volume: number;
 }
 
-/**
- * Hook the engine uses to persist lifecycle events. Wired to the same
- * `appendTtsLog` helper in main.ts that the renderer-side log uses, so
- * native + browser engine events land in one file in event-time order.
- * Best-effort — a logging failure must never break playback.
- */
-export type NativeTtsLogger = (
-  event: TtsLogEvent['event'] | NativeTtsEventName,
-  data?: Record<string, unknown>,
-) => void;
-
 export type NativeTtsEventName =
   | 'native_speak_start'
   | 'native_speak_end'
   | 'native_speak_error'
   | 'native_speak_killed'
-  | 'native_queue_size';
+  | 'native_queue_size'
+  | 'native_no_engine';
+
+export type NativeTtsLogger = (
+  event: TtsLogEvent['event'] | NativeTtsEventName,
+  data?: Record<string, unknown>,
+) => void;
 
 /**
- * Spawner abstraction so unit tests can substitute a fake `say` without
- * touching the real subprocess. Production code calls
- * `spawn('say', args)`; tests pass a stub that returns a synthetic
- * child-process-shaped object.
- *
- * The shape mirrors only the bits we actually use from the real Node
- * child_process type — `kill`, `on('exit')`, `on('error')`, the `pid`.
+ * Spawned-child shape — only the bits we use from Node's ChildProcess, so unit
+ * tests can substitute a fake without touching real subprocesses.
  */
 export interface NativeSpawnedChild extends EventEmitter {
   pid?: number | undefined;
   kill(signal?: NodeJS.Signals | number): boolean;
 }
 
-export type NativeSpawner = (args: string[]) => NativeSpawnedChild;
+/**
+ * How the engine spawns a child. PRODUCTION ALWAYS uses an args array with
+ * `shell:false` (never `shell:true`) so untrusted text in argv can't be parsed
+ * by a shell. `env` is merged onto `process.env` — the Windows adapter uses it
+ * to pass base64 text/voice OUT OF the script string entirely (security note at
+ * top of file). Tests pass a stub that records the call + returns a fake child.
+ */
+export interface NativeSpawnArgs {
+  command: string;
+  args: string[];
+  /** Extra env vars merged onto process.env for the child. */
+  env?: Record<string, string>;
+}
+export type NativeSpawner = (spec: NativeSpawnArgs) => NativeSpawnedChild;
 
-const defaultSpawner: NativeSpawner = (args) =>
-  nodeProc.spawn('say', args, { stdio: ['ignore', 'ignore', 'pipe'] }) as unknown as NativeSpawnedChild;
+const defaultSpawner: NativeSpawner = (spec) =>
+  // SECURITY: shell:false (Node default) — argv passed verbatim, no shell
+  // parsing of the (possibly attacker-controlled) text/voice argv entries.
+  nodeProc.spawn(spec.command, spec.args, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    shell: false,
+    env: spec.env ? { ...process.env, ...spec.env } : process.env,
+  }) as unknown as NativeSpawnedChild;
 
 interface QueueEntry {
   text: string;
   opts: NativeEnqueueOpts;
 }
 
+// ============================================================================
+// Platform adapter — builds the spawn spec + parses the voice list per OS.
+// ============================================================================
+
+/**
+ * A platform adapter knows how to (a) build the spawn spec for one utterance
+ * and (b) enumerate installed voices. `id` is for logging. The engine is
+ * platform-agnostic and just drives whichever adapter `detectPlatformAdapter()`
+ * returns for the current OS (or `null` when no usable engine exists).
+ */
+export interface PlatformAdapter {
+  id: 'macos-say' | 'windows-sapi' | 'linux-spd' | 'linux-espeak';
+  /** Build the spawn spec for one utterance. Text/voice handled SAFELY. */
+  buildSpeakSpec(args: {
+    text: string;
+    voice?: string;
+    rate: number;
+    volume: number;
+  }): NativeSpawnArgs;
+  /** Enumerate installed voices. Spawns the platform's list command + parses. */
+  listVoices(): Promise<NativeVoice[]>;
+}
+
+// ---------- macOS: `say` ----------------------------------------------------
+const macosSayAdapter: PlatformAdapter = {
+  id: 'macos-say',
+  buildSpeakSpec({ text, voice, rate, volume }) {
+    const wpm = rateToWpm(rate);
+    // Volume rides inline in the spoken text via `[[volm n]]`.
+    const spoken = buildSayText(text, volume);
+    const args: string[] = [];
+    if (voice) args.push('-v', voice);
+    args.push('-r', String(wpm));
+    // `--` ends option parsing; everything after is the literal text argv slot.
+    // With shell:false this text cannot inject a shell command.
+    args.push('--', spoken);
+    return { command: 'say', args };
+  },
+  listVoices() {
+    return spawnCollectStdout('say', ['-v', '?']).then(parseSayVoiceList);
+  },
+};
+
+// ---------- Windows: PowerShell System.Speech --------------------------------
+/**
+ * The PowerShell speak script. It contains NO interpolated text or voice — it
+ * reads BOTH from base64-encoded env vars and decodes them in-process, so
+ * attacker-controlled text can never be parsed as PowerShell (see top-of-file
+ * security note). Only the numeric volume/rate are spliced as plain integers.
+ * `RCPP_TTS_VOICE` is optional: when empty we skip SelectVoice (system default).
+ */
+function windowsSpeakScript(volumePercent: number, winRate: number): string {
+  // volumePercent ∈ [0,100], winRate ∈ [-10,10], both integers we generated.
+  return [
+    'Add-Type -AssemblyName System.Speech;',
+    '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;',
+    `$s.Volume = ${volumePercent};`,
+    `$s.Rate = ${winRate};`,
+    // Decode the UTF-8 text from base64 in the env var (NOT a script literal).
+    '$txt = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:RCPP_TTS_TEXT));',
+    '$vb64 = $env:RCPP_TTS_VOICE;',
+    'if ($vb64) {',
+    '  $vname = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($vb64));',
+    // SelectVoice can throw if the named voice was uninstalled — swallow and
+    // fall back to the default voice rather than crashing the subprocess.
+    '  try { $s.SelectVoice($vname) } catch { }',
+    '}',
+    '$s.Speak($txt);',
+  ].join(' ');
+}
+
+const windowsSapiAdapter: PlatformAdapter = {
+  id: 'windows-sapi',
+  buildSpeakSpec({ text, voice, rate, volume }) {
+    const volPct = volumeToPercent(volume);
+    const winRate = rateToWindowsRate(rate);
+    const script = windowsSpeakScript(volPct, winRate);
+    // Pass text + voice via env vars as base64 — they NEVER enter the -Command
+    // string, so no PowerShell metacharacter in chat text can ever execute.
+    const env: Record<string, string> = {
+      RCPP_TTS_TEXT: Buffer.from(text, 'utf8').toString('base64'),
+      RCPP_TTS_VOICE: voice ? Buffer.from(voice, 'utf8').toString('base64') : '',
+    };
+    return {
+      command: 'powershell',
+      args: ['-NoProfile', '-NonInteractive', '-Command', script],
+      env,
+    };
+  },
+  listVoices() {
+    // Emit "name|culture" per line so the parser keeps the lang column.
+    const script = [
+      'Add-Type -AssemblyName System.Speech;',
+      '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;',
+      '$s.GetInstalledVoices() | ForEach-Object {',
+      '  $vi = $_.VoiceInfo;',
+      '  Write-Output ("{0}|{1}" -f $vi.Name, $vi.Culture)',
+      '}',
+    ].join(' ');
+    return spawnCollectStdout('powershell', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      script,
+    ]).then(parseWindowsVoiceList);
+  },
+};
+
+// ---------- Linux: spd-say (preferred) --------------------------------------
+const linuxSpdAdapter: PlatformAdapter = {
+  id: 'linux-spd',
+  buildSpeakSpec({ text, voice, rate, volume }) {
+    const args: string[] = ['-w']; // -w = wait for speech to complete
+    args.push('-r', String(rateToSpdRate(rate)));
+    args.push('-i', String(volumeToSpdIntensity(volume)));
+    if (voice) args.push('-t', voice); // -t = voice "type"/name
+    args.push('--', text); // `--` then literal text; shell:false → no injection
+    return { command: 'spd-say', args };
+  },
+  listVoices() {
+    return spawnCollectStdout('spd-say', ['-L']).then(parseSpdVoiceList);
+  },
+};
+
+// ---------- Linux: espeak-ng / espeak (fallback) ----------------------------
+function makeEspeakAdapter(bin: 'espeak-ng' | 'espeak'): PlatformAdapter {
+  return {
+    id: 'linux-espeak',
+    buildSpeakSpec({ text, voice, rate, volume }) {
+      const args: string[] = [];
+      // espeak -a amplitude 0..200 (100 = default). Map 0..1 → 0..200.
+      args.push('-a', String(Math.round(clampSayVolume(volume) * 200)));
+      args.push('-s', String(rateToWpm(rate))); // -s words/min
+      if (voice) args.push('-v', voice);
+      args.push('--', text); // literal text; shell:false → no injection
+      return { command: bin, args };
+    },
+    listVoices() {
+      return spawnCollectStdout(bin, ['--voices']).then(parseEspeakVoiceList);
+    },
+  };
+}
+
+/**
+ * Pick the adapter for the current OS, or null when no usable engine exists.
+ * Linux probes `spd-say` first (best quality / most installs), then
+ * `espeak-ng`, then `espeak`. `which <bin>` is the probe — synchronous so the
+ * engine can decide its adapter once at construction. Injectable for tests via
+ * `NativeTtsEngineOptions.adapter`.
+ */
+export function detectPlatformAdapter(
+  platform: NodeJS.Platform = process.platform,
+  whichSync: (bin: string) => boolean = defaultWhichSync,
+): PlatformAdapter | null {
+  if (platform === 'darwin') return macosSayAdapter;
+  if (platform === 'win32') return windowsSapiAdapter;
+  if (platform === 'linux') {
+    if (whichSync('spd-say')) return linuxSpdAdapter;
+    if (whichSync('espeak-ng')) return makeEspeakAdapter('espeak-ng');
+    if (whichSync('espeak')) return makeEspeakAdapter('espeak');
+    return null; // no speech engine present → engine no-ops (logged once)
+  }
+  return null; // unknown platform → no-op
+}
+
+/** `which <bin>` returning true when the binary is on PATH. Best-effort. */
+function defaultWhichSync(bin: string): boolean {
+  try {
+    const probe = process.platform === 'win32' ? 'where' : 'which';
+    const r = nodeProc.spawnSync(probe, [bin], { stdio: 'ignore', shell: false });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================================
+// The engine
+// ============================================================================
+
 export interface NativeTtsEngineOptions {
-  /** Initial Settings.tts subset. Required so the first enqueue has a defined voice/rate. */
+  /** Initial Settings.tts subset so the first enqueue has a defined voice/rate. */
   settings: NativeTtsSettings;
-  /** Log sink. Wired to `appendTtsLog` in production; left undefined in tests. */
+  /** Log sink. Wired to `appendTtsLog` in production; undefined in tests. */
   log?: NativeTtsLogger;
   /** Override spawn for unit tests. */
   spawner?: NativeSpawner;
-  /** Override the voice-list spawner (also `say -v ?`). Tests can stub. */
-  voiceListProbe?: () => Promise<NativeVoice[]>;
+  /**
+   * Override the platform adapter (tests inject a fake; production lets
+   * `detectPlatformAdapter()` choose). `null` explicitly = "no engine" path.
+   */
+  adapter?: PlatformAdapter | null;
 }
 
 export class NativeTtsEngine {
@@ -270,58 +470,65 @@ export class NativeTtsEngine {
   private settings: NativeTtsSettings;
   private readonly log: NativeTtsLogger;
   private readonly spawner: NativeSpawner;
-  private readonly voiceListProbe: () => Promise<NativeVoice[]>;
-  /** Cached `say -v "?"` parse. First call populates; subsequent calls hit cache. */
+  /** Chosen platform adapter, or null when no usable OS engine exists. */
+  private readonly adapter: PlatformAdapter | null;
+  /** Cached voice list (does not change at runtime). */
   private voicesCache: NativeVoice[] | undefined;
-  /**
-   * Set to `true` while a `cancel()` is in flight so the exit handler
-   * for the killed subprocess doesn't pop the next queue entry. Cleared
-   * on the next enqueue / explicit drain.
-   */
+  /** True while a cancel() is in flight so the killed child's exit doesn't pop. */
   private cancelling = false;
-  /** Monotonic counter used to tag log entries when no messageId is supplied. */
+  /** Monotonic tag for log entries when no messageId is supplied. */
   private speakSeq = 0;
+  /** Guard so the "no speech engine installed" warning only logs once. */
+  private warnedNoEngine = false;
 
   constructor(opts: NativeTtsEngineOptions) {
     this.settings = opts.settings;
     this.log = opts.log ?? (() => undefined);
     this.spawner = opts.spawner ?? defaultSpawner;
-    this.voiceListProbe = opts.voiceListProbe ?? defaultVoiceListProbe;
+    // `adapter` defaults to auto-detect; an explicit `null` (tests / no-engine
+    // platforms) keeps the engine alive but makes every speak a logged no-op.
+    this.adapter = opts.adapter !== undefined ? opts.adapter : detectPlatformAdapter();
+  }
+
+  /** Which backend the engine resolved to (for diagnostics/tests). null = none. */
+  get adapterId(): PlatformAdapter['id'] | null {
+    return this.adapter ? this.adapter.id : null;
   }
 
   /**
-   * Push text onto the queue. If nothing is speaking we kick off `say`
-   * immediately; otherwise the FIFO drain handler does it when the
-   * current `say` exits.
-   *
-   * Empty / whitespace-only text is dropped silently — `say` accepts it
-   * but produces no audio and just wastes a fork.
+   * Push text onto the queue. If nothing's speaking we kick off immediately;
+   * else the FIFO drain handler does it when the current child exits.
+   * Empty / whitespace-only text is dropped silently. If there's NO platform
+   * engine, we log once + no-op (never crash — there is no browser fallback).
    */
   enqueue(text: string, opts: NativeEnqueueOpts = {}): void {
     if (typeof text !== 'string') return;
     const trimmed = text.trim();
     if (!trimmed) return;
+    if (!this.adapter) {
+      // No `say`/PowerShell/spd-say/espeak available. Warn ONCE so the user can
+      // install one, then silently drop subsequent utterances. We deliberately
+      // do NOT throw — a missing voice engine must never break chat handling.
+      if (!this.warnedNoEngine) {
+        this.warnedNoEngine = true;
+        this.log('native_no_engine', {
+          platform: process.platform,
+          note: 'no system speech engine found (need say / PowerShell / spd-say / espeak)',
+        });
+      }
+      return;
+    }
     this.queue.push({ text, opts });
     this.log('native_queue_size', { queue_size: this.queue.length });
-    if (!this.current) {
-      this.drain();
-    }
+    if (!this.current) this.drain();
   }
 
-  /**
-   * Update settings used for future utterances. Does NOT mutate the
-   * currently-running `say` subprocess — that one finishes with whatever
-   * it was launched with. Chat messages are short so the latency cost of
-   * waiting for the current utterance is negligible.
-   */
+  /** Update settings for FUTURE utterances. Does not mutate the running child. */
   updateSettings(settings: NativeTtsSettings): void {
     this.settings = settings;
   }
 
-  /**
-   * SIGTERM the current `say` subprocess + clear the queue. Idempotent.
-   * Safe to call on a quiescent engine.
-   */
+  /** SIGTERM the current child + clear the queue. Idempotent. */
   cancel(): void {
     const cleared = this.queue.length;
     this.queue = [];
@@ -338,20 +545,35 @@ export class NativeTtsEngine {
       }
       this.log('native_speak_killed', { pid, reason: 'cancel' });
     }
-    if (cleared > 0) {
-      this.log('native_queue_size', { queue_size: 0, cleared });
-    }
+    if (cleared > 0) this.log('native_queue_size', { queue_size: 0, cleared });
   }
 
   /**
-   * Return the cached `say -v "?"` voice list, populating the cache on
-   * first call. The list does not change at runtime (macOS would need a
-   * re-login to install new voices); a session-lifetime cache is fine.
+   * Speak a one-off PREVIEW utterance for the given voice — used by the
+   * Settings voice-preview button (over IPC). Cancels any in-flight preview /
+   * queued chat first so rapid dropdown changes don't pile up overlapping
+   * samples, then enqueues "Hello, my name is <voice>" at the current
+   * rate/volume. Returns the spoken text (for tests). No-ops to the returned
+   * string if no engine is present.
    */
+  preview(voiceURI: string | undefined): string {
+    const displayName = voiceURI ?? 'system default';
+    const text = `Hello, my name is ${displayName}`;
+    this.cancel();
+    this.enqueue(text, {
+      voice: voiceURI,
+      rate: this.settings.rate,
+      volume: this.settings.volume,
+    });
+    return text;
+  }
+
+  /** Cached voice list, populated on first call. Empty array on failure. */
   async getAvailableVoices(): Promise<NativeVoice[]> {
     if (this.voicesCache) return this.voicesCache;
+    if (!this.adapter) return [];
     try {
-      const list = await this.voiceListProbe();
+      const list = await this.adapter.listVoices();
       this.voicesCache = list;
       return list;
     } catch (err) {
@@ -363,18 +585,17 @@ export class NativeTtsEngine {
     }
   }
 
-  /** Force a re-probe of `say -v "?"` (e.g. after the user installs a new voice). */
+  /** Force a re-probe of the voice list (e.g. after a new voice is installed). */
   async refreshVoices(): Promise<NativeVoice[]> {
     this.voicesCache = undefined;
     return this.getAvailableVoices();
   }
 
-  /** Inspect-only: current queue depth. Used by tests + diagnostics. */
+  /** Inspect-only: current queue depth. */
   get queueDepth(): number {
     return this.queue.length;
   }
-
-  /** Inspect-only: is a `say` subprocess currently running. */
+  /** Inspect-only: is a subprocess currently running. */
   get isSpeaking(): boolean {
     return this.current !== null;
   }
@@ -385,47 +606,45 @@ export class NativeTtsEngine {
     if (this.current) return;
     const next = this.queue.shift();
     if (!next) return;
+    if (!this.adapter) return; // belt-and-suspenders; enqueue already guards
     this.cancelling = false;
     const messageId = next.opts.messageId;
     const voice = next.opts.voice ?? this.settings.voiceURI;
     const rate = next.opts.rate ?? this.settings.rate;
-    const wpm = rateToWpm(rate);
-    // v0.1.76 — resolve volume from the per-utterance opt first, then the
-    // engine's current settings (so a slider change with no new enqueue
-    // still applies to the next message), then default to full. Prepend the
-    // inline `[[volm n]]` command to the text — this is how the volume slider
-    // reaches the native `say` path. See `buildSayText` / `clampSayVolume`.
+    // Resolve volume per-utterance first, then engine settings, then full.
     const volume = clampSayVolume(next.opts.volume ?? this.settings.volume);
-    const spokenText = buildSayText(next.text, volume);
-    const args: string[] = [];
-    if (voice) {
-      args.push('-v', voice);
-    }
-    args.push('-r', String(wpm));
-    args.push('--', spokenText);
+
+    // Build the per-platform spawn spec. The adapter owns the SAFE handling of
+    // the (untrusted) text + voice — args array everywhere, env-var base64 on
+    // Windows. No string interpolation of message text into a shell/PS command.
+    const spec = this.adapter.buildSpeakSpec({ text: next.text, voice, rate, volume });
+
     const seq = ++this.speakSeq;
     const startedAt = Date.now();
     this.log('native_speak_start', {
       message_id: messageId,
       seq,
+      engine: this.adapter.id,
       voice: voice ?? null,
-      rateWPM: wpm,
-      // Log the resolved volume so a forensic grep confirms the slider value
-      // actually reached the subprocess (the #1 thing Ethan wants verifiable).
+      // Resolved volume/rate logged so a forensic grep confirms the slider
+      // values actually reached the subprocess (what Ethan wants verifiable).
       volume,
+      rate,
       queue_size: this.queue.length,
     });
+
     let subproc: NativeSpawnedChild;
     try {
-      subproc = this.spawner(args);
+      subproc = this.spawner(spec);
     } catch (err) {
       this.log('native_speak_error', {
         message_id: messageId,
         seq,
         stage: 'spawn',
+        engine: this.adapter.id,
         error: String((err as Error)?.message ?? err),
       });
-      // Pop next entry; never let a single bad spawn wedge the queue.
+      // Never let a single bad spawn wedge the queue.
       this.current = null;
       setImmediate(() => this.drain());
       return;
@@ -451,22 +670,17 @@ export class NativeTtsEngine {
           ...payload,
         });
       }
-      // If a cancel() raced this exit, don't pop the next entry — the
-      // queue has already been cleared and the user explicitly asked us
-      // to stop. The flag resets on the next enqueue.
+      // If a cancel() raced this exit, don't pop the next entry.
       if (this.cancelling) {
         this.cancelling = false;
         return;
       }
-      // Schedule next drain on next tick so we don't grow the stack on
-      // a deep queue.
       setImmediate(() => this.drain());
     };
     subproc.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
       settle('exit', {
         exitCode: code,
         signal,
-        // SIGTERM from cancel() arrives here too; flag it for log clarity.
         killed: signal === 'SIGTERM' || this.cancelling,
       });
     });
@@ -476,22 +690,21 @@ export class NativeTtsEngine {
   }
 }
 
+// ============================================================================
+// stdout collection + per-platform voice-list parsers
+// ============================================================================
+
 /**
- * Production voice-list probe. Spawns `say -v "?"`, parses each line.
- * The output column layout is fixed-width-ish but voice names can
- * contain spaces and parenthesised qualifiers — we split by recognising
- * the locale token (e.g. `en_US`, `fr_CA`, `zh-CN`) which is the only
- * column with consistent shape. The `#` after the locale is the start
- * of the demo phrase.
- *
- * Example lines:
- *   Daniel              en_GB    # Hello! My name is Daniel.
- *   Eddy (English (UK)) en_GB    # Hello! My name is Eddy.
- *   Reed (English (US)) en_US    # Hello! My name is Reed.
+ * Spawn `command args`, collect stdout, resolve it (reject on non-zero exit or
+ * spawn error). Used by every adapter's voice-list probe. shell:false — the
+ * args here are all our own constants, but we keep the safe default uniform.
  */
-async function defaultVoiceListProbe(): Promise<NativeVoice[]> {
+function spawnCollectStdout(command: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    const subproc = nodeProc.spawn('say', ['-v', '?'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const subproc = nodeProc.spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+    });
     let stdout = '';
     let stderr = '';
     subproc.stdout?.on('data', (b) => {
@@ -503,30 +716,25 @@ async function defaultVoiceListProbe(): Promise<NativeVoice[]> {
     subproc.on('error', (err) => reject(err));
     subproc.on('exit', (code) => {
       if (code !== 0) {
-        reject(new Error(`say -v "?" exited ${code}: ${stderr.trim()}`));
+        reject(new Error(`${command} ${args.join(' ')} exited ${code}: ${stderr.trim()}`));
         return;
       }
-      try {
-        resolve(parseSayVoiceList(stdout));
-      } catch (err) {
-        reject(err);
-      }
+      resolve(stdout);
     });
   });
 }
 
 /**
- * Pure parser for `say -v "?"` output. Exported for unit testing without
- * spawning anything. Lines that don't match the expected shape are
- * silently dropped — `say` occasionally emits stray header/footer lines
- * on certain macOS builds we don't want to choke on.
+ * Parse `say -v "?"` output (macOS). Lines look like:
+ *   Daniel              en_GB    # Hello! My name is Daniel.
+ *   Eddy (English (UK)) en_GB    # Hello! My name is Eddy.
+ * Voice names contain spaces/parens, so we anchor on the locale token (the only
+ * column with a consistent `xx_YY` shape). Stray header/footer lines are
+ * dropped. Exported for unit testing without spawning.
  */
 export function parseSayVoiceList(stdout: string): NativeVoice[] {
   const out: NativeVoice[] = [];
   const lines = stdout.split(/\r?\n/);
-  // Locale token is the column we anchor on. macOS uses `_` separators
-  // (e.g. `en_GB`); a small number of voices use plain ISO codes
-  // (`zh-CN`, `pt-BR` on older macOS) — accept both.
   const localeRe = /\s([a-z]{2,3}[_-][A-Z]{2,4})\s/;
   for (const raw of lines) {
     const line = raw.replace(/\s+$/u, '');
@@ -538,9 +746,6 @@ export function parseSayVoiceList(stdout: string): NativeVoice[] {
     if (!name) continue;
     const lang = localeMatch[1];
     const afterLocale = line.slice(localeIdx + localeMatch[0].length);
-    // The remainder starts with "# <sample>" — strip the `#` and any
-    // leading whitespace. If the `#` is missing (some macOS builds
-    // truncate it), keep whatever's left as-is.
     const sample = afterLocale.replace(/^\s*#\s?/, '').trim();
     out.push({ name, lang, sample });
   }
@@ -548,10 +753,76 @@ export function parseSayVoiceList(stdout: string): NativeVoice[] {
 }
 
 /**
- * Helper for unit-testing the integration with the renderer-side
- * Settings shape. Given a full `Settings['tts']` object, extract the
- * subset the native engine consumes.
+ * Parse the Windows voice-list output. Our PS script emits one `name|culture`
+ * per line (e.g. `Microsoft Zira Desktop|en-US`). Lines without a `|` are
+ * dropped. Exported for unit testing.
  */
+export function parseWindowsVoiceList(stdout: string): NativeVoice[] {
+  const out: NativeVoice[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const pipe = line.indexOf('|');
+    if (pipe < 0) continue;
+    const name = line.slice(0, pipe).trim();
+    const lang = line.slice(pipe + 1).trim();
+    if (!name) continue;
+    out.push({ name, lang, sample: '' });
+  }
+  return out;
+}
+
+/**
+ * Parse `spd-say -L` output (Linux speech-dispatcher). Format is a header line
+ * then rows like:
+ *   en-US  espeak-ng  male1
+ * The FIRST whitespace-delimited token that looks like a voice name varies by
+ * module; spd-say -L actually prints columns "NAME LANGUAGE VARIANT". We take
+ * the first column as the name and the second as lang. Header line ("Name ...")
+ * and blank lines are dropped. Exported for unit testing.
+ */
+export function parseSpdVoiceList(stdout: string): NativeVoice[] {
+  const out: NativeVoice[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    // Skip an obvious header row.
+    if (/^name\b/i.test(line)) continue;
+    const cols = line.split(/\s+/);
+    if (cols.length === 0) continue;
+    const name = cols[0];
+    const lang = cols[1] ?? '';
+    if (!name) continue;
+    out.push({ name, lang, sample: '' });
+  }
+  return out;
+}
+
+/**
+ * Parse `espeak --voices` output (Linux). Columns are:
+ *   Pty Language Age/Gender VoiceName          File          Other
+ *     5  en-us          M  english-us          en-us         (en 5)
+ * Header row starts with "Pty". We take VoiceName (4th column) as the name and
+ * Language (2nd column) as lang. Exported for unit testing.
+ */
+export function parseEspeakVoiceList(stdout: string): NativeVoice[] {
+  const out: NativeVoice[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/u, '');
+    if (!line.trim()) continue;
+    if (/^\s*Pty\b/i.test(line)) continue; // header
+    const cols = line.trim().split(/\s+/);
+    // cols: [Pty, Language, Age/Gender, VoiceName, File, ...]
+    if (cols.length < 4) continue;
+    const lang = cols[1] ?? '';
+    const name = cols[3] ?? '';
+    if (!name) continue;
+    out.push({ name, lang, sample: '' });
+  }
+  return out;
+}
+
+/** Extract the Settings.tts subset the native engine consumes. */
 export function ttsToNativeSettings(tts: Settings['tts']): NativeTtsSettings {
   return {
     voiceURI: tts.voiceURI,

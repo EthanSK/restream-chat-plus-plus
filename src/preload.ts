@@ -13,7 +13,6 @@ import type {
   TtsLogEvent,
   TtsNativeEnqueuePayload,
   TtsNativeSettingsPayload,
-  TtsSpeakBrowserPayload,
   UpdateInfo,
 } from './shared/types';
 
@@ -269,23 +268,28 @@ const api = {
     }
   },
   /**
-   * v0.1.42 native-`say` engine bindings. The renderer uses these instead
-   * of `window.speechSynthesis` when `settings.tts.engine === 'native'`.
+   * Native OS-voice engine bindings (main process). As of v0.1.81 this is the
+   * ONLY speech path — the renderer Web-Speech engine was removed. The renderer
+   * only touches these for the Settings drawer (voice list + preview); incoming
+   * chat is decided + spoken entirely in main and never round-trips here.
    *
-   * - `enqueue` / `cancel` / `updateSettings` are fire-and-forget — the
-   *   main-process queue accepts the message and the renderer never
-   *   awaits an ack. This matches the v0.1.41 browser-engine ergonomics
-   *   (renderer-side queue mutations are also sync).
-   * - `getVoices` is async — returns the parsed `say -v "?"` list as
-   *   `NativeVoiceWire[]`. Cached in main, so subsequent calls during
-   *   the same session resolve immediately.
+   * - `getVoices` is async — returns the parsed per-platform voice list as
+   *   `NativeVoiceWire[]` (cached in main; macOS `say -v "?"` / Windows
+   *   System.Speech / Linux spd-say|espeak).
+   * - `preview` (v0.1.81) is fire-and-forget — asks main to speak a sample
+   *   phrase for the given voice through the native engine (the Settings
+   *   voice-preview button). Pass the voice name, or undefined for the OS
+   *   default voice.
+   * - `enqueue` / `cancel` / `updateSettings` are retained fire-and-forget
+   *   primitives (used by main itself + available if a future renderer feature
+   *   needs them); the renderer no longer calls enqueue for chat playback.
    */
   ttsNative: {
     enqueue: (payload: TtsNativeEnqueuePayload): void => {
       try {
         ipcRenderer.send(IPC.TTS_NATIVE_ENQUEUE, payload);
       } catch {
-        /* never crash the renderer over a logging/queue IPC */
+        /* never crash the renderer over a queue IPC */
       }
     },
     cancel: (): void => {
@@ -304,20 +308,17 @@ const api = {
     },
     getVoices: (): Promise<NativeVoiceWire[]> =>
       ipcRenderer.invoke(IPC.TTS_NATIVE_GET_VOICES),
-  },
-  /**
-   * v0.1.76 (Ethan voice 4414) — subscribe to MAIN → renderer browser-speak
-   * commands. The main-process TtsDispatcher decides whether/what to speak and
-   * which backend to use; when it picks the BROWSER backend (window
-   * visible/covered) it pushes `IPC.TTS_SPEAK_BROWSER` with a full settings
-   * snapshot. The renderer's thin executor (App.tsx) speaks that ONE utterance
-   * via Web Speech, honouring volume/voice/rate/PITCH from the payload. The
-   * renderer no longer decides anything — it just executes.
-   */
-  onSpeakBrowser: (cb: (payload: TtsSpeakBrowserPayload) => void): Unsub => {
-    const h = (_: unknown, payload: TtsSpeakBrowserPayload) => cb(payload);
-    ipcRenderer.on(IPC.TTS_SPEAK_BROWSER, h);
-    return () => ipcRenderer.removeListener(IPC.TTS_SPEAK_BROWSER, h);
+    /**
+     * v0.1.81 — preview a voice through the native engine. `voiceURI` is the
+     * platform voice name (undefined = OS default). Fire-and-forget.
+     */
+    preview: (voiceURI: string | undefined): void => {
+      try {
+        ipcRenderer.send(IPC.TTS_NATIVE_PREVIEW, voiceURI);
+      } catch {
+        /* never crash the renderer over a preview IPC */
+      }
+    },
   },
 };
 

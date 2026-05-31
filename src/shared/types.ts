@@ -125,35 +125,9 @@ export interface ConnectionState {
   lastError?: string;
 }
 
-/**
- * TTS engine implementation, v0.1.42.
- *
- * - `native` — macOS `say(1)` subprocess driven from the main process.
- *   Reliable, no Chromium bugs, but currently macOS-only. The renderer
- *   IPCs into `IPC.TTS_NATIVE_*` channels; the queue lives in the
- *   main-process `NativeTtsEngine` (`src/main/tts-native.ts`).
- * - `browser` — Chromium `window.speechSynthesis`. The historical engine
- *   that v0.1.40 / v0.1.41 hardened with watchdogs. Retained behind the
- *   toggle so a future Linux / Windows build can keep working without
- *   needing the OS-specific `say` binary.
- *
- * Default is `native` on macOS (which is currently the only target
- * RC++ ships for). The renderer's `TTSEngine` factory picks the
- * implementation off this setting at construct + update time, so flipping
- * the dropdown takes effect for the next enqueued message without an
- * app restart.
- */
-export type TtsEngineKind = 'native' | 'browser';
-
 export interface Settings {
   tts: {
     enabled: boolean;
-    /**
-     * Which speech-synthesis backend to use. See `TtsEngineKind` for
-     * the per-value semantics. Defaults to `'native'` on macOS so users
-     * who haven't touched the toggle get the reliable path automatically.
-     */
-    engine: TtsEngineKind;
     /**
      * When true, TTS prefixes each message with the sender's display name,
      * e.g. "alice says hello world". When false (default), only the message
@@ -161,8 +135,26 @@ export interface Settings {
      * by default because chat raids become unbearable otherwise.
      */
     readSenderName: boolean;
+    /**
+     * Selected voice identifier. Its FORMAT is platform-dependent because the
+     * voice is now ALWAYS the native OS voice (v0.1.81 removed the browser
+     * engine): macOS = `say` voice name (e.g. `Daniel`); Windows =
+     * System.Speech voice name (e.g. `Microsoft Zira Desktop`); Linux =
+     * spd-say/espeak voice name. `undefined` = the OS default voice.
+     */
     voiceURI?: string;
     rate: number;
+    /**
+     * v0.1.81 — RETAINED FOR BACK-COMPAT ONLY; no longer used for speech.
+     *
+     * The Web-Speech API supported a per-utterance pitch; the native OS voice
+     * engines (`say` / Windows System.Speech / spd-say / espeak) don't expose a
+     * pitch knob we can rely on cross-platform, so when the browser engine was
+     * removed in v0.1.81 the Pitch slider was dropped from the Settings UI and
+     * the value is no longer read by the speech path. The field stays in the
+     * persisted blob so old saved settings don't error and the `set_tts_pitch`
+     * MCP tool keeps round-tripping; it simply has no audible effect now.
+     */
     pitch: number;
     volume: number;
     maxPerMinute: number;
@@ -322,19 +314,16 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
   tts: {
+    // v0.1.81 — `engine` removed. Speech is ALWAYS the native OS system voice
+    // now (macOS `say` / Windows System.Speech / Linux spd-say|espeak); the
+    // renderer Web-Speech engine was deleted because Chromium throttled it when
+    // the window wasn't foreground and Ethan heard nothing. See tts-dispatch.ts.
     enabled: false,
-    // v0.1.44: flipped back to the browser (Web Speech) engine after the
-    // v0.1.40 strong-ref + v0.1.41 cancel-before-speak + 8s keep-alive +
-    // 500ms onstart watchdog + onerror retry + disk-log layers landed.
-    // The macOS `say` engine (added in v0.1.42) is reliable but ignores
-    // the in-app volume slider — `say` has no `--volume` flag and only
-    // tracks the system output level. Browser engine is now reliable AND
-    // honours the slider, so it's the right default again. Native stays
-    // available as an opt-in toggle in Settings.
-    engine: 'browser',
     readSenderName: false,
     voiceURI: undefined,
     rate: 1.0,
+    // v0.1.81 — pitch is no longer used for speech (no cross-platform native
+    // pitch knob); kept at the neutral 1.0 for back-compat only.
     pitch: 1.0,
     volume: 1.0,
     maxPerMinute: 20,
@@ -619,23 +608,18 @@ export const IPC = {
   TTS_NATIVE_UPDATE_SETTINGS: 'tts-native:update-settings',
   TTS_NATIVE_GET_VOICES: 'tts-native:get-voices',
   /**
-   * v0.1.76 (Ethan voice 4414, 2026-05-30) — MAIN → renderer push. Asks the
-   * renderer to speak ONE utterance via the browser Web-Speech engine.
+   * v0.1.81 — Settings voice-PREVIEW (renderer → main). The Settings drawer's
+   * voice-preview affordance (picking a voice, or releasing the rate/volume
+   * sliders) sends this; the main-process NativeTtsEngine cancels any in-flight
+   * preview and speaks "Hello, my name is <voice>" at the current rate/volume.
    *
-   * This is the inversion that moves TTS dispatch into the background: the
-   * main process now OWNS the decision (filters, rate-limit, same-id guard,
-   * visibility-based backend choice — see src/main/tts-dispatch.ts). When the
-   * window is visible/covered, main picks the BROWSER backend and pushes this
-   * channel with a full snapshot of the utterance's TTS settings
-   * (`TtsSpeakBrowserPayload` — voice/rate/pitch/volume). The renderer is now
-   * a THIN executor: it just speaks what it's told, honouring every setting in
-   * the payload. It no longer decides anything.
-   *
-   * Fire-and-forget. If the window is genuinely hidden main NEVER uses this
-   * channel — it speaks via native `say` directly (renderer-independent), which
-   * is the never-miss guarantee.
+   * WHY THIS REPLACED THE OLD RENDERER-SIDE PREVIEW: through v0.1.80 the preview
+   * was spoken by the renderer Web-Speech engine (`speechSynthesis`). v0.1.81
+   * removed that engine entirely, so the preview — like all speech — now goes
+   * through the native OS voice in main. Fire-and-forget; payload is the voice
+   * name string (or undefined for the system default voice).
    */
-  TTS_SPEAK_BROWSER: 'tts:speak-browser',
+  TTS_NATIVE_PREVIEW: 'tts-native:preview',
 } as const;
 
 /**
@@ -682,25 +666,6 @@ export interface TtsNativeSettingsPayload {
 }
 
 /**
- * v0.1.76 — wire payload for `IPC.TTS_SPEAK_BROWSER` (MAIN → renderer). One
- * utterance the renderer should speak via Web Speech, carrying a full snapshot
- * of the TTS settings the utterance needs. The decision (whether to speak at
- * all, which backend) was already made in main — the renderer just executes.
- * Carrying the settings in the payload is what keeps volume/voice/rate/PITCH
- * all working in the visible-window case without the renderer re-reading state.
- */
-export interface TtsSpeakBrowserPayload {
-  /** Already-composed text (sender-name prefix already applied if enabled). */
-  text: string;
-  voiceURI?: string;
-  rate: number;
-  pitch: number;
-  volume: number;
-  /** For log correlation with the main-process decision row. */
-  messageId: string;
-}
-
-/**
  * Payload shape for `IPC.TTS_LOG`. `event` is a stable lowercase identifier;
  * `data` is an arbitrary JSON-serialisable bag (utterance id, retry count,
  * watchdog reason, etc.). `ts` is filled by the main-process handler so we
@@ -716,14 +681,22 @@ export interface TtsLogEvent {
     | 'onstart_watchdog_retry'
     | 'keepalive_fired'
     | 'cancel_called'
-    // v0.1.42 native-engine events. Emitted from `NativeTtsEngine` in
-    // the main process; persisted to the same JSONL file so native +
-    // browser events appear in one timeline ordered by wall clock.
+    // Native-engine events. Emitted from `NativeTtsEngine` in the main
+    // process (src/main/tts-native.ts); persisted to the JSONL file.
+    // As of v0.1.81 this is the ONLY speaking engine (macOS/Windows/Linux);
+    // the `speak_called`/`onstart`/`onend`/`onerror`/`watchdog_fired`/
+    // `keepalive_fired`/`cancel_called` events above were the renderer
+    // Web-Speech engine's and are now legacy (kept in the union so old
+    // tts-events.jsonl rows still type-check, but nothing emits them).
     | 'native_speak_start'
     | 'native_speak_end'
     | 'native_speak_error'
     | 'native_speak_killed'
     | 'native_queue_size'
+    // v0.1.81 — emitted ONCE when no system speech engine is installed on the
+    // platform (e.g. a bare Linux box with no spd-say/espeak). Speech then
+    // no-ops silently; this row tells a forensic grep why nothing was voiced.
+    | 'native_no_engine'
     // v0.1.73 (Ethan voice 4364, 2026-05-28) — explicit decision-gate
     // logging. EVERY message that flows through the App.tsx side-effect
     // useEffect now emits one of these rows BEFORE the engine is called
@@ -744,15 +717,7 @@ export interface TtsLogEvent {
     // aloud? If not, we need to add that to the logs, but, like,
     // that's fucked."
     | 'tts_decision'
-    | 'notification_decision'
-    // v0.1.74 (Ethan voice 4407, 2026-05-30) — background-TTS fix. Emitted
-    // by the renderer browser `TTSEngine` when it detects the page is
-    // hidden/occluded (so `window.speechSynthesis` is suspended) and
-    // therefore routes the utterance through the native main-process `say`
-    // bridge instead. Lets a forensic grep confirm "this message was voiced
-    // via the background fallback path, not Web Speech" — which is exactly
-    // the case the user couldn't previously diagnose.
-    | 'background_native_fallback';
+    | 'notification_decision';
   data?: Record<string, unknown>;
 }
 

@@ -1,56 +1,47 @@
-// v0.1.76 (Ethan voice 4414, 2026-05-30) — MAIN-PROCESS TTS + NOTIFICATION DISPATCH.
+// MAIN-PROCESS TTS + NOTIFICATION DISPATCH.
 // ============================================================================
 //
-// WHY THIS EXISTS / WHAT CHANGED
+// WHY THIS EXISTS / WHAT IT OWNS
 // ------------------------------
-// Through v0.1.75 the chat→speak decision/filter/queue/rate-limit logic lived
-// in the RENDERER (App.tsx + the pure deciders in side-effect-decision.ts).
-// The main process merely forwarded each chat message to the renderer over
-// `IPC.CHAT_MESSAGE`, and the renderer decided whether to speak it. That made
-// the never-miss guarantee depend on the renderer being alive + responsive:
-// if the renderer was wedged, slow, or mid-teardown, a message could be
-// dropped with nothing to catch it.
+// The chat→speak decision (filters, rate-limit, same-id guard) and the actual
+// speaking BOTH happen in the MAIN (background) process. ws-client hands every
+// chat message to `handleMessage(m)` here; we decide whether to speak, then
+// speak via the native OS voice engine (src/main/tts-native.ts). Running this
+// in main is PRIORITY #1 from Ethan voice 4414: "it must NEVER miss a message".
+// A wedged/dead/slow renderer can no longer swallow a message — there is no
+// renderer involvement in speech at all anymore.
 //
-// Ethan voice 4414 (PRIORITY #1: "it must NEVER miss a message") asked to move
-// ALL the TTS decision/dispatch into the BACKGROUND (main) process so
-// robustness never depends on the renderer. This module is that move.
+// v0.1.81 (Ethan 2026-05-31: "lets just use system voice for everything then.
+// no more browser one. do it.") — THE BROWSER (renderer Web-Speech) SPEAKING
+// PATH IS GONE. Through v0.1.80 this dispatcher had TWO backends: the renderer
+// Web-Speech voice (when the window was visible, on win/linux + briefly macOS)
+// and the native OS voice (macOS always + the genuinely-hidden fallback). The
+// browser path was unreliable: Chromium throttles/suspends `speechSynthesis`
+// whenever the window isn't foreground (and can silently latch even when it
+// is), so it produced NO AUDIO — Ethan heard nothing. The decision (final) was
+// to drop the renderer engine entirely and use the OS system voice on EVERY
+// platform. So `dispatchSpeak()` now has exactly ONE path: native. No
+// visibility detection, no backend choice, no IPC-to-renderer-to-speak.
 //
-// CONTRACT (the part Ethan cares about):
-//   1. NEVER MISS: chat arrives in main (from ws-client). Main decides here,
-//      then dispatches to a backend. If the window is genuinely hidden, the
-//      native macOS `say` subprocess speaks it — that path does NOT touch the
-//      renderer at all, so a dead/wedged renderer can never swallow a message.
-//   2. ALL SETTINGS WORK: the decision uses the SAME pure deciders the
-//      renderer used (decideTtsAction / decideNotificationAction in
-//      shared/side-effect-decision.ts) so every filter/toggle behaves
-//      identically. For the actual SPEAKING:
-//        - window VISIBLE (incl. merely COVERED — the app disables Chromium
-//          occlusion so covered windows stay 'visible') → main tells the
-//          renderer to speak via the BROWSER voice (Web Speech), which honours
-//          EVERY setting exactly as before: volume, voice, rate, pitch.
-//        - window genuinely HIDDEN (minimised / other Space / app-hidden via
-//          Cmd-H) → main speaks via native `say`, honouring volume (via the
-//          inline `[[volm]]` command — v0.1.76), voice (`-v`) and rate (`-r`).
-//      Net: volume + every control work in the normal (visible) case; the only
-//      setting the hidden fallback can't honour is PITCH (`say` has no pitch),
-//      and that's restored the instant the window is visible again.
-//
-// WHY DECISION IN MAIN BUT BROWSER-SPEAK STILL IN RENDERER:
-//   The browser Web-Speech engine necessarily runs in the renderer (it IS the
-//   Chromium speechSynthesis API). We can't move the audio out of the renderer
-//   without losing volume/pitch support. So the split is: main OWNS the
-//   decision + the never-miss guarantee + the native fallback; the renderer is
-//   a THIN executor that, on command (`IPC.TTS_SPEAK_BROWSER`), speaks one
-//   utterance via Web Speech. The renderer no longer DECIDES anything.
+// WHAT STILL WORKS (all the controls Ethan cares about):
+//   - volume → native engine applies it (macOS `[[volm]]`, Windows
+//     System.Speech `$s.Volume`, Linux espeak `-a` / spd-say `-i`).
+//   - rate   → mapped per platform (WPM on macOS/espeak, -10..10 on Windows,
+//     -100..100 on spd-say).
+//   - voice  → `-v` (macOS/espeak) / SelectVoice (Windows) / `-t` (spd-say).
+//   - mute / enabled / speakSelf / regex filters / hidden-users / platform
+//     toggles / rate-limit → all enforced by the SAME pure deciders + limiters
+//     here in main, BEFORE the native engine is ever touched.
+//   - PITCH is the one Web-Speech control that has no clean native equivalent
+//     (`say`/spd-say/espeak/System.Speech don't expose a per-utterance pitch
+//     knob we can rely on cross-platform), so it was dropped from the UI in
+//     v0.1.81. The `pitch` setting still exists in the persisted blob (for
+//     back-compat + the MCP tool) but is no longer used for speech.
 //
 // STATE OWNED HERE (per main-process singleton):
 //   - compiled regex patterns + hidden-users set (rebuilt on settings change)
-//   - the TTS + notification rate limiters (token buckets; moved out of the
-//     renderer so they survive renderer reloads)
+//   - the TTS + notification rate limiters (token buckets)
 //   - lastProcessedId (the same-id-reprocess guard)
-//
-// The renderer-side App.tsx side-effect useEffect is REMOVED in v0.1.76 (it no
-// longer decides/dispatches); the renderer only listens for TTS_SPEAK_BROWSER.
 
 import type {
   ChatMessage,
@@ -58,7 +49,6 @@ import type {
   Settings,
   TtsDecisionReason,
   TtsLogEvent,
-  TtsSpeakBrowserPayload,
 } from '../shared/types';
 import {
   compileHiddenUsersSet,
@@ -72,25 +62,19 @@ import {
 } from '../shared/side-effect-decision';
 
 /**
- * Backend the dispatcher chose for a given message. Surfaced to the caller
- * (and logged) so a forensic grep can answer "which path voiced this".
+ * Backend the dispatcher chose for a message. Surfaced to the caller (+ logged)
+ * so a forensic grep can answer "did this message get voiced".
  *
- *   - 'browser' → main asked the renderer to speak via Web Speech (window
- *                 visible/covered — all settings honoured incl. pitch).
- *   - 'native'  → main spoke via the `say` subprocess (window genuinely
- *                 hidden — volume/voice/rate honoured, pitch degraded).
- *   - 'skip'    → a decision gate suppressed TTS (disabled, regex, etc.).
+ * v0.1.81: the only speaking backend now is 'native' (the OS system voice on
+ * every platform). 'skip' means a decision gate suppressed TTS. The old
+ * 'browser' value is gone with the renderer Web-Speech path.
  */
-export type TtsBackendChoice = 'browser' | 'native' | 'skip';
+export type TtsBackendChoice = 'native' | 'skip';
 
 /**
- * Pure rate limiter (token bucket over a rolling 60s window). Identical math
- * to the renderer's `RateLimiter` in tts.ts, re-implemented here so the main
- * process doesn't have to import the DOM-bound renderer module. `now` is
- * injectable so unit tests can advance the clock deterministically.
- *
- * Lives in main now (not the renderer) so the limit survives a renderer
- * reload — part of "robustness never depends on the renderer".
+ * Pure rate limiter (token bucket over a rolling 60s window). `now` is
+ * injectable so unit tests can advance the clock deterministically. Lives in
+ * main so the limit survives a renderer reload.
  */
 export class MainRateLimiter {
   private timestamps: number[] = [];
@@ -114,75 +98,21 @@ export class MainRateLimiter {
 }
 
 /**
- * Things the dispatcher needs from the host (main.ts) but that we don't want
- * to hard-couple to — passed in so the module is unit-testable with fakes.
+ * Things the dispatcher needs from the host (main.ts), passed in so the module
+ * is unit-testable with fakes.
  */
 export interface TtsDispatchDeps {
   /** Current persisted settings. Called once per message + on settings change. */
   loadSettings(): Settings;
   /**
-   * v0.1.80 (Ethan 2026-05-31: "i havent been hearing the voice stuff yet …
-   * should it always use system voice, can volume n stuff work with that") —
-   * TRUE on macOS, FALSE on every other platform. Wired to
-   * `process.platform === 'darwin'` in main.ts.
-   *
-   * WHY THIS GATE EXISTS / THE WHOLE POINT OF v0.1.80:
-   * --------------------------------------------------
-   * Through v0.1.79 the dispatcher used the BROWSER (renderer Web-Speech)
-   * voice whenever the window was visible-or-merely-covered, and only fell
-   * back to native `say` when the window was GENUINELY hidden. That was
-   * Ethan's stated preference at the time (v0.1.75) — but it relies on
-   * Chromium's `speechSynthesis` actually producing audio in the renderer,
-   * which it frequently does NOT: Chromium throttles/suspends the renderer's
-   * speech engine the moment the window loses foreground focus (covered by
-   * another window, on another Space, app in the background, screen-locked,
-   * etc.), and on Electron 42 it can silently latch even in the foreground.
-   * Net result for Ethan: he heard NOTHING — `speak()` fired but no sound
-   * came out, because the renderer engine was suspended/dormant.
-   *
-   * The fix Ethan chose (and the decision is final): on macOS, ALWAYS speak
-   * via the native main-process `say` subprocess — never the renderer. `say`
-   * is an OS-level process that is immune to Chromium renderer throttling, so
-   * it plays foreground AND background, uses the same macOS system voices, and
-   * (since v0.1.76) honours volume via the inline `[[volm]]` command plus rate
-   * via `-r` and voice via `-v`. So we drop background-detection ENTIRELY on
-   * macOS — there is no longer any "is the window hidden?" branch to get wrong.
-   *
-   * NON-macOS: this returns FALSE, so the dispatcher keeps the OLD
-   * visibility-based behaviour (browser voice — the ONLY speech engine a
-   * win/linux build has; there is no `say` binary there). See `dispatchSpeak`.
-   */
-  isMacNative(): boolean;
-  /**
-   * True when the app window is GENUINELY hidden (minimised / on another
-   * macOS Space / app hidden via Cmd-H) — i.e. Chromium has suspended Web
-   * Speech and the browser voice cannot run. False when visible OR merely
-   * covered (the app disables occlusion so covered windows stay usable by
-   * Web Speech). When true the dispatcher MUST use the native `say` path so
-   * the message is never silently lost. Implemented in main.ts off the
-   * BrowserWindow state (isMinimized / isVisible) — see wireTtsDispatch.
-   *
-   * v0.1.80 NOTE: on macOS this predicate is now UNUSED for backend choice
-   * (macOS always goes native via `isMacNative()`), but it's kept wired so
-   * the non-macOS path (where `isMacNative()` is false) still works exactly
-   * as before — browser when visible, native when hidden.
-   */
-  isWindowGenuinelyHidden(): boolean;
-  /**
-   * Speak `text` via the native `say` engine. `volume`/`voice`/`rate` flow
-   * from settings; the native engine applies volume via `[[volm]]`. Wired to
-   * the main-process NativeTtsEngine singleton.
+   * Speak `text` via the native OS voice engine. `volume`/`voice`/`rate` flow
+   * from settings; the native engine applies them per platform. Wired to the
+   * main-process NativeTtsEngine singleton (which works on macOS / Windows /
+   * Linux). This is the ONLY speaking path as of v0.1.81 — there is no browser
+   * path anymore. `pitch` is intentionally NOT passed (no cross-platform native
+   * pitch knob — see the file header).
    */
   speakNative(text: string, opts: { voice?: string; rate?: number; volume?: number; messageId?: string }): void;
-  /**
-   * Ask the RENDERER to speak one utterance via Web Speech. Wired to
-   * `mainWindow.webContents.send(IPC.TTS_SPEAK_BROWSER, payload)`. The
-   * renderer's thin executor honours volume/voice/rate/pitch from the payload
-   * (a snapshot of settings.tts at decision time). Best-effort — if the
-   * window is gone this is a no-op, but that can only happen when the window
-   * is ALSO genuinely hidden, in which case we'd have taken the native path.
-   */
-  speakBrowser(payload: TtsSpeakBrowserPayload): void;
   /** Fire a native OS notification. `silent` honours settings.notifications.soundEnabled. */
   notify(title: string, body: string, silent: boolean): void;
   /** Persist a tts-events.jsonl row. Best-effort; never throws into dispatch. */
@@ -190,9 +120,8 @@ export interface TtsDispatchDeps {
 }
 
 /**
- * Build the string the synthesizer speaks for a message — mirror of the
- * renderer's `composeUtterance` (kept here to avoid importing the DOM-bound
- * tts.ts into main). readSenderName=true → "alice says hi"; false → "hi".
+ * Build the string the synthesizer speaks for a message.
+ * readSenderName=true → "alice says hi"; false → "hi".
  */
 export function composeUtteranceForDispatch(m: ChatMessage, readSenderName: boolean): string {
   if (readSenderName) return `${m.username} says ${m.text}`;
@@ -202,15 +131,14 @@ export function composeUtteranceForDispatch(m: ChatMessage, readSenderName: bool
 /**
  * The main-process TTS + notification dispatcher. One instance per main
  * process. `handleMessage(m)` is called for every chat message that arrives
- * from ws-client — it runs the decision, picks the backend by window
- * visibility, and dispatches. Returns the TTS backend it chose (for tests).
+ * from ws-client — it runs the decision, and (when not suppressed) speaks via
+ * the native OS engine. Returns the backend it chose (for tests).
  *
  * Settings + compiled patterns are refreshed lazily per message via
  * `deps.loadSettings()` so a live settings change (UI slider, MCP tool) is
- * always reflected — no stale-cache bugs. The compiled regex/hidden-user
- * derivations are MEMOISED against the source arrays so we don't recompile on
- * every single message during a chat raid (only when the lists actually
- * change). The rate limiters are long-lived (token buckets must persist).
+ * always reflected. The compiled regex/hidden-user derivations are MEMOISED
+ * against the source arrays so we don't recompile on every message during a
+ * raid. The rate limiters are long-lived (token buckets must persist).
  */
 export class TtsDispatcher {
   private readonly deps: TtsDispatchDeps;
@@ -234,16 +162,14 @@ export class TtsDispatcher {
   constructor(deps: TtsDispatchDeps, now: () => number = Date.now) {
     this.deps = deps;
     const s = deps.loadSettings();
-    // Seed the limiters from current settings; setMax keeps them live on change.
     this.ttsLimiter = new MainRateLimiter(s.tts.maxPerMinute, now);
     this.notifLimiter = new MainRateLimiter(s.notifications.maxPerMinute, now);
   }
 
   /**
    * Recompile a memoised regex list ONLY if the source array reference (or
-   * contents) changed. We compare by reference first (cheap, hits in the
-   * common no-change case) and fall back to a shallow value compare so a
-   * fresh-but-equal array from loadSettings() doesn't force a recompile.
+   * contents) changed. Reference compare first (cheap, common no-change case),
+   * then a shallow value compare so a fresh-but-equal array doesn't recompile.
    */
   private memoPatterns(
     src: readonly string[],
@@ -259,13 +185,11 @@ export class TtsDispatcher {
 
   /** Build the decision context for one message from the current settings. */
   private buildContext(settings: Settings): SideEffectContext {
-    // Hidden users.
     const hiddenSrc = settings.hiddenUsers ?? [];
     if (this.cachedHiddenUsersSrc === undefined || !sameStringArray(hiddenSrc, this.cachedHiddenUsersSrc)) {
       this.cachedHiddenUsersSet = compileHiddenUsersSet(hiddenSrc);
       this.cachedHiddenUsersSrc = hiddenSrc;
     }
-    // Regex axes (4 lists). memoPatterns mutates the matching cache fields.
     const ttsContent = this.memoPatterns(
       settings.filters?.tts?.ignoreRegex ?? [],
       this.cachedTtsContentSrc,
@@ -315,19 +239,18 @@ export class TtsDispatcher {
 
   /**
    * Main entry point — called for EVERY chat message arriving in main. Runs
-   * the TTS + notification decisions, dispatches to the chosen backend, and
-   * logs the decision (so the "why didn't this get read aloud" forensic grep
-   * still works, now from the main side). Returns the TTS backend chosen.
+   * the TTS + notification decisions, speaks (when not suppressed), and logs
+   * the decision (so the "why didn't this get read aloud" forensic grep works).
+   * Returns the TTS backend chosen.
    *
    * Wrapped so a thrown error anywhere in here can NEVER break the chat
-   * pipeline — the worst case must be "this one message wasn't voiced", never
-   * "the app stopped processing chat".
+   * pipeline — worst case must be "this one message wasn't voiced", never "the
+   * app stopped processing chat".
    */
   handleMessage(m: ChatMessage): TtsBackendChoice {
     try {
       return this.handleMessageInner(m);
     } catch (err) {
-      // Defensive: never let a dispatch crash the chat forwarder.
       try {
         this.deps.log('tts_decision', {
           messageId: m?.id,
@@ -344,20 +267,15 @@ export class TtsDispatcher {
 
   private handleMessageInner(m: ChatMessage): TtsBackendChoice {
     const settings = this.deps.loadSettings();
-    // Keep the limiters' caps in lock-step with live settings.
     this.ttsLimiter.setMax(settings.tts.maxPerMinute);
     this.notifLimiter.setMax(settings.notifications.maxPerMinute);
 
     const ctx = this.buildContext(settings);
 
-    // --- TTS decision (same pure ladder as the old renderer path) ---
     const ttsResult = decideTtsAction(m, ctx);
-    // --- Notification decision (independent axes) ---
     const notifResult = decideNotificationAction(m, ctx);
 
-    // Bump the same-id guard exactly once per non-reprocess message (matches
-    // the old renderer semantics — we check the TTS path since both apply the
-    // same-id gate identically).
+    // Bump the same-id guard exactly once per non-reprocess message.
     if (ttsResult.reason !== 'same-id-reprocess') {
       this.lastProcessedId = m.id;
     }
@@ -366,18 +284,10 @@ export class TtsDispatcher {
 
     // --- TTS dispatch ---
     if (ttsResult.decision === 'read') {
-      // Rate-limit in main (token bucket persists across renderer reloads).
       if (this.ttsLimiter.tryConsume()) {
         backend = this.dispatchSpeak(m, settings);
-        // Decision row carries the chosen backend so a grep proves whether
-        // the message went out via browser or native `say`.
-        this.deps.log(
-          'tts_decision',
-          { ...composeDecisionLogData(m, ttsResult), backend },
-        );
+        this.deps.log('tts_decision', { ...composeDecisionLogData(m, ttsResult), backend });
       } else {
-        // Limiter blocked it — log a skip:rate-limited row (matches the
-        // renderer's old notification rate-limit logging convention).
         backend = 'skip';
         this.deps.log('tts_decision', {
           ...composeDecisionLogData(m, { decision: 'skip', reason: 'rate-limited' as TtsDecisionReason }),
@@ -385,7 +295,6 @@ export class TtsDispatcher {
         });
       }
     } else {
-      // A gate suppressed it — log the gate's reason as-is.
       this.deps.log('tts_decision', composeDecisionLogData(m, ttsResult));
     }
 
@@ -393,7 +302,6 @@ export class TtsDispatcher {
     if (notifResult.decision === 'notify') {
       if (this.notifLimiter.tryConsume()) {
         this.deps.log('notification_decision', composeDecisionLogData(m, notifResult));
-        // soundEnabled → silent is its inverse.
         this.deps.notify(
           `${m.username} (${m.platform})`,
           m.text,
@@ -416,78 +324,22 @@ export class TtsDispatcher {
   }
 
   /**
-   * Pick the speak backend and dispatch. Returns the backend chosen.
+   * Speak the message via the native OS voice engine. The ONLY speaking path
+   * as of v0.1.81 — every platform, foreground or background. Returns 'native'.
    *
-   * v0.1.80 BACKEND-SELECTION RULES (Ethan 2026-05-31):
-   * ---------------------------------------------------
-   *   macOS (isMacNative() === true)  → ALWAYS native `say`. No
-   *     background-detection: foreground and background both go through the
-   *     OS-level subprocess, which is immune to Chromium renderer throttling
-   *     (the thing that made Ethan hear nothing on the old browser path). All
-   *     of volume (`[[volm]]`), rate (`-r`) and voice (`-v`) are honoured; the
-   *     ONLY Web-Speech control native can't do is pitch (`say` has no pitch
-   *     knob), an intentional, accepted trade for "actually plays audio".
-   *
-   *   non-macOS (isMacNative() === false) → the PRE-v0.1.80 behaviour, unchanged:
-   *     genuinely-hidden → native (never-miss), otherwise → browser
-   *     (full-fidelity Web Speech). win/linux have no `say` binary, so in
-   *     practice the native branch there is a near-no-op; we keep the exact
-   *     old code path so those builds behave identically to before.
-   *
-   * This split is the entire v0.1.80 change: macOS stops using the renderer
-   * Web-Speech engine for chat playback entirely. The renderer engine + its
-   * `speakBrowserCommand`/`trySpeakViaNativeWhileHidden` layers remain in the
-   * codebase for non-macOS and for the in-Settings voice-preview button, but
-   * incoming chat on macOS never reaches them now — so there is no
-   * double-speak risk (main fires exactly one backend per message).
+   * volume / rate / voice flow from settings into the native engine (which maps
+   * them per platform). pitch is deliberately NOT passed — no cross-platform
+   * native pitch knob exists; the setting was dropped from the UI in v0.1.81.
    */
   private dispatchSpeak(m: ChatMessage, settings: Settings): TtsBackendChoice {
     const text = composeUtteranceForDispatch(m, settings.tts.readSenderName);
-
-    // --- macOS: ALWAYS native `say` (foreground + background). ---
-    // This is the v0.1.80 fix for "I hear nothing": the renderer Web-Speech
-    // engine gets throttled/suspended by Chromium when the window isn't
-    // foreground (and can silently latch even when it is), so it was producing
-    // no audio. The OS `say` subprocess always plays. Volume via [[volm]],
-    // rate via -r, voice via -v — see src/main/tts-native.ts.
-    if (this.deps.isMacNative()) {
-      this.deps.speakNative(text, {
-        voice: settings.tts.voiceURI,
-        rate: settings.tts.rate,
-        volume: settings.tts.volume,
-        messageId: m.id,
-      });
-      return 'native';
-    }
-
-    // --- non-macOS: original visibility-based selection (unchanged). ---
-    const hidden = this.deps.isWindowGenuinelyHidden();
-    if (hidden) {
-      // Genuinely hidden — Web Speech is suspended. Native `say` is immune to
-      // renderer visibility, so this is the never-miss path. Volume flows via
-      // the inline `[[volm]]` command in the native engine. (On win/linux
-      // there is no `say` binary; the native engine's spawn fails and is
-      // swallowed — a known limitation of those platforms, not a regression.)
-      this.deps.speakNative(text, {
-        voice: settings.tts.voiceURI,
-        rate: settings.tts.rate,
-        volume: settings.tts.volume,
-        messageId: m.id,
-      });
-      return 'native';
-    }
-    // Visible (or merely covered — occlusion disabled keeps it 'visible').
-    // Use the browser voice so EVERY setting (volume, voice, rate, PITCH) is
-    // honoured exactly as before v0.1.76.
-    this.deps.speakBrowser({
-      text,
-      voiceURI: settings.tts.voiceURI,
+    this.deps.speakNative(text, {
+      voice: settings.tts.voiceURI,
       rate: settings.tts.rate,
-      pitch: settings.tts.pitch,
       volume: settings.tts.volume,
       messageId: m.id,
     });
-    return 'browser';
+    return 'native';
   }
 }
 
