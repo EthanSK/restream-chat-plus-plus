@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-31T17:30:21Z
+**Trigger:** Codex review of new native TTS code (v0.1.81); shipped as v0.1.82
+**Symptom:** Hitting mute (or turning TTS off) mid-utterance didn't stop speech: the current utterance played to the end and every already-queued chat message still spoke. Also: spam-clicking the Settings voice-preview dropped samples. Also: Linux chosen voice never applied; macOS voices with numeric-region locales (ar_001/es_419) missing from the dropdown; MCP set_tts_pitch description claimed it affected pitch when it's inert since v0.1.81.
+**Root cause:** v0.1.81 native-TTS code. (1) decideTtsAction muted/engine-disabled gates only run on the NEXT incoming message — they suppress FUTURE enqueues but never touch the in-flight subprocess or the FIFO queue the native engine holds in main; toggleMuted/patchTts only flipped settings.tts.muted/enabled. (2) NativeTtsEngine.settle() on the killed-child exit path did 'if(cancelling){cancelling=false;return;}' BEFORE drain(); an enqueue() during the cancelling window couldn't self-start (this.current still=dying child) so the queued item sat idle until the next enqueue. (3) linux-spd buildSpeakSpec passed the voice via -t (voice TYPE) but parseSpdVoiceList lists synthesis-voice NAMES. (4) parseSayVoiceList locale regex required [A-Z]{2,4} region, dropping numeric M49 regions. (5) stale description.
+**Fix:** v0.1.82. (1) New pure predicate shouldCancelNativeTtsOnSettingsChange(prev,next) in src/shared/side-effect-decision.ts returns true ONLY on transition INTO silence (muted false->true OR enabled true->false). App.tsx updateSettings snapshots prev tts flags before setSettings and calls rcpp.ttsNative.cancel() (TTS_NATIVE_CANCEL -> NativeTtsEngine.cancel: SIGTERMs child + clears queue) when it returns true. Un-mute/re-enable never cancels (cancel-only, no replay). Header button + both Settings rows funnel through the one updateSettings chokepoint. (2) settle() now, after clearing cancelling, drains if this.queue.length>0 && current cleared. (3) -t -> -y (--synthesis-voice). (4) region group widened to [A-Z0-9]{2,4}. (5) description marked back-compat/inert.
+**Commit:** 4a7311d
+**Guard:** tts-native.test.ts: cancel->enqueue->killed-exit->plays, plain-cancel-stays-idle, preview-while-playing-still-speaks, numeric-region parse (ar_001/es_419), spd-say -y flag asserted + -t absent. side-effect-decision.test.ts: 8 predicate cases (both INTO-silence triggers true, reverse/no-change/undefined-muted false). mute-cancels-inflight.test.ts: source-level App.tsx wiring guard (snapshot-before-setState, cancel gated by predicate, toggleMuted has no direct cancel). 600 tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-05-31T16:18:43Z
 **Trigger:** Ethan: 'lets just use system voice for everything then. no more browser one. do it.'
 **Symptom:** Spoken chat (TTS) silent / unreliable: renderer Chromium window.speechSynthesis fired but produced no audio whenever the window wasn't foreground (covered/other-Space/minimised/backgrounded/locked) and could silently latch even in foreground on Electron 42. Browser engine was win/linux path + Settings preview + voice enumeration.
