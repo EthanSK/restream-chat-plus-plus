@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-05-31T17:48:59Z
+**Trigger:** Codex menu-bar review (v0.1.83 ship task)
+**Symptom:** Preferences… menu item throws macOS 'this command is disabled and cannot be executed' alert after the window is closed then app/menu kept alive (mac), and separately a dialog-show failure silently opened the release page in the browser
+**Root cause:** 1) mainWindow declared null + assigned on create but NEVER nulled on close, and no closed listener; on macOS window-all-closed only quits non-darwin so the app+menu outlive the window. mainWindow became a stale NON-null handle to a DESTROYED BrowserWindow; the mainWindow?. optional-chain guard short-circuits null but NOT destroyed, so .webContents threw synchronously -> Electron menu dispatcher surfaces it as the 'command is disabled' alert. 2) safeMessageBox catch returned { response: 0 } on a dialog-show throw, and the Update-available dialog treats index 0 as 'Open Release Page' (if response===0 shell.openExternal), so a FAILED dialog opened the browser unprompted.
+**Fix:** 1) Added mainWindow.on('closed', () => { mainWindow = null }) in createMainWindow (root cause); now every mainWindow?. guard short-circuits after close and app.on('activate') recreates+reassigns. Factored the Preferences handler into exported openSettingsFromMenu(win) which bails on null OR isDestroyed() + try/catch; same isDestroyed() guard on the chat-feed context-menu popup. 2) safeMessageBox now returns sentinel { response: -1 } on a thrown dialog (matches no action at any call site); action site uses named OPEN_RELEASE_PAGE=0 const. Other safeMessageBox callers ignore the return so unaffected.
+**Commit:** 605a07e
+**Guard:** Tests: src/__tests__/menu-preferences-destroyed-window.test.ts (openSettingsFromMenu null/destroyed/live/throw cases) + 3 new cases in updater-menu-reconciliation.test.ts (thrown dialog does NOT open browser, index 0 does, index 1 does not). Thorough inline comments at both fix sites explaining the macOS stale-destroyed-window mechanism and the dialog-fail sentinel.
+---
+
+---
 **Date:** 2026-05-31T17:30:21Z
 **Trigger:** Codex review of new native TTS code (v0.1.81); shipped as v0.1.82
 **Symptom:** Hitting mute (or turning TTS off) mid-utterance didn't stop speech: the current utterance played to the end and every already-queued chat message still spoke. Also: spam-clicking the Settings voice-preview dropped samples. Also: Linux chosen voice never applied; macOS voices with numeric-region locales (ar_001/es_419) missing from the dropdown; MCP set_tts_pitch description claimed it affected pitch when it's inert since v0.1.81.
