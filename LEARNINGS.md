@@ -24,6 +24,26 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-02T15:47:37Z
+**Trigger:** voice 7280
+**Symptom:** Electron auto-update flaky: clicking Install Update + Restart failed the first ~2-3 times before working; transient network blip mid-download dead-ended on an error pane with no retry, forcing manual re-clicks
+**Root cause:** Squirrel autoUpdater 'error' event (network category) only reset downloadInFlight + broadcast an error pane — nothing auto-retried. The hourly GH-Releases poll also fired once and waited a full hour on a transient blip. Each manual Install click = one attempt, so it 'worked after about three times'.
+**Fix:** Added bounded auto-retry. updater.ts: network-category Squirrel errors auto-re-arm checkForUpdates() on 5s/15s/45s backoff (max 3); signature-mismatch/staging/unknown still surface immediately. Counter resets on fresh user download, update-downloaded, update-not-available. github-update-check.ts: automatic poll wrapped in checkWithQuickRetry (10s/30s, 2 retries). New downloadRetryAttempt/downloadRetryMax UpdateInfo fields for the banner.
+**Commit:** a6d5122
+**Guard:** src/__tests__/update-download-retry.test.ts + update-check-retry.test.ts (backoff ladder, budget exhaustion, category gating, counter reset). Thorough inline comments at every retry decision point.
+---
+
+---
+**Date:** 2026-05-31T18:35:21Z
+**Trigger:** Codex review of v0.1.83 TTS work; v0.1.84
+**Symptom:** Muting/disabling TTS (renderer toggle, header mute, or MCP set_tts_enabled) didn't stop in-flight/queued native speech; closing main window while OAuth helper open left no way to reopen via Dock; Linux spd-say cancel didn't stop daemon playback
+**Root cause:** Cancel-on-silence lived in renderer App.tsx as two separate IPCs (cancel then setSettings) — race let a message slip through; MCP path went through main saveSettings which never cancelled. activate handler keyed off BrowserWindow.getAllWindows().length not mainWindow. spd-say SIGTERM only kills the client, daemon keeps playing.
+**Fix:** Moved cancel into main saveSettings (snapshot prev tts, gate on shared shouldCancelNativeTtsOnSettingsChange, call nativeTts.cancel() atomically with persist; removed renderer cancel). activate: if(!mainWindow)createMainWindow(). cancel(): on linux-spd adapter also spawn spd-say --cancel.
+**Commit:** 1505f2d
+**Guard:** src/__tests__/mute-cancels-inflight.test.ts (behavioural + source wiring), activate-recreates-main-window.test.ts, tts-native.test.ts spd-say --cancel cases
+---
+
+---
 **Date:** 2026-05-31T17:48:59Z
 **Trigger:** Codex menu-bar review (v0.1.83 ship task)
 **Symptom:** Preferences… menu item throws macOS 'this command is disabled and cannot be executed' alert after the window is closed then app/menu kept alive (mac), and separately a dialog-show failure silently opened the release page in the browser
