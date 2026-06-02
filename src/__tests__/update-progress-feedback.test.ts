@@ -274,14 +274,29 @@ describe('v0.1.61 — Squirrel error event broadcasts kind:error to renderer', (
     expect(p.latestVersion).toBe('v0.1.60');
   });
 
-  it('network error → categorised as network', async () => {
+  it('network error → auto-retries (no error pane) until budget exhausts, then surfaces error', async () => {
+    // v0.1.85 (voice 7280) — a TRANSIENT network error no longer dead-ends on
+    // the error pane on its FIRST occurrence; it auto-arms a bounded backoff
+    // retry instead (the "if it fails while downloading, retry" fix). Only
+    // after the retry budget is exhausted does the error pane surface.
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.triggerSquirrelDownload();
     sentMessages.length = 0;
 
+    // First network error → retry armed, NOT an error broadcast.
     fakeAutoUpdater.emit('error', new Error('connect ECONNREFUSED 140.82.121.4:443'));
+    expect(findBroadcasts('error').length).toBe(0);
 
+    // Drain the retry budget directly (each returns true until exhausted).
+    expect(updater.scheduleDownloadRetry()).toBe(true);
+    expect(updater.scheduleDownloadRetry()).toBe(true);
+    expect(updater.scheduleDownloadRetry()).toBe(false); // exhausted
+
+    // A further network error now CAN'T retry → surfaces the error pane,
+    // still correctly categorised as `network`.
+    sentMessages.length = 0;
+    fakeAutoUpdater.emit('error', new Error('connect ECONNREFUSED 140.82.121.4:443'));
     const errorBroadcasts = findBroadcasts('error');
     expect(errorBroadcasts.length).toBe(1);
     expect(errorBroadcasts[0]!.payload.errorCategory).toBe('network');

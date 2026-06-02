@@ -51,8 +51,29 @@ const RELEASES_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
 const HOUR_MS = 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 15_000;
 
+// ---------------------------------------------------------------------------
+// v0.1.85 (voice 7280) — CHECK-RETRY RESILIENCE.
+//
+// The hourly poll fires `performGithubUpdateCheck()` once. If the GH API
+// request transiently fails (Wi-Fi handoff, DNS hiccup, GH rate-limit blip,
+// 5xx), pre-v0.1.85 the renderer got an `error` UpdateInfo and then nothing
+// re-checked for a FULL HOUR. That meant a user could miss an available
+// update for an hour after one transient blip — and since the in-app download
+// is gated on the banner showing `available`, a flaky check directly feeds the
+// "update never seems to show up / is flaky" symptom Ethan reported.
+//
+// Fix: the AUTOMATIC poll paths (`first check` + hourly tick) now use
+// `checkWithQuickRetry()`, which re-attempts on an `error` result with a short
+// bounded backoff (10s → 30s, 2 retries) before settling. The on-demand
+// (forced) menu/button path is NOT wrapped — the user can just click again,
+// and a fast manual loop shouldn't be slowed by our backoff waits.
+// ---------------------------------------------------------------------------
+const CHECK_RETRY_DELAYS_MS = [10_000, 30_000];
+
 let intervalHandle: NodeJS.Timeout | undefined;
 let firstCheckTimer: NodeJS.Timeout | undefined;
+// Pending check-retry timer so a quit (`stopGithubUpdatePoller`) can cancel it.
+let checkRetryTimer: NodeJS.Timeout | undefined;
 let lastInfo: UpdateInfo | undefined;
 let lastBroadcast: UpdateInfo | undefined;
 let getAutoCheck: () => boolean = () => true;
@@ -287,6 +308,42 @@ export async function performGithubUpdateCheck(force = false): Promise<UpdateInf
 }
 
 /**
+ * v0.1.85 — run an AUTOMATIC update check that re-attempts on a transient
+ * `error` result with a short bounded backoff. Resolves with the FINAL
+ * UpdateInfo (the first non-error result, or the last error if the budget
+ * is exhausted). Each attempt already broadcasts its own UpdateInfo via
+ * `broadcast()`, so the renderer sees the transient error → checking →
+ * recovered transitions live.
+ *
+ * Only the `error` kind triggers a retry — `available` / `up-to-date` /
+ * `disabled` are terminal and returned immediately. `attempt` is 0-based:
+ * attempt 0 is the initial try, attempts 1..N consume `CHECK_RETRY_DELAYS_MS`.
+ *
+ * The optional `delay` injection (defaults to a real `setTimeout` Promise)
+ * lets the Vitest suite drive the backoff deterministically.
+ */
+export async function checkWithQuickRetry(
+  delay: (ms: number) => Promise<void> = (ms) =>
+    new Promise((resolve) => {
+      checkRetryTimer = setTimeout(resolve, ms);
+    }),
+): Promise<UpdateInfo> {
+  let last = await performGithubUpdateCheck();
+  for (let attempt = 0; attempt < CHECK_RETRY_DELAYS_MS.length; attempt += 1) {
+    // Only a transient failure is worth re-attempting. A `disabled` result
+    // means the user turned auto-check off — respect that and stop.
+    if (last.kind !== 'error') break;
+    const wait = CHECK_RETRY_DELAYS_MS[attempt];
+    log.warn(
+      `[updater-gh] check failed (${last.error ?? 'unknown'}) — quick-retry ${attempt + 1}/${CHECK_RETRY_DELAYS_MS.length} in ${wait}ms`,
+    );
+    await delay(wait);
+    last = await performGithubUpdateCheck();
+  }
+  return last;
+}
+
+/**
  * Start the GH update poller. Called once from `app.on('ready')`. Safe to
  * call repeatedly — duplicate calls are a no-op once the interval is armed.
  *
@@ -310,12 +367,15 @@ export function startGithubUpdatePoller(autoCheckGetter: () => boolean): void {
 
   // Delay the first check ~3s so we don't compete with OAuth resume + WS
   // handshake during boot. Single-shot.
+  // v0.1.85 — use the quick-retry wrapper so a transient blip at boot
+  // (Wi-Fi not yet associated, DNS warming up) doesn't strand the user on
+  // an error banner for a full hour until the next interval tick.
   firstCheckTimer = setTimeout(() => {
-    void performGithubUpdateCheck();
+    void checkWithQuickRetry();
   }, 3_000);
 
   intervalHandle = setInterval(() => {
-    void performGithubUpdateCheck();
+    void checkWithQuickRetry();
   }, HOUR_MS);
   log.info('[updater-gh] poller armed (1h interval)');
 }
@@ -332,6 +392,12 @@ export function stopGithubUpdatePoller(): void {
   if (firstCheckTimer) {
     clearTimeout(firstCheckTimer);
     firstCheckTimer = undefined;
+  }
+  // v0.1.85 — also cancel a pending quick-retry backoff so a quit mid-retry
+  // doesn't leave a dangling timer.
+  if (checkRetryTimer) {
+    clearTimeout(checkRetryTimer);
+    checkRetryTimer = undefined;
   }
 }
 
