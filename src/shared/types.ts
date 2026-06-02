@@ -851,6 +851,23 @@ export interface UpdateInfo {
    */
   downloadStartedAt?: number;
   /**
+   * v0.1.85 (voice 7280) — DOWNLOAD-RETRY telemetry. Populated on
+   * `kind === 'downloading'` payloads emitted while the updater is
+   * auto-retrying after a TRANSIENT (network) download failure.
+   *
+   *   - `downloadRetryAttempt` → 1-based retry number currently in flight
+   *     (1, 2, 3). Undefined on the first/normal download (no retry yet).
+   *   - `downloadRetryMax`     → total auto-retry budget (3) so the banner
+   *     can render "Download failed — retrying (1/3)…".
+   *
+   * Lets the banner reassure the user that a hiccup is being handled
+   * automatically rather than showing a dead error pane that needs a
+   * manual re-click — the root of Ethan's "worked after about three
+   * times" complaint.
+   */
+  downloadRetryAttempt?: number;
+  downloadRetryMax?: number;
+  /**
    * v0.1.61 — populated when `kind === 'error'`. Together with `error`
    * the banner offers a 'Open GitHub Releases' button so the user can
    * always finish a failed update manually.

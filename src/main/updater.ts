@@ -66,6 +66,179 @@ let downloadStartedAt: number | undefined;
 // anonymous percentage.
 let pendingDownloadVersion: string | undefined;
 
+// ---------------------------------------------------------------------------
+// v0.1.85 (voice 7280) — DOWNLOAD-RETRY RESILIENCE.
+//
+// THE BUG WE'RE FIXING:
+//   Ethan reported the update flow is flaky — "you click install update and
+//   then restart, and it quits and opens, and... oh well, now it's working...
+//   it just worked after about three times." i.e. the in-app download (or the
+//   quit→relaunch swap) was failing on the first ~2 attempts and only landed
+//   on the 3rd manual retry. The most likely culprit is a TRANSIENT network
+//   blip mid-download: Squirrel.Mac emits an `error` event, our handler reset
+//   `downloadInFlight=false` and broadcast an error pane, and then NOTHING
+//   retried — the user had to manually click Install again. Each manual click
+//   is one attempt; 3 clicks = the "worked after about three times" symptom.
+//
+// THE FIX:
+//   When Squirrel emits an `error` whose category is `network` (transient —
+//   the exact "fails while downloading" case Ethan called out), automatically
+//   re-arm `autoUpdater.checkForUpdates()` on a bounded exponential backoff
+//   (5s → 15s → 45s, max 3 retries) instead of dead-ending. We deliberately
+//   do NOT auto-retry `signature-mismatch` / `staging` / `unknown` categories
+//   — those won't fix themselves on retry (a bad signature stays bad), so we
+//   leave them surfaced to the user with the manual-fallback link as before.
+//
+// WHY BOUNDED + EXPONENTIAL:
+//   A transient blip (Wi-Fi handoff, DNS hiccup) usually clears within
+//   seconds, so 5s gives a fast first retry. Doubling-ish (5→15→45) avoids
+//   hammering GH releases / update.electronjs.org if the network is genuinely
+//   down. Capping at 3 attempts means a persistently-broken network surfaces
+//   the error to the user within ~65s total rather than retrying forever.
+// ---------------------------------------------------------------------------
+
+/** Backoff schedule (ms) for auto-retrying a transient download failure. */
+export const DOWNLOAD_RETRY_DELAYS_MS = [5_000, 15_000, 45_000];
+/** Max auto-retry attempts before giving up + surfacing the error pane. */
+export const DOWNLOAD_RETRY_MAX = DOWNLOAD_RETRY_DELAYS_MS.length;
+
+// How many transient download retries we've fired for the CURRENT download
+// session. Reset to 0 whenever a fresh user-initiated download starts
+// (`triggerSquirrelDownload`), whenever a download succeeds
+// (`update-downloaded`), and whenever Squirrel reports `update-not-available`
+// (no work to do). Without the reset, a download that recovered after one
+// blip would carry a stale count into the next session and give up early.
+let downloadRetryCount = 0;
+// Outstanding retry timer handle so we can cancel it if the user manually
+// re-clicks Install (avoids a manual click + an auto-retry firing
+// `checkForUpdates()` twice, which would throw "command is disabled").
+let downloadRetryTimer: NodeJS.Timeout | undefined;
+// Injectable timer for tests (Vitest fake timers drive the real globals, but
+// keeping the seam explicit makes the retry path unit-testable in isolation).
+let retrySetTimeout: (fn: () => void, ms: number) => NodeJS.Timeout =
+  ((fn, ms) => setTimeout(fn, ms)) as typeof retrySetTimeout;
+let retryClearTimeout: (h: NodeJS.Timeout) => void = (h) => clearTimeout(h);
+
+/**
+ * v0.1.85 — test seam: swap the retry timer primitives. Returns a restore
+ * fn. Not part of the runtime API; only used by the Vitest suite so it can
+ * assert the backoff schedule deterministically without real-time waits.
+ */
+export function _setRetryTimersForTest(
+  set: (fn: () => void, ms: number) => NodeJS.Timeout,
+  clear: (h: NodeJS.Timeout) => void,
+): () => void {
+  const prevSet = retrySetTimeout;
+  const prevClear = retryClearTimeout;
+  retrySetTimeout = set;
+  retryClearTimeout = clear;
+  return () => {
+    retrySetTimeout = prevSet;
+    retryClearTimeout = prevClear;
+  };
+}
+
+/** Cancel any pending auto-retry timer + reset the per-session counter. */
+function resetDownloadRetryState(): void {
+  if (downloadRetryTimer) {
+    retryClearTimeout(downloadRetryTimer);
+    downloadRetryTimer = undefined;
+  }
+  downloadRetryCount = 0;
+}
+
+/**
+ * v0.1.85 — schedule an automatic re-attempt of the in-app download after a
+ * TRANSIENT (network-category) Squirrel error. Returns `true` if a retry was
+ * armed, `false` if we've exhausted the budget (caller should leave the error
+ * surfaced). Exported for unit tests; called from the `error` handler.
+ *
+ * The retry fires `autoUpdater.checkForUpdates()` directly (same entry point
+ * `triggerSquirrelDownload` uses) — by the time it runs `downloadInFlight`
+ * has already been reset to false by the `error` handler, so the call is
+ * safe (won't hit Squirrel's "command is disabled" re-entry guard).
+ */
+export function scheduleDownloadRetry(): boolean {
+  if (downloadRetryCount >= DOWNLOAD_RETRY_MAX) {
+    log.warn(
+      `[updater] download-retry budget exhausted (${downloadRetryCount}/${DOWNLOAD_RETRY_MAX}) — leaving error surfaced`,
+    );
+    return false;
+  }
+  // Cancel any previously-armed timer so we never have two outstanding
+  // retries racing (defensive — the error handler resets in-flight first).
+  if (downloadRetryTimer) {
+    retryClearTimeout(downloadRetryTimer);
+    downloadRetryTimer = undefined;
+  }
+  const delay = DOWNLOAD_RETRY_DELAYS_MS[downloadRetryCount];
+  downloadRetryCount += 1;
+  const attempt = downloadRetryCount;
+  log.info(
+    `[updater] arming transient download retry ${attempt}/${DOWNLOAD_RETRY_MAX} in ${delay}ms`,
+  );
+  // Tell the renderer we're going to retry so the banner can show
+  // "Download failed — retrying (1/3)…" instead of a dead error pane. The
+  // banner already renders `kind: 'downloading'` as an indeterminate bar, so
+  // reusing it keeps the UI honest while we wait out the backoff.
+  broadcastSquirrelStatus({
+    kind: 'downloading',
+    currentVersion: app.getVersion(),
+    latestVersion: pendingDownloadVersion,
+    downloadStartedAt,
+    downloadRetryAttempt: attempt,
+    downloadRetryMax: DOWNLOAD_RETRY_MAX,
+    checkedAt: Date.now(),
+  });
+  downloadRetryTimer = retrySetTimeout(() => {
+    downloadRetryTimer = undefined;
+    // Guard: if the user manually recovered (update already staged) or a
+    // fresh check is already in flight, skip — re-entering checkForUpdates()
+    // now would throw Squirrel's "command is disabled".
+    if (updateDownloaded) {
+      log.info('[updater] download-retry: update already staged, skipping retry');
+      return;
+    }
+    if (downloadInFlight) {
+      log.info('[updater] download-retry: a download is already in flight, skipping retry');
+      return;
+    }
+    if (!feedURLReady) {
+      log.warn('[updater] download-retry: feed URL not ready, skipping retry');
+      return;
+    }
+    try {
+      log.info(`[updater] firing transient download retry ${attempt}/${DOWNLOAD_RETRY_MAX}`);
+      downloadInFlight = true;
+      downloadStartedAt = Date.now();
+      broadcastSquirrelStatus({
+        kind: 'downloading',
+        currentVersion: app.getVersion(),
+        latestVersion: pendingDownloadVersion,
+        downloadStartedAt,
+        downloadRetryAttempt: attempt,
+        downloadRetryMax: DOWNLOAD_RETRY_MAX,
+        checkedAt: Date.now(),
+      });
+      autoUpdater.checkForUpdates();
+    } catch (err) {
+      // A synchronous throw on the retry means the check never started; reset
+      // the in-flight flag so the NEXT error-driven retry (or a manual click)
+      // isn't incorrectly blocked.
+      downloadInFlight = false;
+      downloadStartedAt = undefined;
+      log.error('[updater] download-retry: checkForUpdates() threw', err);
+      appendErrorLog({
+        subsystem: 'updater',
+        phase: 'updater.download-retry-threw',
+        errorMessage: errorToString(err),
+        context: { attempt: String(attempt) },
+      });
+    }
+  }, delay);
+  return true;
+}
+
 /**
  * Push an UpdateInfo payload to every live BrowserWindow via the existing
  * `IPC.UPDATE_STATUS` channel — shared with the GH-Releases poller so the
@@ -279,6 +452,10 @@ function attachSquirrelProgressForwarders(): void {
   autoUpdater.on('update-not-available', () => {
     downloadInFlight = false;
     downloadStartedAt = undefined;
+    // v0.1.85 — nothing to download, so cancel any pending transient retry
+    // and reset the per-session counter. (A retry that was armed by a blip
+    // before Squirrel concluded "no update" would otherwise fire pointlessly.)
+    resetDownloadRetryState();
   });
   autoUpdater.on('error', (err) => {
     // v0.1.61 — broadcast the error to the renderer so the banner can
@@ -309,15 +486,40 @@ function attachSquirrelProgressForwarders(): void {
       // log file. Cleared in `checking-for-update` and `update-downloaded`.
       lastErrorMessage = message;
       lastErrorCategory = category;
-      broadcastSquirrelStatus({
-        kind: 'error',
-        currentVersion: app.getVersion(),
-        latestVersion: pendingDownloadVersion,
-        error: message,
-        errorCategory: category,
-        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
-        checkedAt: Date.now(),
-      });
+      // v0.1.85 (voice 7280) — DOWNLOAD-RETRY: if this is a TRANSIENT
+      // (network-category) failure mid-download, auto-retry on a bounded
+      // backoff instead of dead-ending the user on the error pane. This is
+      // the headline fix for "if it fails while downloading, retry" — the
+      // exact "worked after about three times" symptom Ethan reported was a
+      // network blip that previously needed a manual re-click each time.
+      //
+      // Note the ordering: `downloadInFlight`/`downloadStartedAt` were reset
+      // ABOVE before we get here, so `scheduleDownloadRetry()`'s deferred
+      // `checkForUpdates()` won't trip Squirrel's re-entry guard.
+      //
+      // We only auto-retry `network`. `signature-mismatch` (bad codesign) and
+      // `staging` (ShipIt/permission) won't self-heal on retry — retrying
+      // would just re-fail identically and spam the feed — so those stay
+      // surfaced with the manual-fallback link as before.
+      if (category === 'network' && scheduleDownloadRetry()) {
+        // A retry was armed. `scheduleDownloadRetry` already broadcast a
+        // `downloading` (retrying) payload so the banner shows progress
+        // rather than the error pane. Skip the terminal error broadcast.
+        log.info('[updater] transient download error — retry armed, suppressing error pane');
+      } else {
+        // Either a non-network category, or we've exhausted the retry budget.
+        // Surface the error pane (with manual-fallback link) as before so the
+        // user can install manually from the GitHub release page.
+        broadcastSquirrelStatus({
+          kind: 'error',
+          currentVersion: app.getVersion(),
+          latestVersion: pendingDownloadVersion,
+          error: message,
+          errorCategory: category,
+          errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
+          checkedAt: Date.now(),
+        });
+      }
     } catch (broadcastErr) {
       log.error('[updater] error broadcast failed', broadcastErr);
     }
@@ -330,6 +532,9 @@ function attachSquirrelProgressForwarders(): void {
         updateDownloaded = true;
         downloadInFlight = false;
         downloadStartedAt = undefined;
+        // v0.1.85 — download landed: cancel any pending transient retry timer
+        // and reset the counter so the next update session starts fresh.
+        resetDownloadRetryState();
         // v0.1.64 — successful download clears the cached error so the
         // MCP `update_download_status` tool stops flagging a previous
         // failure. The renderer banner is independent and already handles
@@ -695,6 +900,12 @@ export function triggerSquirrelDownload(): StartDownloadResult {
   }
   try {
     log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
+    // v0.1.85 — a fresh USER-INITIATED download resets the auto-retry budget
+    // (and cancels any pending auto-retry timer from a prior failed session)
+    // so the next transient blip gets a full 3-attempt ladder. Without this,
+    // a user manually re-clicking Install after the auto-retries exhausted
+    // would get no further auto-retries.
+    resetDownloadRetryState();
     downloadInFlight = true;
     downloadStartedAt = Date.now();
     // v0.1.61 — broadcast a `downloading` payload IMMEDIATELY (before
