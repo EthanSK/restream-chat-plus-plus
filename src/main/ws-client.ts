@@ -98,6 +98,44 @@ const AUTO_RETRY_INTERVAL_MS = 60_000;
 const POST_CONNECT_RETRY_DELAY_MS = 30_000;
 
 /**
+ * v0.1.86 (voice 4491) — subscription-loss recovery.
+ *
+ * THE BUG THIS GUARDS AGAINST: on 2026-06-06 Restream sent
+ * `connection_closed` frames with reason "replaced" for EVERY platform
+ * connection (youtube/twitch/discord/facebook) at once. `applyConnectionClosed`
+ * dutifully deleted each entry, draining `this.connections` to empty — but the
+ * underlying WS socket stayed OPEN (30s heartbeats kept flowing). The result:
+ *
+ *   - We were subscribed to NOTHING, so NO chat `event` frames ever arrived
+ *     again → the TTS dispatcher was never called → TTS went dead silent for
+ *     47 minutes (only 1248 heartbeats in the raw log, zero events).
+ *   - The stale-inbound watchdog couldn't catch it because heartbeats bump
+ *     `lastInboundFrameAt` every 30s, so `staleForMs` never exceeded the
+ *     90s threshold. Heartbeats MASK the dead-for-events state.
+ *   - This never went through `handleDisconnect` (the socket never closed),
+ *     so the managed OAuth-refresh + `chat.reconnect()` path — which is what
+ *     RE-SUBSCRIBES — never ran.
+ *
+ * THE FIX: when `connection_closed` drains the active connection count to
+ * zero while the socket is still OPEN, schedule ONE debounced managed
+ * reconnect through the same `reconnectProvider` the manual Reconnect button
+ * uses (which tears down + re-handshakes + re-subscribes). A short debounce
+ * coalesces the burst of per-platform "replaced" frames into a single
+ * reconnect instead of one per platform.
+ *
+ * REPLACE-WAR GUARD: "replaced" means a competing client took over the
+ * Restream session. If, AFTER we reconnect, we get drained to zero AGAIN
+ * within `REPLACE_WAR_WINDOW_MS`, that competing client is still there and
+ * blindly reconnecting forever would ping-pong the session between the two
+ * clients. So on the second drain inside the window we do NOT reconnect —
+ * we surface a clear warning ("another client took over — close it") and
+ * stand down until the user resolves it (a manual Reconnect, or the next
+ * fresh WS session via app restart / sign-in, resets the guard).
+ */
+const SUBSCRIPTION_RECOVERY_DEBOUNCE_MS = 2_000;
+const REPLACE_WAR_WINDOW_MS = 60_000;
+
+/**
  * Result returned by the `reconnectProvider` hook. `ok` indicates whether
  * the WS handshake will be attempted with a fresh token (i.e. OAuth refresh
  * succeeded if needed AND `chat.reconnect()` fired). When `ok: false`, the
@@ -160,6 +198,26 @@ export class ChatClient extends EventEmitter {
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
   private lastInboundFrameAt = 0;
+  /**
+   * v0.1.86 (voice 4491): timestamp (Date.now() ms) of the last MEANINGFUL
+   * chat-traffic frame — i.e. an `event` or `connection_info` frame, NOT a
+   * heartbeat. Distinct from `lastInboundFrameAt` (which every inbound frame
+   * bumps, heartbeats included).
+   *
+   * WHY: the original stale-inbound watchdog couldn't detect the 2026-06-06
+   * "replaced-drained-all-subs" outage because heartbeats kept
+   * `lastInboundFrameAt` fresh, so it looked healthy. This field lets a
+   * post-mortem SEE how long it's actually been since real chat activity.
+   *
+   * IMPORTANT: a long gap here does NOT by itself mean anything is broken —
+   * a genuinely quiet (but healthy + subscribed) chat can go minutes/hours
+   * with no events. We deliberately do NOT reconnect on this signal alone
+   * (that would false-positive on quiet streams). The reliable trigger for
+   * subscription loss is the connections-drained-to-zero signal in
+   * `handleAllConnectionsDrained`. This timestamp is for OBSERVABILITY only
+   * (logged in the stale-watchdog row) — see step 2 of the v0.1.86 fix.
+   */
+  private lastChatTrafficAt = 0;
   private attempt = 0;
   private accessToken?: string;
   private stopped = false;
@@ -250,6 +308,38 @@ export class ChatClient extends EventEmitter {
    */
   private connections = new Map<string, ChatConnection>();
 
+  // ------------------------------------------------------------------
+  // v0.1.86 (voice 4491) — subscription-loss recovery state. See the
+  // SUBSCRIPTION_RECOVERY_DEBOUNCE_MS / REPLACE_WAR_WINDOW_MS comment block
+  // above for the bug history + design.
+  // ------------------------------------------------------------------
+
+  /**
+   * Pending debounce timer for the subscription-loss recovery reconnect.
+   * We coalesce the burst of per-platform "replaced" `connection_closed`
+   * frames (one each for youtube/twitch/discord/facebook) into ONE managed
+   * reconnect by waiting SUBSCRIPTION_RECOVERY_DEBOUNCE_MS after the count
+   * first hits zero. Cleared once it fires, or on stop()/reconnect()/start().
+   */
+  private subscriptionRecoveryTimer?: NodeJS.Timeout;
+  /**
+   * Wall-clock ms (Date.now()) at which we LAST triggered a subscription-loss
+   * recovery reconnect, or 0 if we never have this session. The replace-war
+   * guard compares the next drain-to-zero against this: if it lands within
+   * REPLACE_WAR_WINDOW_MS we assume a competing client is fighting us and
+   * stand down instead of reconnecting again. Reset on start()/reconnect()/
+   * stop() (fresh session = fresh guard).
+   */
+  private lastSubscriptionRecoveryAt = 0;
+  /**
+   * Latches true once the replace-war guard has tripped this session, so we
+   * only log the warning + emit it ONCE (not on every subsequent drain).
+   * Reset on start()/reconnect()/stop(). A successful re-subscribe (seeing a
+   * fresh connection_info that repopulates the map) clears it so a LATER,
+   * genuinely-new replace event can recover again.
+   */
+  private replaceWarGuardTripped = false;
+
   /**
    * The current Restream chat context — the `{showId, eventId, instant}`
    * triple-tagged union the chat backend uses to scope a `POST /client/reply`
@@ -332,6 +422,7 @@ export class ChatClient extends EventEmitter {
     this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
+    this.resetSubscriptionRecoveryState();
     this.connect();
   }
 
@@ -340,6 +431,7 @@ export class ChatClient extends EventEmitter {
     this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
+    this.resetSubscriptionRecoveryState();
     this.clearTimers();
     this.ws?.removeAllListeners();
     try {
@@ -382,6 +474,10 @@ export class ChatClient extends EventEmitter {
     this.lastInboundFrameAt = 0;
     this.hasEverConnectedThisSession = false;
     this.postConnectRetryUsedThisSession = false;
+    // v0.1.86: a manual/managed reconnect is the user explicitly asking us
+    // to re-grab the session, so the replace-war guard must reset — they may
+    // have just closed the competing client and want us to take over again.
+    this.resetSubscriptionRecoveryState();
     this.connect();
   }
 
@@ -477,6 +573,9 @@ export class ChatClient extends EventEmitter {
     ws.on('open', () => {
       this.attempt = 0;
       this.lastInboundFrameAt = Date.now();
+      // v0.1.86: seed chat-traffic timestamp at open so the stale-watchdog's
+      // "chatQuietForMs" reading is measured from connect, not from epoch 0.
+      this.lastChatTrafficAt = Date.now();
       this.hasEverConnectedThisSession = true;
       this.appendRawLog({ kind: 'ws-open' });
       this.setState({ status: 'connected', attempt: 0 });
@@ -547,6 +646,20 @@ export class ChatClient extends EventEmitter {
       // connections map so the renderer's channels panel stays in sync.
       if (parsed && typeof parsed === 'object') {
         const p = parsed as Record<string, any>;
+        // v0.1.86: bump the meaningful-chat-traffic timestamp on any non-
+        // heartbeat action. `event` = a real chat message; `connection_info`
+        // / `connection_closed` = subscription churn. These are the frames
+        // that prove we're still actually subscribed to something — unlike
+        // heartbeats (action 'heartbeat' / ping-pong) which flow regardless.
+        // Used for observability in the stale-watchdog log row (NOT as a
+        // reconnect trigger — see the field comment on lastChatTrafficAt).
+        if (
+          p.action === 'event' ||
+          p.action === 'connection_info' ||
+          p.action === 'connection_closed'
+        ) {
+          this.lastChatTrafficAt = Date.now();
+        }
         if (p.action === 'connection_info') {
           if (p.payload?.status === 'error') {
             this.appendRawLog({
@@ -841,10 +954,20 @@ export class ChatClient extends EventEmitter {
           : 0;
         if (staleForMs > STALE_INBOUND_TIMEOUT_MS) {
           const reason = `stale inbound ${staleForMs}ms`;
+          // v0.1.86: record how long it's been since MEANINGFUL chat traffic
+          // (events / connection_info) and how many connections we hold — so
+          // a post-mortem can distinguish "WS truly dead" (this branch) from
+          // the v0.1.86 "heartbeats-flowing-but-no-subs" outage (which never
+          // reaches here precisely because heartbeats keep staleForMs low).
+          const chatQuietForMs = this.lastChatTrafficAt
+            ? Date.now() - this.lastChatTrafficAt
+            : 0;
           this.appendRawLog({
             kind: 'ws-stale',
             staleForMs,
             timeoutMs: STALE_INBOUND_TIMEOUT_MS,
+            chatQuietForMs,
+            activeConnections: this.connections.size,
           });
           // v0.1.69 (voice 4015): stale-inbound is a healthy-WS-gone-quiet
           // signal — Restream's TCP didn't FIN, we just stopped hearing
@@ -890,6 +1013,29 @@ export class ChatClient extends EventEmitter {
     this.clearHeartbeat();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    // v0.1.86: also cancel any pending subscription-loss recovery debounce so
+    // a torn-down/replaced WS doesn't fire a stale recovery reconnect after
+    // we've already moved on.
+    if (this.subscriptionRecoveryTimer) {
+      clearTimeout(this.subscriptionRecoveryTimer);
+      this.subscriptionRecoveryTimer = undefined;
+    }
+  }
+
+  /**
+   * v0.1.86: reset all subscription-loss-recovery bookkeeping back to a
+   * pristine "fresh session" state. Called from start()/stop()/reconnect()
+   * (every event that begins or ends a logical WS session). Cancels the
+   * debounce timer and forgets the replace-war timestamp + latch so the
+   * NEXT session can recover from a drain-to-zero independently.
+   */
+  private resetSubscriptionRecoveryState(): void {
+    if (this.subscriptionRecoveryTimer) {
+      clearTimeout(this.subscriptionRecoveryTimer);
+      this.subscriptionRecoveryTimer = undefined;
+    }
+    this.lastSubscriptionRecoveryAt = 0;
+    this.replaceWarGuardTripped = false;
   }
 
   private setState(s: ConnectionState) {
@@ -962,6 +1108,23 @@ export class ChatClient extends EventEmitter {
     const prev = this.connections.get(connectionIdentifier);
     if (prev && connectionsEqual(prev, next)) return; // skip noisy duplicates
     this.connections.set(connectionIdentifier, next);
+    // v0.1.86: seeing a fresh connection_info means we're (re)subscribed and
+    // chat is flowing again. If the replace-war guard had tripped and we'd
+    // surfaced a warning, clear it now — a LATER drain-to-zero should be able
+    // to recover again rather than being permanently suppressed. Also clear
+    // any lingering renderer warning on the live state.
+    if (this.replaceWarGuardTripped) {
+      this.replaceWarGuardTripped = false;
+      this.lastSubscriptionRecoveryAt = 0;
+      this.appendRawLog({
+        kind: 'subscription-recovered',
+        connectionIdentifier,
+      });
+      if (this.state.status === 'connected' && this.state.warning) {
+        // Re-emit the connected state without the stale warning.
+        this.setState({ status: 'connected', attempt: 0 });
+      }
+    }
     this.emit('connections', this.getConnections());
   }
 
@@ -984,7 +1147,186 @@ export class ChatClient extends EventEmitter {
         break;
       }
     }
-    if (changed) this.emit('connections', this.getConnections());
+    if (changed) {
+      this.emit('connections', this.getConnections());
+      // v0.1.86 (voice 4491): if removing this entry drained us to ZERO active
+      // platform connections while the WS socket is still OPEN, we've lost all
+      // chat subscriptions but the socket won't close (heartbeats keep flowing)
+      // — so nothing else triggers a re-subscribe. Kick the subscription-loss
+      // recovery path. We pass the closed-frame reason ("replaced",
+      // "duplicate", etc) through so the replace-war guard + logs can use it.
+      if (this.connections.size === 0) {
+        this.handleAllConnectionsDrained(typeof p.reason === 'string' ? p.reason : 'unknown');
+      }
+    }
+  }
+
+  /**
+   * v0.1.86 (voice 4491): handle "we just lost our LAST chat subscription
+   * while the WS socket is still open". See the
+   * SUBSCRIPTION_RECOVERY_DEBOUNCE_MS comment block at the top of this file
+   * for the full bug history. This is the PRIMARY (and only reliable) trigger
+   * for subscription-loss recovery — the stale-inbound watchdog can't catch
+   * it because heartbeats keep `lastInboundFrameAt` fresh.
+   *
+   * State machine:
+   *   - Socket NOT open  → do nothing. A closed/closing socket will go through
+   *     handleDisconnect → the normal managed reconnect path already.
+   *   - Replace-war:      → if we ALREADY triggered a recovery reconnect within
+   *     REPLACE_WAR_WINDOW_MS, a competing client is fighting us for the
+   *     session. Do NOT reconnect again (would ping-pong forever). Surface a
+   *     one-shot warning + log instead, and stand down.
+   *   - Otherwise         → debounce a SINGLE managed reconnect (coalesces the
+   *     burst of per-platform "replaced" frames into one).
+   */
+  private handleAllConnectionsDrained(reason: string): void {
+    // Only act while the socket is genuinely OPEN. If it's closed/closing, the
+    // close handler → handleDisconnect already owns recovery; reconnecting from
+    // here too would double-fire.
+    const socketOpen = this.ws?.readyState === WebSocket.OPEN;
+    this.appendRawLog({
+      kind: 'all-connections-drained',
+      reason,
+      socketOpen,
+    });
+    if (!socketOpen) return;
+    // No managed-reconnect provider installed (e.g. early boot, or a unit test
+    // exercising the raw WS state machine) → nothing safe we can do here; the
+    // legacy bare-reconnect path doesn't apply because the socket is still
+    // open. Leave it; the next genuine close will recover via handleDisconnect.
+    if (!this.reconnectProvider) {
+      this.appendRawLog({ kind: 'subscription-recovery-skipped', why: 'no-provider' });
+      return;
+    }
+
+    const now = Date.now();
+    const sinceLastRecovery = this.lastSubscriptionRecoveryAt
+      ? now - this.lastSubscriptionRecoveryAt
+      : Number.POSITIVE_INFINITY;
+
+    // REPLACE-WAR GUARD: we recently triggered a recovery reconnect and got
+    // drained to zero AGAIN within the window → a competing Restream client is
+    // still holding the session. Reconnecting again would ping-pong. Stand
+    // down and tell the user to close the other client. One-shot per session
+    // (latched) until a successful re-subscribe clears it.
+    if (sinceLastRecovery <= REPLACE_WAR_WINDOW_MS) {
+      if (!this.replaceWarGuardTripped) {
+        this.replaceWarGuardTripped = true;
+        const warning =
+          'Another Restream client or browser tab took over your chat connection — ' +
+          'close it to let cha++ hold the connection.';
+        this.appendRawLog({
+          kind: 'replace-war-guard-tripped',
+          reason,
+          sinceLastRecoveryMs: sinceLastRecovery,
+          windowMs: REPLACE_WAR_WINDOW_MS,
+        });
+        appendErrorLog({
+          subsystem: 'ws',
+          phase: 'ws.replace-war-guard',
+          errorMessage: warning,
+          context: { reason, sinceLastRecoveryMs: sinceLastRecovery },
+        });
+        // Surface to the renderer WITHOUT flipping status off 'connected' (the
+        // socket is still open — it's a competing-client problem, not a
+        // connectivity problem). The renderer shows this as a non-blocking
+        // warning next to the status dot.
+        this.setState({ status: 'connected', attempt: 0, warning });
+      }
+      // Cancel any debounce that may have been armed before the guard tripped.
+      if (this.subscriptionRecoveryTimer) {
+        clearTimeout(this.subscriptionRecoveryTimer);
+        this.subscriptionRecoveryTimer = undefined;
+      }
+      return;
+    }
+
+    // Debounce: coalesce the burst of per-platform "replaced" frames into ONE
+    // reconnect. If a timer is already armed, the latest drain just keeps it
+    // armed (no reset needed — it'll fire once shortly).
+    if (this.subscriptionRecoveryTimer) return;
+    this.appendRawLog({
+      kind: 'subscription-recovery-scheduled',
+      reason,
+      debounceMs: SUBSCRIPTION_RECOVERY_DEBOUNCE_MS,
+    });
+    this.subscriptionRecoveryTimer = setTimeout(() => {
+      this.subscriptionRecoveryTimer = undefined;
+      if (this.stopped) return;
+      // Re-check the preconditions at fire time: a real connection_info may
+      // have arrived during the debounce window (Restream re-subscribed us on
+      // its own) — if so the map is non-empty and we don't need to reconnect.
+      if (this.connections.size > 0) {
+        this.appendRawLog({ kind: 'subscription-recovery-aborted', why: 'connections-repopulated' });
+        return;
+      }
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        this.appendRawLog({ kind: 'subscription-recovery-aborted', why: 'socket-not-open' });
+        return;
+      }
+      if (this.providerInFlight) {
+        this.appendRawLog({ kind: 'subscription-recovery-aborted', why: 'provider-in-flight' });
+        return;
+      }
+      const provider = this.reconnectProvider;
+      if (!provider) return;
+      // Stamp the recovery time BEFORE invoking so the replace-war guard can
+      // detect a second drain that lands during/just-after this reconnect.
+      this.lastSubscriptionRecoveryAt = Date.now();
+      this.providerInFlight = true;
+      this.appendErrorLogSubscriptionRecovery(reason);
+      Promise.resolve()
+        .then(() => provider())
+        .then((outcome) => {
+          this.providerInFlight = false;
+          this.appendRawLog({
+            kind: 'subscription-recovery-result',
+            ok: outcome.ok,
+            failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+          });
+          try {
+            this.autoAttemptListener?.({
+              attempt: this.attempt,
+              reason: `subscription-recovery:${reason}`,
+              outcome: outcome.ok ? 'ok' : 'failed',
+              failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+        })
+        .catch((err) => {
+          this.providerInFlight = false;
+          const msg = (err as Error)?.message ?? String(err);
+          this.appendRawLog({ kind: 'subscription-recovery-result', ok: false, failureReason: msg });
+          try {
+            this.autoAttemptListener?.({
+              attempt: this.attempt,
+              reason: `subscription-recovery:${reason}`,
+              outcome: 'failed',
+              failureReason: msg,
+            });
+          } catch {
+            // never break delivery on a listener failure
+          }
+        });
+    }, SUBSCRIPTION_RECOVERY_DEBOUNCE_MS);
+  }
+
+  /**
+   * v0.1.86: emit the structured app-errors.jsonl row when a subscription-loss
+   * recovery reconnect actually fires. Kept as a tiny helper so the
+   * (test-friendly) decision logic above stays readable. This is the row the
+   * next post-mortem greps for to see "the app noticed it lost all subs and
+   * kicked a reconnect at HH:MM:SS".
+   */
+  private appendErrorLogSubscriptionRecovery(reason: string): void {
+    appendErrorLog({
+      subsystem: 'ws',
+      phase: 'ws.subscription-recovery',
+      errorMessage: `all chat connections drained (reason "${reason}") while WS open — triggering managed reconnect to re-subscribe`,
+      context: { reason },
+    });
   }
 
   private resolveRawLogPath(): string | undefined {
