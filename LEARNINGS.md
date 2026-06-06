@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-06T14:14:01Z
+**Trigger:** voice 4491
+**Symptom:** TTS silently went dead for 47 min mid-stream; chat feed stopped getting new messages but the app still looked 'connected' (heartbeats flowing)
+**Root cause:** Restream sent connection_closed reason:'replaced' for ALL platform connections at once, draining the in-memory connections map to empty WHILE the WS socket stayed OPEN. Zero subscriptions => no chat 'event' frames => decideTtsAction never called. Stale-inbound watchdog couldn't catch it (heartbeats keep lastInboundFrameAt fresh so staleForMs never crossed 90s); nothing went through handleDisconnect (socket never closed) so the managed re-subscribe (chat.reconnect via reconnectProvider) never fired.
+**Fix:** ws-client.ts handleAllConnectionsDrained(): on connection_closed draining active connections to 0 while socket OPEN, schedule ONE debounced (2s) managed reconnect via reconnectProvider (re-subscribes); debounce coalesces the per-platform 'replaced' burst. Replace-war guard: a 2nd drain within 60s of our own recovery = competing client, stand down (no ping-pong) + surface ConnectionState.warning. Added lastChatTrafficAt observability (NOT a reconnect trigger). New structured log rows. Surfaced warning inline in renderer status label.
+**Commit:** 6299a3e
+**Guard:** src/__tests__/ws-subscription-recovery.test.ts: (a) drain-all schedules exactly ONE reconnect, (b) replace-war guard blocks 2nd + warns, (c) quiet-but-connected does NOT reconnect, + socket-not-open bail + attempt-listener report. 629/629 pass. Thorough inline comments at every decision point.
+---
+
+---
 **Date:** 2026-06-02T15:47:37Z
 **Trigger:** voice 7280
 **Symptom:** Electron auto-update flaky: clicking Install Update + Restart failed the first ~2-3 times before working; transient network blip mid-download dead-ended on an error pane with no retry, forcing manual re-clicks
