@@ -986,7 +986,12 @@ function statusLabel(conn: ConnectionState, auth: AuthStatus): string {
   if (!auth.authenticated) return 'Not signed in';
   switch (conn.status) {
     case 'connected':
-      return 'Connected';
+      // v0.1.86 (voice 4491): the socket can be 'connected' yet carry a
+      // non-fatal warning — currently the "replace-war" case where another
+      // Restream client/tab grabbed the chat session and we stood down from
+      // reconnecting (see ConnectionState.warning). Show it inline so the
+      // user knows to close the competing client; the dot stays green-ish.
+      return conn.warning ? `Connected — ${conn.warning}` : 'Connected';
     case 'connecting':
       return 'Connecting…';
     case 'reconnecting':

@@ -123,6 +123,20 @@ export interface ConnectionState {
   status: ConnectionStatus;
   attempt: number;
   lastError?: string;
+  /**
+   * v0.1.86 (voice 4491): a non-fatal warning that should be surfaced to the
+   * user WITHOUT flipping the connection status away from 'connected'. Set
+   * when the WS socket is still healthy but something the user should know
+   * about happened — currently only the "replace-war" case: another Restream
+   * client (a second cha++ instance, a browser tab on chat.restream.io, OBS's
+   * built-in Restream chat, etc.) grabbed the Restream chat session, sending
+   * us repeated `connection_closed` reason:"replaced" frames. We stop
+   * auto-reconnecting in that case (reconnecting forever would ping-pong the
+   * session between the two clients) and instead ask the user to close the
+   * competing client. Cleared (set back to undefined) once we successfully
+   * re-subscribe and see chat traffic again.
+   */
+  warning?: string;
 }
 
 export interface Settings {
