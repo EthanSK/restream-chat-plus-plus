@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.1.87 — Auto-reconnect when a send goes unconfirmed (2026-06-07)
+
+Ethan (send-warning auto-reconnect request):
+> When the send-warning happens, automatically do the equivalent of
+> clicking the Refresh/Reconnect connection button, because that seemed
+> to fix it.
+
+### What's new
+
+- **Auto-heal the chat connection when a sent message goes unconfirmed.**
+  When you send a message and it never gets its WS echo within the 30s
+  guard — so it shows the red ⚠ "unconfirmed" badge — the app now
+  automatically runs the SAME managed reconnect the manual Reconnect
+  button uses (OAuth refresh + `chat.reconnect()` → re-subscribe). This is
+  the more direct, complementary trigger to v0.1.86's "all connections
+  drained" recovery: the WS can be echo-dead WITHOUT the connections map
+  draining to zero, so this catches the case v0.1.86 misses.
+- **No reconnect storm.** A burst of unconfirmed sends coalesces into ONE
+  reconnect (shared 2s debounce), and a 45s cooldown stops a
+  persistently-broken upstream from looping. The recovery shares the
+  v0.1.86 replace-war guard, so if a competing client is provably stealing
+  the connection we stand down and surface the existing "another client
+  took over" warning instead of ping-ponging.
+- **We do NOT re-send the message.** The POST already returned 200
+  (Restream accepted it), so re-sending would risk a duplicate. We only
+  heal the connection so FUTURE sends confirm. The warned message stays as
+  it is.
+- **Structured logging** at every decision point in
+  `raw-frames.jsonl` (`unconfirmed-send-recovery-requested` /
+  `-scheduled` / `-suppressed` / `-coalesced` / `-skipped` / `-result`)
+  and an `app-errors.jsonl` `ws.unconfirmed-send-recovery` row when the
+  reconnect actually fires, so the next post-mortem is grep-able.
+
+Implementation: renderer's optimistic-send timeout
+(`src/renderer/App.tsx`) fires `rcpp.notifyUnconfirmedSend()` →
+`IPC.CHAT_SEND_UNCONFIRMED` → main calls
+`chat.requestUnconfirmedSendRecovery()` in `src/main/ws-client.ts`, which
+owns the debounce + cooldown + replace-war coordination (all reused from
+the v0.1.86 plumbing). Tests in
+`src/__tests__/ws-unconfirmed-send-recovery.test.ts`.
+
 ## v0.1.79 — "Speak my own messages" toggle (2026-05-31)
 
 Ethan (2026-05-31):

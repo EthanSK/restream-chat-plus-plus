@@ -509,6 +509,23 @@ export const IPC = {
    */
   CHAT_SEND_LOG_EVENT: 'chat:send-log-event',
   /**
+   * v0.1.87 (send-warning auto-reconnect request 2026-06-07) — renderer → main
+   * fire-and-forget signal that a sent message went UNCONFIRMED (it POSTed 200
+   * but never got its `ws-echo-received` frame within the renderer's 30s
+   * `OPTIMISTIC_SEND_TIMEOUT_MS` guard, so the renderer flipped it to the red ⚠
+   * state). Main responds by triggering the SAME managed reconnect the manual
+   * Reconnect button uses — `chat.requestUnconfirmedSendRecovery()` — which
+   * re-subscribes the WS so FUTURE sends confirm again. (We do NOT re-send the
+   * message: the POST already returned 200, so re-sending risks a duplicate.)
+   *
+   * The debounce + cooldown + replace-war guard all live in `ws-client.ts`
+   * (shared with the v0.1.86 drain-to-zero recovery), so a burst of unconfirmed
+   * sends coalesces into exactly ONE reconnect and a persistently-broken
+   * upstream can't drive a reconnect loop. Payload carries nothing the main
+   * process trusts — it's a bare "heal the connection" nudge.
+   */
+  CHAT_SEND_UNCONFIRMED: 'chat:send-unconfirmed',
+  /**
    * Renderer → main. Asks the main process to pop a native context menu
    * (Menu.buildFromTemplate + popup) anchored at the cursor. Currently the
    * only item is "Clear chat"; when clicked, main sends back `CHAT_CLEAR`
