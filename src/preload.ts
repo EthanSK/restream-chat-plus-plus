@@ -130,6 +130,21 @@ const api = {
     }
   },
   /**
+   * v0.1.87 (send-warning auto-reconnect request 2026-06-07) — fire-and-forget
+   * nudge telling main that a sent message just went UNCONFIRMED (the renderer's
+   * 30s optimistic-send timeout fired with no WS echo). Main triggers the SAME
+   * managed reconnect the manual Reconnect button uses so FUTURE sends confirm
+   * again. The renderer NEVER awaits this — it's pure best-effort self-healing.
+   * Errors are swallowed: this must never break the renderer's send loop.
+   */
+  notifyUnconfirmedSend: (): void => {
+    try {
+      ipcRenderer.send(IPC.CHAT_SEND_UNCONFIRMED);
+    } catch {
+      /* never let an IPC failure break the renderer's send loop */
+    }
+  },
+  /**
    * v0.1.43 — subscribe to lifecycle status events for queued sends.
    * Renderer keys updates by `clientId` to flip the per-message
    * "sending…" / sent / failed (⚠) state in the chat feed.

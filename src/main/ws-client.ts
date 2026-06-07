@@ -136,6 +136,53 @@ const SUBSCRIPTION_RECOVERY_DEBOUNCE_MS = 2_000;
 const REPLACE_WAR_WINDOW_MS = 60_000;
 
 /**
+ * v0.1.87 (send-warning auto-reconnect request 2026-06-07) — unconfirmed-send
+ * recovery.
+ *
+ * THE SYMPTOM THIS GUARDS AGAINST: a chat message the user sends gets POSTed
+ * to `https://backend.chat.restream.io/api/client/reply` and Restream returns
+ * `200 {"success":true}`, but the matching `ws-echo-received` (`reply_created`)
+ * frame NEVER arrives. The renderer's `OPTIMISTIC_SEND_TIMEOUT_MS` (30s) guard
+ * then flips that message to the red ⚠ "unconfirmed" state. Empirically (Ethan)
+ * clicking the manual Reconnect button at that point restores the WS so
+ * subsequent sends confirm again — "that seemed to fix it".
+ *
+ * WHY IT'S A DISTINCT TRIGGER FROM v0.1.86's drain-to-zero recovery: the WS can
+ * be in a half-broken "stale/replaced socket" state where the echo round-trip
+ * is dead, WITHOUT `connection_closed` having drained the connections map to
+ * empty. So `handleAllConnectionsDrained` may never fire even though sends stop
+ * confirming. The unconfirmed-send signal is a MORE DIRECT, complementary
+ * trigger for the same managed-reconnect recovery.
+ *
+ * THE FIX: when the renderer reports an unconfirmed send (via
+ * `requestUnconfirmedSendRecovery`), schedule the SAME debounced managed
+ * reconnect (`reconnectProvider` → OAuth refresh + `chat.reconnect()` →
+ * re-subscribe) the manual button + the v0.1.86 drain path use. We deliberately
+ * REUSE the v0.1.86 state (`subscriptionRecoveryTimer`, `lastSubscriptionRecoveryAt`,
+ * `replaceWarGuardTripped`, `providerInFlight`) so the two recovery triggers
+ * coordinate and can NEVER fire two competing reconnects.
+ *
+ * DEBOUNCE / NO-STORM: a burst of unconfirmed sends (the user spam-sends while
+ * the WS is broken) coalesces into ONE reconnect via the shared debounce timer.
+ *
+ * COOLDOWN: after we fire a recovery (from EITHER trigger), we will not fire
+ * an unconfirmed-send recovery again for UNCONFIRMED_SEND_COOLDOWN_MS. This
+ * stops a persistently-broken upstream (Restream backend down, the message
+ * genuinely can't round-trip) from causing a reconnect loop — one heal attempt
+ * per cooldown window, then we wait.
+ *
+ * REPLACE-WAR: this path respects the SAME replace-war latch as v0.1.86 — if a
+ * competing client is provably fighting us (`replaceWarGuardTripped`), we stand
+ * down and surface the existing "another client took over" warning instead of
+ * reconnecting (looping would ping-pong the session).
+ *
+ * WE DO NOT RE-SEND THE MESSAGE: the POST already returned 200, so Restream
+ * accepted it; re-sending risks a duplicate. We only heal the connection so
+ * FUTURE sends confirm.
+ */
+const UNCONFIRMED_SEND_COOLDOWN_MS = 45_000;
+
+/**
  * Result returned by the `reconnectProvider` hook. `ok` indicates whether
  * the WS handshake will be attempted with a fresh token (i.e. OAuth refresh
  * succeeded if needed AND `chat.reconnect()` fired). When `ok: false`, the
@@ -1314,6 +1361,185 @@ export class ChatClient extends EventEmitter {
   }
 
   /**
+   * v0.1.87 (send-warning auto-reconnect request 2026-06-07): the renderer
+   * reports that a sent message went UNCONFIRMED — it POSTed 200 but never got
+   * its `ws-echo-received` (`reply_created`) frame within the renderer's 30s
+   * `OPTIMISTIC_SEND_TIMEOUT_MS`, so it flipped to the red ⚠ state. The
+   * established manual recovery for this is clicking Reconnect, so we do the
+   * equivalent automatically here: schedule the SAME debounced managed reconnect
+   * (re-subscribe) the v0.1.86 drain path + the manual button use.
+   *
+   * See the UNCONFIRMED_SEND_COOLDOWN_MS comment block at the top of this file
+   * for the full design rationale (debounce, cooldown, replace-war, no-resend).
+   *
+   * Decision ladder (in order):
+   *   1. No provider installed (early boot / raw-WS unit test)   → log + bail.
+   *   2. Socket not OPEN                                          → log + bail
+   *      (a closed/closing socket is already owned by handleDisconnect's
+   *      managed reconnect path; firing here too would double-fire).
+   *   3. Replace-war guard already tripped this session           → stand down
+   *      (a competing client is provably fighting us; the warning is already
+   *      surfaced; reconnecting would ping-pong).
+   *   4. Within UNCONFIRMED_SEND_COOLDOWN_MS of our LAST recovery → suppress
+   *      (cooldown — one heal attempt per window so a persistently-broken
+   *      upstream can't drive a reconnect loop). NOTE we share
+   *      `lastSubscriptionRecoveryAt` with the v0.1.86 drain path, so a drain
+   *      recovery that JUST fired also satisfies this cooldown — we won't
+   *      double-heal across the two triggers.
+   *   5. A recovery is already armed/in-flight                    → coalesce
+   *      (the burst of unconfirmed sends folds into the single pending
+   *      reconnect — exactly one reconnect, not one per warned message).
+   *   6. Otherwise                                                → arm the
+   *      shared debounce timer; on fire, invoke the provider once.
+   *
+   * Safe to call from any state and from the main process IPC handler. Never
+   * throws (logging + provider invocation are fully guarded).
+   */
+  requestUnconfirmedSendRecovery(reason = 'send-unconfirmed'): void {
+    const now = Date.now();
+    const socketOpen = this.ws?.readyState === WebSocket.OPEN;
+    this.appendRawLog({
+      kind: 'unconfirmed-send-recovery-requested',
+      reason,
+      socketOpen,
+      activeConnections: this.connections.size,
+    });
+
+    // (1) No managed-reconnect provider → nothing safe to do here.
+    if (!this.reconnectProvider) {
+      this.appendRawLog({ kind: 'unconfirmed-send-recovery-skipped', why: 'no-provider' });
+      return;
+    }
+    // (2) Socket not open → the close/disconnect path already owns recovery.
+    if (!socketOpen) {
+      this.appendRawLog({ kind: 'unconfirmed-send-recovery-skipped', why: 'socket-not-open' });
+      return;
+    }
+    // (3) Replace-war guard already tripped → a competing client is winning;
+    // stand down (the "took over" warning is already surfaced by v0.1.86).
+    if (this.replaceWarGuardTripped) {
+      this.appendRawLog({ kind: 'unconfirmed-send-recovery-skipped', why: 'replace-war-guard' });
+      return;
+    }
+    // (4) Cooldown — we (either trigger) recovered too recently. Suppress so a
+    // persistently-broken upstream can't loop us. Shared timestamp = one heal
+    // per window across BOTH the drain trigger and this one.
+    const sinceLastRecovery = this.lastSubscriptionRecoveryAt
+      ? now - this.lastSubscriptionRecoveryAt
+      : Number.POSITIVE_INFINITY;
+    if (sinceLastRecovery < UNCONFIRMED_SEND_COOLDOWN_MS) {
+      this.appendRawLog({
+        kind: 'unconfirmed-send-recovery-suppressed',
+        why: 'cooldown',
+        sinceLastRecoveryMs: sinceLastRecovery,
+        cooldownMs: UNCONFIRMED_SEND_COOLDOWN_MS,
+      });
+      return;
+    }
+    // (5) Coalesce: a recovery is already armed (debounce timer pending) or
+    // in-flight (provider call running) — the burst of warned messages folds
+    // into that single reconnect.
+    if (this.subscriptionRecoveryTimer || this.providerInFlight) {
+      this.appendRawLog({ kind: 'unconfirmed-send-recovery-coalesced' });
+      return;
+    }
+
+    // (6) Arm the SHARED debounce timer. Uses the same field as the v0.1.86
+    // drain path so a drain-recovery scheduled in the same window also coalesces
+    // (whichever armed it first wins; the other returns at step 5).
+    this.appendRawLog({
+      kind: 'unconfirmed-send-recovery-scheduled',
+      reason,
+      debounceMs: SUBSCRIPTION_RECOVERY_DEBOUNCE_MS,
+    });
+    this.subscriptionRecoveryTimer = setTimeout(() => {
+      this.subscriptionRecoveryTimer = undefined;
+      if (this.stopped) return;
+      // Re-check preconditions at fire time — the world may have changed during
+      // the debounce window (socket closed, a manual reconnect ran, a fresh
+      // echo arrived). We deliberately do NOT abort on `connections.size > 0`
+      // here (unlike the drain path): the whole point is that the socket can
+      // still hold connections yet be echo-dead, so a non-empty map is NOT
+      // evidence that sends are confirming again.
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        this.appendRawLog({ kind: 'unconfirmed-send-recovery-aborted', why: 'socket-not-open' });
+        return;
+      }
+      if (this.providerInFlight) {
+        this.appendRawLog({ kind: 'unconfirmed-send-recovery-aborted', why: 'provider-in-flight' });
+        return;
+      }
+      if (this.replaceWarGuardTripped) {
+        this.appendRawLog({ kind: 'unconfirmed-send-recovery-aborted', why: 'replace-war-guard' });
+        return;
+      }
+      const provider = this.reconnectProvider;
+      if (!provider) return;
+      // Stamp BEFORE invoking so the replace-war guard + cooldown see this
+      // recovery as the most recent (shared clock with the drain path).
+      this.lastSubscriptionRecoveryAt = Date.now();
+      this.providerInFlight = true;
+      // Structured app-errors row so a post-mortem can grep "the app noticed a
+      // send went unconfirmed and kicked a reconnect at HH:MM:SS".
+      appendErrorLog({
+        subsystem: 'ws',
+        phase: 'ws.unconfirmed-send-recovery',
+        errorMessage: `a sent message went unconfirmed (reason "${reason}") while WS open — triggering managed reconnect to re-subscribe`,
+        context: { reason },
+      });
+      this.invokeRecoveryProvider(provider, `unconfirmed-send-recovery:${reason}`);
+    }, SUBSCRIPTION_RECOVERY_DEBOUNCE_MS);
+  }
+
+  /**
+   * v0.1.87: shared "invoke the managed-reconnect provider, log the outcome,
+   * notify the auto-attempt listener" tail used by the unconfirmed-send
+   * recovery path. The v0.1.86 drain path has its own inline copy (kept as-is
+   * to avoid churning that tested code); this helper exists so the new path
+   * doesn't duplicate the fragile promise-handling + listener-guard boilerplate.
+   *
+   * Clears `providerInFlight` on both resolve + reject so a future recovery can
+   * fire. Never throws — listener callbacks are individually try/caught.
+   */
+  private invokeRecoveryProvider(provider: ReconnectProvider, logReason: string): void {
+    Promise.resolve()
+      .then(() => provider())
+      .then((outcome) => {
+        this.providerInFlight = false;
+        this.appendRawLog({
+          kind: 'unconfirmed-send-recovery-result',
+          ok: outcome.ok,
+          failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+        });
+        try {
+          this.autoAttemptListener?.({
+            attempt: this.attempt,
+            reason: logReason,
+            outcome: outcome.ok ? 'ok' : 'failed',
+            failureReason: outcome.ok ? undefined : (outcome.reason ?? 'unknown'),
+          });
+        } catch {
+          // never break delivery on a listener failure
+        }
+      })
+      .catch((err) => {
+        this.providerInFlight = false;
+        const msg = (err as Error)?.message ?? String(err);
+        this.appendRawLog({ kind: 'unconfirmed-send-recovery-result', ok: false, failureReason: msg });
+        try {
+          this.autoAttemptListener?.({
+            attempt: this.attempt,
+            reason: logReason,
+            outcome: 'failed',
+            failureReason: msg,
+          });
+        } catch {
+          // never break delivery on a listener failure
+        }
+      });
+  }
+
+  /**
    * v0.1.86: emit the structured app-errors.jsonl row when a subscription-loss
    * recovery reconnect actually fires. Kept as a tiny helper so the
    * (test-friendly) decision logic above stays readable. This is the row the
@@ -1368,6 +1594,10 @@ export const __test_backoff_for = (attempt: number): number =>
 // fake-timer-advance by exactly one interval.
 export const __test_auto_retry_interval_ms = AUTO_RETRY_INTERVAL_MS;
 export const __test_stale_inbound_timeout_ms = STALE_INBOUND_TIMEOUT_MS;
+// v0.1.87: expose the unconfirmed-send recovery cooldown + the shared debounce
+// so the unconfirmed-send recovery tests can fake-timer-advance precisely.
+export const __test_unconfirmed_send_cooldown_ms = UNCONFIRMED_SEND_COOLDOWN_MS;
+export const __test_subscription_recovery_debounce_ms = SUBSCRIPTION_RECOVERY_DEBOUNCE_MS;
 
 // ---------------------------------------------------------------------------
 // Connection helpers (free-standing so they're trivially unit-testable and

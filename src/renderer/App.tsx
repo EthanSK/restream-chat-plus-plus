@@ -242,6 +242,24 @@ export function App(): React.ReactElement {
       // actually land just too slowly for the guard to wait.
       setMessages((prev) => applyOptimisticSendTimeout(prev, clientId));
       logOptimisticSendTimeout(clientId);
+      // v0.1.87 (send-warning auto-reconnect request 2026-06-07): a send that
+      // never got its WS echo within the 30s guard means the chat WS is most
+      // likely stale/replaced — the POST landed (200) but the round-trip echo
+      // is dead. Ethan confirmed clicking Reconnect fixes it, so do the
+      // equivalent automatically: nudge main to run the SAME managed reconnect
+      // (re-subscribe) the manual button uses, so FUTURE sends confirm again.
+      // We do NOT re-send THIS message — the POST already succeeded; re-sending
+      // would risk a duplicate. main owns the debounce + cooldown + replace-war
+      // guard (see ws-client.ts requestUnconfirmedSendRecovery), so a burst of
+      // unconfirmed sends coalesces into one reconnect and a persistently-broken
+      // upstream can't loop. Fire-and-forget; guarded against a missing bridge
+      // method (older preload) so it never breaks the timeout's primary job of
+      // flipping the placeholder to the visible ⚠ state.
+      try {
+        rcpp.notifyUnconfirmedSend?.();
+      } catch {
+        // self-healing nudge must never break the stuck-send guard
+      }
       const notice = sendFailureNoticeText(optimisticSendTimeoutStatus(clientId));
       if (notice) showSendNotice(notice);
     }, OPTIMISTIC_SEND_TIMEOUT_MS);

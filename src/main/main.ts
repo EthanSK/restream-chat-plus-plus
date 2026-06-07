@@ -2170,6 +2170,39 @@ app.on('ready', async () => {
     }
   });
 
+  // ----- v0.1.87 (send-warning auto-reconnect request 2026-06-07): renderer →
+  // main "a send went unconfirmed, heal the connection" signal -------------
+  //
+  // When the renderer's 30s optimistic-send timeout fires with no WS echo, the
+  // chat WS is almost certainly stale/replaced (the POST returned 200 but the
+  // `reply_created` echo never round-tripped). Ethan confirmed clicking the
+  // manual Reconnect button at that point fixes it, so we do the equivalent
+  // automatically: ask the ChatClient to run the SAME managed reconnect
+  // (`performFullReconnect` → OAuth refresh + `chat.reconnect()` → re-subscribe)
+  // that the manual button + the v0.1.86 drain-to-zero recovery use.
+  //
+  // ALL the debounce / cooldown / replace-war coordination lives inside
+  // `chat.requestUnconfirmedSendRecovery()` (shared with v0.1.86), so this
+  // handler is a thin nudge: a burst of unconfirmed sends coalesces into ONE
+  // reconnect, and a persistently-broken upstream is capped by the cooldown.
+  // We deliberately do NOT re-send the message — the POST already succeeded.
+  ipcMain.on(IPC.CHAT_SEND_UNCONFIRMED, () => {
+    try {
+      chat.requestUnconfirmedSendRecovery('send-unconfirmed');
+    } catch (err) {
+      console.error('[main] CHAT_SEND_UNCONFIRMED handler failed', err);
+      // The recovery method is internally guarded and shouldn't throw; if it
+      // does it's a programming bug worth surfacing without DevTools open. The
+      // user-visible ⚠ on the message is unaffected — this is only the
+      // self-healing nudge.
+      appendErrorLog({
+        subsystem: 'main',
+        phase: 'main.chat-send-unconfirmed-handler-failed',
+        errorMessage: errorToString(err),
+      });
+    }
+  });
+
   // ----- IPC: pop native chat-feed context menu (right-click on feed) -----
   // Renderer's `.feed` element wires `onContextMenu` to call this handler.
   // We use a native popup (Menu.buildFromTemplate + popup) rather than a
