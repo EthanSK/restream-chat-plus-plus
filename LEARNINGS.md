@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-07T14:20:55Z
+**Trigger:** voice/msg send-warning auto-reconnect request 2026-06-07
+**Symptom:** Sent chat message shows red ⚠ unconfirmed badge: POST to /api/client/reply returns 200 {success:true} but no matching ws-echo-received (reply_created) frame arrives within the renderer's 30s OPTIMISTIC_SEND_TIMEOUT_MS guard. Clicking the manual Reconnect button restores it.
+**Root cause:** The chat WS goes echo-dead (stale/replaced socket) so sends stop round-tripping, but connection_closed may NOT have drained the connections map to zero — so v0.1.86's handleAllConnectionsDrained never fires. No automatic recovery existed for this echo-dead-but-not-drained state.
+**Fix:** v0.1.87: renderer optimistic-send timeout (App.tsx) fires rcpp.notifyUnconfirmedSend() -> IPC.CHAT_SEND_UNCONFIRMED -> main chat.requestUnconfirmedSendRecovery() in ws-client.ts runs the SAME managed reconnect (performFullReconnect -> OAuth refresh + chat.reconnect -> re-subscribe) the manual button uses. Reuses v0.1.86 debounce(2s)+cooldown(45s)+replace-war state so the two triggers never fire competing reconnects. Does NOT re-send the message (POST already 200 = avoid dup).
+**Commit:** 3796309
+**Guard:** src/__tests__/ws-unconfirmed-send-recovery.test.ts (8 tests: 1 unconfirmed->1 reconnect, burst->1, cooldown suppresses 2nd, confirmed send->no reconnect, replace-war stand-down, no-provider/socket-closed bails, listener reporting). Thorough inline comments at the requestUnconfirmedSendRecovery decision ladder + UNCONFIRMED_SEND_COOLDOWN_MS comment block.
+---
+
+---
 **Date:** 2026-06-06T14:14:01Z
 **Trigger:** voice 4491
 **Symptom:** TTS silently went dead for 47 min mid-stream; chat feed stopped getting new messages but the app still looked 'connected' (heartbeats flowing)
