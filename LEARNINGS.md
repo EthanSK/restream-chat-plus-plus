@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-08T17:06:13Z
+**Trigger:** voice 4504
+**Symptom:** Own sent message keeps stuck red ⚠ 'unconfirmed' badge even after the v0.1.87 auto-reconnect re-subscribes and the message actually delivered. The 30s OPTIMISTIC_SEND_TIMEOUT_MS flipped the placeholder to pendingSend:'failed' during the echo-dead window; nothing ever downgraded it back.
+**Root cause:** Two gaps after v0.1.87. (1) A LATE WS echo (arriving after the 30s timeout, common right after a resubscribe) technically already cleared the ⚠ via dedupeOptimisticOnEcho replacing any pendingSend!==undefined placeholder, but it was undetected/unlogged. (2) When NO echo replays after re-subscribe (Restream doesn't always replay queued replies), nothing cleared the ⚠ even though the POST had returned HTTP 200 (= it delivered). No signal told the renderer 'a managed reconnect just succeeded' to sweep those.
+**Fix:** v0.1.88. ws-client.ts emits new 'reconnect-succeeded' event on the SUCCESS branch of both managed-recovery paths (v0.1.86 drain + v0.1.87 unconfirmed-send via emitReconnectSucceeded). main.ts forwards it to renderer over new IPC.CONN_RECONNECT_SUCCEEDED, and the manual Reconnect handler sends the same IPC directly on success. Renderer (App.tsx): tracks HTTP-200 sends in httpOkSendsRef (from the queue's 'sent' ChatSendStatus, capped 2000), on onReconnectSucceeded runs resolveLingeringFailedSendsOnReconnect() which clears ⚠ ONLY for failed sends whose id is in the HTTP-200 set (genuine non-200 failures stay flagged; never re-sends). Late-echo path logs late-echo-resolved when an echo resolves a 'failed' placeholder. New chat-send.jsonl rows: late-echo-resolved + reconnect-sweep-cleared.
+**Commit:** 5c5271c
+**Guard:** src/__tests__/send-warning-resolution.test.ts (4 spec cases a-d: late echo clears ⚠, reconnect sweep clears HTTP-200, NOT no-200, confirmed unaffected) + ws-unconfirmed-send-recovery.test.ts new cases (emits reconnect-succeeded on unconfirmed + drain success, NOT on provider fail). 647 tests pass, typecheck clean. Thorough inline comments at every new decision point.
+---
+
+---
 **Date:** 2026-06-07T14:20:55Z
 **Trigger:** voice/msg send-warning auto-reconnect request 2026-06-07
 **Symptom:** Sent chat message shows red ⚠ unconfirmed badge: POST to /api/client/reply returns 200 {success:true} but no matching ws-echo-received (reply_created) frame arrives within the renderer's 30s OPTIMISTIC_SEND_TIMEOUT_MS guard. Clicking the manual Reconnect button restores it.

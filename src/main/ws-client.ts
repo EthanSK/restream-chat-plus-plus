@@ -230,6 +230,32 @@ export interface ChatClientEvents {
    * channels + per-platform expansion.
    */
   connections: (cs: ChatConnection[]) => void;
+  /**
+   * v0.1.88 (voice 4504, 2026-06-08) — emitted when a MANAGED reconnect
+   * (the v0.1.86 drain-to-zero recovery OR the v0.1.87 unconfirmed-send
+   * recovery) successfully completes its provider call (`outcome.ok === true`).
+   *
+   * WHY THIS EXISTS: v0.1.87 made an unconfirmed send (POST 200 but no WS echo
+   * within 30s, so the renderer flips the message to a red ⚠) automatically
+   * trigger a managed reconnect that re-subscribes the WS so FUTURE sends
+   * confirm. But the ALREADY-warned message keeps its stuck ⚠ even after the
+   * connection recovers and that message empirically DID deliver (every HTTP-200
+   * send round-tripped once we re-subscribed). Ethan asked for the ⚠ to clear
+   * itself after the reconnect. This event is the "a managed reconnect just
+   * succeeded" signal main.ts forwards to the renderer (over
+   * IPC.CONN_RECONNECT_SUCCEEDED) so the renderer can sweep lingering
+   * failed-but-HTTP-200 optimistic sends and resolve their ⚠.
+   *
+   * `reason` is the provider-invocation context string (e.g.
+   * 'subscription-recovery:replaced', 'unconfirmed-send-recovery:send-unconfirmed')
+   * for observability only — the renderer sweep does not branch on it.
+   *
+   * NOTE: this fires only for the AUTOMATIC managed recoveries inside this
+   * client. The MANUAL Reconnect toolbar button's success is signalled
+   * separately by main.ts itself (it owns that IPC handler), so we don't
+   * double-emit here for the manual path.
+   */
+  'reconnect-succeeded': (reason: string) => void;
 }
 
 /**
@@ -1341,6 +1367,13 @@ export class ChatClient extends EventEmitter {
           } catch {
             // never break delivery on a listener failure
           }
+          // v0.1.88 (voice 4504): on a SUCCESSFUL managed reconnect, tell
+          // listeners so the renderer can sweep lingering ⚠ on HTTP-200 sends
+          // that this reconnect just made deliverable again. Guarded — a
+          // listener throw must never break the recovery promise chain.
+          if (outcome.ok) {
+            this.emitReconnectSucceeded(`subscription-recovery:${reason}`);
+          }
         })
         .catch((err) => {
           this.providerInFlight = false;
@@ -1521,6 +1554,13 @@ export class ChatClient extends EventEmitter {
         } catch {
           // never break delivery on a listener failure
         }
+        // v0.1.88 (voice 4504): on a SUCCESSFUL unconfirmed-send recovery the
+        // WS is re-subscribed, so the very send that warned (and any other
+        // HTTP-200 send still showing ⚠) is now deliverable. Signal listeners
+        // so the renderer can sweep + clear those lingering warnings.
+        if (outcome.ok) {
+          this.emitReconnectSucceeded(logReason);
+        }
       })
       .catch((err) => {
         this.providerInFlight = false;
@@ -1537,6 +1577,23 @@ export class ChatClient extends EventEmitter {
           // never break delivery on a listener failure
         }
       });
+  }
+
+  /**
+   * v0.1.88 (voice 4504): emit the 'reconnect-succeeded' event after a managed
+   * recovery's provider call resolves ok. Wrapped in try/catch + a raw-log row
+   * so a listener throw can never break the recovery promise chain (the whole
+   * point of the recovery is to heal the connection; surfacing the heal to the
+   * renderer is best-effort on top of that). main.ts subscribes and forwards
+   * the signal to the renderer over IPC.CONN_RECONNECT_SUCCEEDED.
+   */
+  private emitReconnectSucceeded(reason: string): void {
+    this.appendRawLog({ kind: 'reconnect-succeeded', reason });
+    try {
+      this.emit('reconnect-succeeded', reason);
+    } catch {
+      // never break the recovery chain on a listener failure
+    }
   }
 
   /**

@@ -573,7 +573,9 @@ export type ChatSendLogRecord =
   | ChatSendFinalFailureLogRecord
   | ChatSendStatusEmitFailedLogRecord
   | ChatSendOptimisticTimeoutLogRecord
-  | ChatSendWsEchoLogRecord;
+  | ChatSendWsEchoLogRecord
+  | ChatSendLateEchoResolvedLogRecord
+  | ChatSendReconnectSweepLogRecord;
 
 export interface ChatSendPostLogRecord {
   /** Discriminator. `'send'` for legacy / POST-round-trip rows. */
@@ -733,6 +735,39 @@ export interface ChatSendWsEchoLogRecord {
   replyUuid?: string;
   /** Source of the echo — `1` = "all connections" broadcast, other ids = per-platform. */
   eventSourceId?: unknown;
+}
+
+/**
+ * v0.1.88 (voice 4504) — renderer-emitted diagnostic written when a LATE WS
+ * echo resolves a send that the 30s `OPTIMISTIC_SEND_TIMEOUT_MS` guard had
+ * already flipped to the red ⚠ `'failed'` state. This is the "the guard fired
+ * too early, the send was actually fine, and the late echo cleared it" smoking
+ * gun — common right after an auto-reconnect re-subscribe (Restream replays /
+ * echoes around resubscribe). Correlate with the matching `optimistic-timeout`
+ * row (same `clientReplyUuid`) to measure how late the echo arrived. Relayed
+ * over IPC.CHAT_SEND_LOG_EVENT from the renderer (no fs in preload).
+ */
+export interface ChatSendLateEchoResolvedLogRecord {
+  phase: 'late-echo-resolved';
+  /** Renderer-minted UUID = the optimistic placeholder id the echo matched. */
+  clientReplyUuid: string;
+}
+
+/**
+ * v0.1.88 (voice 4504) — renderer-emitted diagnostic written when a managed
+ * reconnect-success sweep clears N lingering ⚠ on HTTP-200 optimistic sends.
+ * One row per sweep (NOT one per cleared message). `reason` carries the
+ * reconnect context (e.g. 'unconfirmed-send-recovery:send-unconfirmed',
+ * 'manual-reconnect') and `clearedCount` is how many ⚠ were resolved. A sweep
+ * that cleared zero is NOT logged (the renderer skips the relay when count is
+ * 0). Relayed over IPC.CHAT_SEND_LOG_EVENT from the renderer.
+ */
+export interface ChatSendReconnectSweepLogRecord {
+  phase: 'reconnect-sweep-cleared';
+  /** Reconnect-context label forwarded from main's CONN_RECONNECT_SUCCEEDED push. */
+  reason: string;
+  /** How many ⚠ (failed-but-HTTP-200) placeholders this sweep resolved. */
+  clearedCount: number;
 }
 
 /**

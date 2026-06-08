@@ -49,14 +49,18 @@ import {
 import {
   applyFailedSendStatus,
   dedupeOptimisticOnEcho,
+  isLateEchoForFailedSend,
   pushOptimisticMessage,
+  resolveLingeringFailedSendsOnReconnect,
 } from './chat-message-reducers';
 // v0.1.76 — the TTS/notification decision-gate evaluator
 // (decideTtsAction / decideNotificationAction) now runs in the MAIN process
 // (src/main/tts-dispatch.ts), NOT here. The renderer no longer imports it.
 import {
   applyOptimisticSendTimeout,
+  logLateEchoResolved,
   logOptimisticSendTimeout,
+  logReconnectSweepCleared,
   optimisticSendTimeoutStatus,
   OPTIMISTIC_SEND_TIMEOUT_MS,
 } from './optimistic-send-timeout';
@@ -128,6 +132,29 @@ export function App(): React.ReactElement {
   const optimisticSendTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
+  // v0.1.88 (voice 4504) — set of clientIds (== optimistic placeholder ids ==
+  // Restream clientReplyUuids) whose POST returned HTTP 200, learned from the
+  // queue's `'sent'` ChatSendStatus (emitted ONLY on a 2xx POST). This is the
+  // GATE for the reconnect-success sweep: when a managed reconnect succeeds we
+  // clear the lingering ⚠ ONLY for sends in this set — empirically every
+  // 200-send round-trips once the WS re-subscribes, so its ⚠ was a false alarm
+  // from the 30s echo-timeout firing during the dead window. A send that never
+  // POSTed 200 (HTTP error / no-session-cookies / no-active-connections /
+  // network throw) is a GENUINE failure, is NOT in this set, and KEEPS its ⚠.
+  //
+  // Lives in a ref (lifecycle bookkeeping, not render data). Entries are pruned
+  // when the matching ⚠ is actually cleared (late echo OR reconnect sweep), on
+  // clear-chat, and on sign-out, with a hard size cap so a long session can't
+  // grow it unbounded. We deliberately do NOT delete on a normal confirmed echo
+  // immediately — see the onChatSendStatus 'sent' handler for the retention
+  // rationale (a late echo or a reconnect sweep may still need to consult it).
+  const httpOkSendsRef = useRef<Set<string>>(new Set());
+  // Hard cap so the HTTP-200 set can't grow without bound across a marathon
+  // stream. Old entries are the oldest-resolved sends; if we ever exceed this
+  // we drop the oldest-inserted ids (Set preserves insertion order). 2000 is
+  // ~2x the MAX_MESSAGES feed cap so a fully-failed-then-recovered feed is
+  // still fully covered.
+  const HTTP_OK_SENDS_MAX = 2000;
   const sendNoticeSeqRef = useRef(0);
   // v0.1.76 — the same-id-reprocess guard (lastSpokenIdRef) moved to the MAIN
   // process (TtsDispatcher.lastProcessedId) with the rest of the decision
@@ -217,6 +244,13 @@ export function App(): React.ReactElement {
     for (const clientId of optimisticSendTimeoutsRef.current.keys()) {
       clearOptimisticSendTimeout(clientId, reason);
     }
+    // v0.1.88 (voice 4504): the optimistic placeholders these ids tracked are
+    // gone (clear-chat empties the feed; sign-out resets it; unmount tears the
+    // whole renderer down), so the HTTP-200 tracking set has nothing left to
+    // sweep — flush it too. Without this, the set would keep ids for messages
+    // that no longer exist, leaking memory across a long session of
+    // clear-chats and never matching a sweep again.
+    httpOkSendsRef.current.clear();
   };
 
   const scheduleOptimisticSendTimeout = (clientId: string): void => {
@@ -431,7 +465,38 @@ export function App(): React.ReactElement {
       // path; leaving the timer armed would let a stale callback later repaint
       // an already-confirmed message as failed.
       clearOptimisticSendTimeout(flagged.id, 'echo');
-      setMessages((prev) => dedupeOptimisticOnEcho(prev, flagged, MAX_MESSAGES));
+      // v0.1.88 (voice 4504): LATE-ECHO RESOLUTION.
+      //
+      // `dedupeOptimisticOnEcho` replaces ANY placeholder with `pendingSend !==
+      // undefined` — which INCLUDES a `'failed'` (timed-out ⚠) one — so a LATE
+      // echo (arriving after the 30s OPTIMISTIC_SEND_TIMEOUT_MS already flipped
+      // the placeholder to ⚠) ALREADY clears the warning just by being deduped
+      // in. The failed placeholder is never auto-removed from the feed, so it's
+      // always still there for a late echo to match by id, however late the echo
+      // arrives. So we don't need to CHANGE the resolution — we only DETECT it
+      // to emit a structured log row. This is the common case right after an
+      // auto-reconnect re-subscribe, where Restream replays/echoes the queued
+      // reply ~5s past the 30s guard.
+      //
+      // The detection MUST read the CURRENT feed (`prev`), not the `messages`
+      // captured by this mount-only listener closure (which is the stale
+      // initial value). So we do it inside the setMessages updater, latching a
+      // flag we act on AFTER setState returns (logging is a side effect — it
+      // must not run inside the reducer, which React may call twice in Strict
+      // Mode). The HTTP-200 set is pruned here too: the id is now resolved, so
+      // it can no longer need a reconnect sweep.
+      let wasLateEchoForFailed = false;
+      setMessages((prev) => {
+        wasLateEchoForFailed = isLateEchoForFailedSend(prev, flagged);
+        return dedupeOptimisticOnEcho(prev, flagged, MAX_MESSAGES);
+      });
+      if (wasLateEchoForFailed) {
+        logLateEchoResolved(flagged.id);
+      }
+      // The id is now resolved (whether on-time or late) — drop it from the
+      // HTTP-200 tracking set so that set only ever holds ids that might STILL
+      // need a reconnect sweep. Harmless if the id was never in it.
+      httpOkSendsRef.current.delete(flagged.id);
     });
     // v0.1.43 — listen for queue lifecycle updates and flip the matching
     // optimistic placeholder. `pending` is a no-op (the placeholder is
@@ -440,15 +505,91 @@ export function App(): React.ReactElement {
     // dedupe path above. `failed` keeps the placeholder visible with a
     // small ⚠ + tooltip carrying the error.
     const offSendStatus = rcpp.onChatSendStatus((status) => {
+      // v0.1.88 (voice 4504): record HTTP-200 sends so the reconnect-success
+      // sweep can tell "Restream accepted this POST (it WILL deliver once we
+      // re-subscribe)" from "this send genuinely never landed". The queue emits
+      // `'sent'` ONLY on a 2xx POST (see chat-send-queue.ts `result.ok` path),
+      // so it's the authoritative HTTP-200 signal. `'pending'` is the enqueue
+      // ack (no POST yet) and is ignored. We track the clientId here rather
+      // than touching the feed — `'sent'` does NOT replace the placeholder (the
+      // WS echo does that); it only tells us the POST succeeded, which is
+      // exactly the gate the sweep needs. Capped to avoid unbounded growth on a
+      // long stream (drop oldest-inserted; Set preserves insertion order).
+      if (status.status === 'sent') {
+        const set = httpOkSendsRef.current;
+        set.add(status.clientId);
+        if (set.size > HTTP_OK_SENDS_MAX) {
+          const oldest = set.values().next().value;
+          if (oldest !== undefined) set.delete(oldest);
+        }
+        return;
+      }
       if (status.status !== 'failed') return;
       // Explicit queue failures win over the timeout guard. The queue knows
       // the real reason (`no-session-cookies`, `send-failed`, auth drift,
       // thrown fetch, etc.), so cancel the generic 15s timer before painting
       // the specific failure into the placeholder.
       clearOptimisticSendTimeout(status.clientId, 'failed-status');
+      // v0.1.88: a queue-reported `'failed'` means the POST did NOT return 200
+      // (preflight bail or non-2xx). Make sure this id is NOT considered an
+      // HTTP-200 send — otherwise a later reconnect sweep would wrongly clear a
+      // GENUINE failure. (It normally wouldn't be in the set at all, but a
+      // pathological out-of-order status sequence shouldn't leave it stale.)
+      httpOkSendsRef.current.delete(status.clientId);
       setMessages((prev) => applyFailedSendStatus(prev, status));
       const notice = sendFailureNoticeText(status);
       if (notice) showSendNotice(notice);
+    });
+    // v0.1.88 (voice 4504): RECONNECT-SUCCESS SWEEP.
+    //
+    // Main pushes CONN_RECONNECT_SUCCEEDED whenever a MANAGED reconnect
+    // succeeds + re-subscribes — the v0.1.86 drain-to-zero recovery, the
+    // v0.1.87 unconfirmed-send recovery, OR the manual Reconnect button. When
+    // that happens, any optimistic send still showing the red ⚠
+    // (`pendingSend:'failed'`) whose POST returned HTTP 200 has — empirically —
+    // ALREADY delivered (every 200-send round-trips once the WS re-subscribes;
+    // the ⚠ was a false alarm from the 30s echo-timeout firing during the dead
+    // window). Sweep those and clear the ⚠. The `resolveLingeringFailedSends...`
+    // reducer GATES on the HTTP-200 set so a send that never POSTed 200 (a
+    // genuine failure) keeps its ⚠. We never re-send anything (POST already
+    // landed → re-sending risks a duplicate); this is a pure visual resolution.
+    //
+    // Why a sweep AND late-echo resolution? They cover different timings: the
+    // late echo clears a SPECIFIC message the instant Restream echoes it back;
+    // the sweep is the catch-all for messages whose echo never arrives even
+    // after re-subscribe (Restream doesn't always replay every queued reply) —
+    // those we resolve on the strength of the HTTP-200 alone once the
+    // connection is provably healthy again.
+    const offReconnectSucceeded = rcpp.onReconnectSucceeded((reason) => {
+      // Latch the cleared ids out of the updater so the side effects (pruning
+      // the HTTP-200 set + emitting the single sweep log row) run exactly ONCE
+      // after setState, not inside the reducer (React may call a reducer twice
+      // in Strict Mode). The reducer stays pure: compute `next`, record which
+      // ids it resolved.
+      const clearedIds: string[] = [];
+      setMessages((prev) => {
+        const { next, clearedCount } = resolveLingeringFailedSendsOnReconnect(
+          prev,
+          httpOkSendsRef.current,
+        );
+        if (clearedCount > 0) {
+          // Record exactly which placeholders this sweep resolved so we can
+          // prune them from the HTTP-200 set afterward. Reassigning the array's
+          // contents (not the binding) keeps the latched value correct even if
+          // the reducer runs twice — the second run recomputes the same set.
+          clearedIds.length = 0;
+          for (const m of prev) {
+            if (m.pendingSend === 'failed' && httpOkSendsRef.current.has(m.id)) {
+              clearedIds.push(m.id);
+            }
+          }
+        }
+        return next;
+      });
+      if (clearedIds.length > 0) {
+        for (const id of clearedIds) httpOkSendsRef.current.delete(id);
+        logReconnectSweepCleared(reason, clearedIds.length);
+      }
     });
     const offMenu = rcpp.onMenuOpenSettings(() => setDrawerOpen(true));
     // "Clear chat" can be triggered from either the chat-feed right-click
@@ -520,6 +661,7 @@ export function App(): React.ReactElement {
       offConnections();
       offChat();
       offSendStatus();
+      offReconnectSucceeded();
       offMenu();
       offClear();
       offSettingsPush();

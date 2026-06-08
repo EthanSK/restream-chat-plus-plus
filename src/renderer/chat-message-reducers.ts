@@ -96,6 +96,86 @@ export function applyFailedSendStatus(
 }
 
 /**
+ * v0.1.88 (voice 4504) — was the optimistic placeholder this incoming echo is
+ * about to REPLACE in a FAILED (timed-out / ⚠) state?
+ *
+ * `dedupeOptimisticOnEcho` already replaces ANY placeholder with
+ * `pendingSend !== undefined` — that INCLUDES a `'failed'` one — so a LATE echo
+ * (arriving after the 30s `OPTIMISTIC_SEND_TIMEOUT_MS` flipped the placeholder
+ * to `'failed'`) ALREADY clears the ⚠ purely by being deduped in. This helper
+ * does NOT change that behaviour; it just lets the caller DETECT that the echo
+ * resolved a previously-FAILED send (vs. a still-`'sending'` one or a brand-new
+ * incoming message) so it can emit a structured log row. We look the id up in
+ * the CURRENT feed BEFORE the dedupe runs.
+ *
+ * Returns true iff `prev` contains a placeholder with `id === incoming.id` whose
+ * `pendingSend === 'failed'`. The late echo is the authoritative "Restream
+ * confirmed this send" signal, so this is the smoking gun that the 30s guard
+ * fired too early and the send was actually fine.
+ */
+export function isLateEchoForFailedSend(
+  prev: ChatMessage[],
+  incoming: ChatMessage,
+): boolean {
+  return prev.some(
+    (m) => m.id === incoming.id && m.pendingSend === 'failed',
+  );
+}
+
+/**
+ * v0.1.88 (voice 4504) — RECONNECT-SUCCESS SWEEP.
+ *
+ * After a managed reconnect succeeds and re-subscribes the WS, any optimistic
+ * send still showing the red ⚠ (`pendingSend === 'failed'`) whose POST returned
+ * HTTP 200 is — empirically — a message that DID deliver (every 200-send
+ * round-tripped once we re-subscribed; the ⚠ was a false alarm from the 30s
+ * echo-timeout firing during the dead window). This reducer RESOLVES those
+ * placeholders: it clears `pendingSend` + `pendingError` so the ⚠ disappears and
+ * the row renders as a normal sent self-message.
+ *
+ * GATING (critical correctness):
+ *   - ONLY placeholders whose `id` is in `httpOkClientIds` are touched. That
+ *     Set is populated renderer-side from the queue's `'sent'` ChatSendStatus
+ *     (which fires only on an HTTP 2xx POST). A send that NEVER POSTed 200 (HTTP
+ *     error, no-session-cookies, no-active-connections, network throw, etc.) is
+ *     a GENUINE failure and MUST keep its ⚠ — so it is deliberately NOT in the
+ *     Set and is left untouched.
+ *   - We never RE-SEND anything here (the POST already landed; re-sending risks
+ *     a duplicate). This is a pure visual-status resolution.
+ *   - Non-failed messages (confirmed echoes, still-`'sending'` placeholders,
+ *     incoming messages) are untouched.
+ *
+ * Returns the same array reference when nothing changed (so React can skip a
+ * re-render), or a new array with the resolved placeholders when ≥1 cleared.
+ * The second return value is the count of ⚠ cleared, for the caller's log row.
+ */
+export function resolveLingeringFailedSendsOnReconnect(
+  prev: ChatMessage[],
+  httpOkClientIds: ReadonlySet<string>,
+): { next: ChatMessage[]; clearedCount: number } {
+  let clearedCount = 0;
+  const next = prev.map((m) => {
+    if (m.pendingSend !== 'failed') return m;
+    if (!httpOkClientIds.has(m.id)) return m; // genuine failure — keep the ⚠
+    clearedCount += 1;
+    // Resolve to a plain sent self-message: drop pendingSend + the ⚠ tooltip.
+    // We intentionally strip BOTH fields rather than setting some 'sent' state
+    // because the ChatMessage contract uses `pendingSend === undefined` to mean
+    // "fully sent / not a pending placeholder" (see the type docstring). The
+    // row keeps `self: true` so it still renders right-aligned like the user's
+    // own confirmed messages.
+    const resolved = { ...m };
+    delete resolved.pendingSend;
+    delete resolved.pendingError;
+    return resolved;
+  });
+  // Preserve reference identity when nothing changed so the caller's setState
+  // is a no-op and React doesn't re-render the whole feed needlessly.
+  if (clearedCount === 0) return { next: prev, clearedCount: 0 };
+  return { next, clearedCount };
+}
+
+/**
  * v0.1.60 — decide whether a freshly-observed `lastMessage` should
  * trigger one-shot side effects (TTS speak + native notification).
  *
