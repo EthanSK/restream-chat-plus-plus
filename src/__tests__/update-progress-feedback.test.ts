@@ -145,108 +145,137 @@ function findBroadcasts(kind: string): SentBroadcast[] {
   ) as SentBroadcast[];
 }
 
-describe('v0.1.61 — immediate downloading broadcast on Install Update click', () => {
-  it('broadcasts kind:downloading synchronously when triggerSquirrelDownload fires', async () => {
+// v0.1.89 (voice 4507) — CONSOLIDATION ONTO THE RELIABLE PATH.
+//
+// These two describe blocks PREVIOUSLY pinned the OLD flaky top-bar
+// download-progress UI: that `triggerSquirrelDownload()` + the
+// `checking-for-update` / `download-progress` events each broadcast a
+// `kind: 'downloading'` payload to the renderer, which rendered the top-bar
+// progress bar. v0.1.89 SUPPRESSES every `downloading` broadcast
+// (`SUPPRESS_FOREGROUND_DOWNLOAD_UI` in updater.ts) so the banner never shows
+// that flaky pane — the background Squirrel download drives straight to
+// `ready-to-install` (the snackbar/Restart path Ethan says "works
+// everywhere"). The tests are inverted accordingly: assert NO `downloading`
+// reaches the renderer, while everything else (error pane, ready-to-install)
+// is unaffected and the internal download-progress field-validation still
+// runs without throwing.
+describe('v0.1.89 — Install Update click no longer shows the flaky top-bar download bar', () => {
+  it('does NOT broadcast kind:downloading when triggerSquirrelDownload fires', async () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.rememberPendingDownloadVersion('v0.1.60');
 
-    // The broadcast must happen BEFORE autoUpdater.checkForUpdates(),
-    // so the renderer sees the state transition before any further
-    // Squirrel events fire.
+    // The click still kicks Squirrel's (idempotent) checkForUpdates() so the
+    // background download proceeds, but NO top-bar `downloading` UI reaches
+    // the renderer — that's the whole point of the consolidation.
     const result = updater.triggerSquirrelDownload();
     expect(result.ok).toBe(true);
-
-    const downloadingBroadcasts = findBroadcasts('downloading');
-    // At least one immediate broadcast from triggerSquirrelDownload()
-    // itself (the `checking-for-update` event would add more — but
-    // those only fire when something emits the event).
-    expect(downloadingBroadcasts.length).toBeGreaterThan(0);
-    const first = downloadingBroadcasts[0]!.payload;
-    expect(first.kind).toBe('downloading');
-    expect(first.latestVersion).toBe('v0.1.60');
-    expect(typeof first.downloadStartedAt).toBe('number');
-    expect((first.downloadStartedAt as number) > 0).toBe(true);
+    // checkForUpdates() was still invoked (the reliable background pipeline).
+    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalled();
+    // …but the renderer saw zero `downloading` payloads.
+    expect(findBroadcasts('downloading').length).toBe(0);
   });
 
-  it('subsequent checking-for-update event also broadcasts downloading (banner stays consistent)', async () => {
+  it('suppresses downloading on the subsequent checking-for-update / update-available events too', async () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.rememberPendingDownloadVersion('v0.1.60');
     updater.triggerSquirrelDownload();
     sentMessages.length = 0;
 
+    // These fire during the BACKGROUND hourly poll as well; the banner must
+    // never flip into the top-bar download pane for them either.
     fakeAutoUpdater.emit('checking-for-update');
+    fakeAutoUpdater.emit('update-available');
 
-    const downloadingBroadcasts = findBroadcasts('downloading');
-    expect(downloadingBroadcasts.length).toBe(1);
-    expect(downloadingBroadcasts[0]!.payload.latestVersion).toBe('v0.1.60');
+    expect(findBroadcasts('downloading').length).toBe(0);
+  });
+
+  it('still flips to ready-to-install when the background download completes (the reliable path)', async () => {
+    const updater = await loadUpdater();
+    updater.configureAutoUpdater();
+    updater.rememberPendingDownloadVersion('v0.1.60');
+    updater.triggerSquirrelDownload();
+    sentMessages.length = 0;
+
+    // Squirrel finished staging the background-downloaded bundle.
+    fakeAutoUpdater.emit('update-downloaded', {}, undefined, 'Restream Chat++ v0.1.60');
+
+    const ready = findBroadcasts('ready-to-install');
+    expect(ready.length).toBe(1);
+    expect(ready[0]!.payload.latestVersion).toBe('Restream Chat++ v0.1.60');
+    // And no `downloading` ever leaked to the renderer along the way.
+    expect(findBroadcasts('downloading').length).toBe(0);
   });
 });
 
-describe('v0.1.61 — download-progress forwards bytes + speed', () => {
-  it('forwards bytesPerSecond + total + transferred', async () => {
+describe('v0.1.89 — download-progress field validation still runs (internally) but is not broadcast', () => {
+  // The progress forwarder still parses/validates Squirrel's payload (so a
+  // malformed event can't throw and break the listener) — it just no longer
+  // reaches the renderer because `downloading` is suppressed. We assert the
+  // forward path is a no-throw no-broadcast for each field-shape variant.
+  it('valid bytes + speed: no throw, no downloading broadcast', async () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.rememberPendingDownloadVersion('v0.1.60');
     updater.triggerSquirrelDownload();
     sentMessages.length = 0;
 
-    fakeAutoUpdater.emit('download-progress', {
-      percent: 42.7,
-      bytesPerSecond: 1_234_567,
-      total: 200_000_000,
-      transferred: 85_400_000,
-    });
-
-    const broadcasts = findBroadcasts('downloading');
-    expect(broadcasts.length).toBe(1);
-    const p = broadcasts[0]!.payload;
-    expect(p.downloadPercent).toBeCloseTo(42.7);
-    expect(p.downloadBytesPerSecond).toBe(1_234_567);
-    expect(p.downloadBytesTotal).toBe(200_000_000);
-    expect(p.downloadBytesTransferred).toBe(85_400_000);
-    expect(p.latestVersion).toBe('v0.1.60');
-    expect(typeof p.downloadStartedAt).toBe('number');
+    expect(() =>
+      fakeAutoUpdater.emit('download-progress', {
+        percent: 42.7,
+        bytesPerSecond: 1_234_567,
+        total: 200_000_000,
+        transferred: 85_400_000,
+      }),
+    ).not.toThrow();
+    expect(findBroadcasts('downloading').length).toBe(0);
   });
 
-  it('handles missing optional fields gracefully (only percent reported)', async () => {
+  it('only percent reported: no throw, no downloading broadcast', async () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.triggerSquirrelDownload();
     sentMessages.length = 0;
 
-    fakeAutoUpdater.emit('download-progress', { percent: 17 });
-
-    const broadcasts = findBroadcasts('downloading');
-    expect(broadcasts.length).toBe(1);
-    const p = broadcasts[0]!.payload;
-    expect(p.downloadPercent).toBe(17);
-    expect(p.downloadBytesPerSecond).toBeUndefined();
-    expect(p.downloadBytesTotal).toBeUndefined();
-    expect(p.downloadBytesTransferred).toBeUndefined();
+    expect(() => fakeAutoUpdater.emit('download-progress', { percent: 17 })).not.toThrow();
+    expect(findBroadcasts('downloading').length).toBe(0);
   });
 
-  it('clamps invalid percent values + drops invalid byte fields', async () => {
+  it('invalid/garbage fields: no throw, no downloading broadcast', async () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.triggerSquirrelDownload();
     sentMessages.length = 0;
 
-    fakeAutoUpdater.emit('download-progress', {
-      percent: 999,
-      bytesPerSecond: -1,
-      total: NaN,
-      transferred: 'bad' as unknown as number,
-    });
+    expect(() =>
+      fakeAutoUpdater.emit('download-progress', {
+        percent: 999,
+        bytesPerSecond: -1,
+        total: NaN,
+        transferred: 'bad' as unknown as number,
+      }),
+    ).not.toThrow();
+    expect(findBroadcasts('downloading').length).toBe(0);
+  });
+});
 
-    const broadcasts = findBroadcasts('downloading');
-    expect(broadcasts.length).toBe(1);
-    const p = broadcasts[0]!.payload;
-    expect(p.downloadPercent).toBe(100);
-    expect(p.downloadBytesPerSecond).toBeUndefined();
-    expect(p.downloadBytesTotal).toBeUndefined();
-    expect(p.downloadBytesTransferred).toBeUndefined();
+describe('v0.1.89 — SUPPRESS_FOREGROUND_DOWNLOAD_UI gate', () => {
+  it('is enabled by default so the flaky top-bar download UI is off', async () => {
+    const updater = await loadUpdater();
+    expect(updater.SUPPRESS_FOREGROUND_DOWNLOAD_UI).toBe(true);
+  });
+
+  it('still lets the reliable error pane through (error is NOT gated)', async () => {
+    // Sanity: the suppression only drops `downloading`. A genuine failure
+    // must still reach the renderer so the user gets the manual-fallback link.
+    const updater = await loadUpdater();
+    updater.configureAutoUpdater();
+    updater.triggerSquirrelDownload();
+    sentMessages.length = 0;
+    fakeAutoUpdater.emit('error', new Error('ShipIt install failed: EPERM on rename'));
+    expect(findBroadcasts('error').length).toBe(1);
+    expect(findBroadcasts('downloading').length).toBe(0);
   });
 });
 

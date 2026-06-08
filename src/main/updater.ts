@@ -239,6 +239,70 @@ export function scheduleDownloadRetry(): boolean {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// v0.1.89 (voice 4507) — CONSOLIDATE ONTO THE RELIABLE UPDATE PATH.
+//
+// THE PROBLEM Ethan reported:
+//   The app has TWO observable update UIs and they have very different
+//   reliability:
+//
+//   (A) THE FLAKY TOP-BAR DOWNLOAD BAR.
+//       When the banner is in `available` state and the user clicks "Install
+//       Update", `triggerSquirrelDownload()` fires a *foreground*
+//       `autoUpdater.checkForUpdates()` AND broadcasts `kind: 'downloading'`,
+//       which flips the banner into the top-bar `DownloadingPane` (percentage
+//       + progress bar). This foreground download is the one that hits
+//       transient "The internet connection appears to be offline" errors
+//       (see main.log 2026-06-08 12:16 — it burned through all 3 retries and
+//       surfaced a red error pane). This is the "worked after about three
+//       times" path.
+//
+//   (B) THE RELIABLE SNACKBAR / RESTART PATH.
+//       `update-electron-app`'s hourly *background* poll already downloads the
+//       new bundle silently (main.log 18:16:51 `checking-for-update` →
+//       18:17:16 `update downloaded, ready to install`, with NO user action
+//       and NO `download requested` line). The banner then shows
+//       `ready-to-install`; the user clicks Restart → `quitAndInstall()` →
+//       instant swap + a quick toast. No foreground re-download, no top-bar
+//       progress bar. This is the path Ethan says "works everywhere".
+//
+// THE FIX — make every update action route through (B), never (A):
+//   We gate EVERY `kind: 'downloading'` renderer broadcast behind
+//   `SUPPRESS_FOREGROUND_DOWNLOAD_UI`. When suppressed (the default), the
+//   renderer NEVER enters the flaky top-bar `DownloadingPane`. The banner
+//   stays in `available` (with the snackbar toast after a click) until the
+//   BACKGROUND Squirrel download completes and fires `update-downloaded` →
+//   `ready-to-install` → Restart → snackbar. Exactly path (B).
+//
+//   Crucially we do NOT rip out any logic: Squirrel's `checkForUpdates()` is
+//   still kicked (idempotent — the logs show it normally no-ops as "already
+//   in flight" because the background poll beat the click), all internal
+//   state bookkeeping (`downloadInFlight`, `updateDownloaded`, the v0.1.85
+//   transient-retry ladder, `lastErrorMessage` for the MCP
+//   `update_download_status` tool) still runs, and the reliable
+//   `ready-to-install` / `error` broadcasts are UNAFFECTED. We only stop the
+//   single thing Ethan dislikes: the top-bar download-progress UI.
+//
+//   `error` is deliberately NOT gated — a genuine signature-mismatch /
+//   staging failure still needs to surface the red error pane with the
+//   manual-fallback link. Only the noisy `downloading` progress UI is hidden.
+//
+// WHY A FLAG RATHER THAN DELETING THE PANE:
+//   `DownloadingPane` + its tests + the v0.1.85 retry resilience are kept
+//   intact so this is a low-risk, fully-reversible consolidation (flip the
+//   const to re-enable the top-bar bar). The pane is simply never reached at
+//   runtime while the flag is true.
+// ---------------------------------------------------------------------------
+
+/**
+ * v0.1.89 — when true, NO `kind: 'downloading'` payload is forwarded to the
+ * renderer, so the banner never shows the flaky foreground top-bar download
+ * progress bar. The reliable background-download → `ready-to-install` →
+ * Restart (snackbar) path is used everywhere instead. See the block comment
+ * above for the full rationale (voice 4507).
+ */
+export const SUPPRESS_FOREGROUND_DOWNLOAD_UI = true;
+
 /**
  * Push an UpdateInfo payload to every live BrowserWindow via the existing
  * `IPC.UPDATE_STATUS` channel — shared with the GH-Releases poller so the
@@ -248,8 +312,24 @@ export function scheduleDownloadRetry(): boolean {
  * payload diff (kind/latestVersion/error) — Squirrel emits dozens of
  * `download-progress` events with the same kind, and they all need to
  * reach the renderer for the percentage to animate. v0.1.25.
+ *
+ * v0.1.89 (voice 4507): every `kind: 'downloading'` payload is DROPPED here
+ * when `SUPPRESS_FOREGROUND_DOWNLOAD_UI` is on. This is the single choke
+ * point that neutralises the flaky top-bar download UI from ALL of its
+ * sources at once — the user-click path (`triggerSquirrelDownload`), the
+ * early `checking-for-update` / `update-available` rebroadcasts, the
+ * per-chunk `download-progress` events, and the transient-retry rebroadcasts.
+ * The background download still happens; the renderer simply doesn't render a
+ * progress bar for it and waits for the reliable `ready-to-install` flip.
  */
 function broadcastSquirrelStatus(info: UpdateInfo): void {
+  // v0.1.89 — swallow the flaky top-bar download UI at the source. We let
+  // EVERYTHING ELSE through (`checking` is harmless/brief, `ready-to-install`
+  // is the reliable Restart prompt, `error` is the genuine-failure pane). Only
+  // the noisy `downloading` progress payloads are dropped.
+  if (SUPPRESS_FOREGROUND_DOWNLOAD_UI && info.kind === 'downloading') {
+    return;
+  }
   for (const win of BrowserWindow.getAllWindows()) {
     try {
       win.webContents.send(IPC.UPDATE_STATUS, info);
