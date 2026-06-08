@@ -238,4 +238,68 @@ describe('ChatClient unconfirmed-send recovery (v0.1.87)', () => {
     expect(rec).toBeTruthy();
     expect(rec!.outcome).toBe('ok');
   });
+
+  // v0.1.88 (voice 4504): a SUCCESSFUL unconfirmed-send recovery must emit the
+  // 'reconnect-succeeded' event so main can forward it to the renderer, which
+  // sweeps + clears the lingering ⚠ on the HTTP-200 send that warned.
+  it("(v0.1.88) emits 'reconnect-succeeded' when the unconfirmed-send recovery succeeds", async () => {
+    const { client, provider } = makeOpenClient();
+    const reasons: string[] = [];
+    client.on('reconnect-succeeded', (r: string) => reasons.push(r));
+
+    client.requestUnconfirmedSendRecovery('send-unconfirmed');
+    await vi.advanceTimersByTimeAsync(2_500);
+
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toBe('unconfirmed-send-recovery:send-unconfirmed');
+  });
+
+  // v0.1.88: a FAILED recovery (provider returns { ok: false }) must NOT emit
+  // 'reconnect-succeeded' — the connection didn't actually heal, so the renderer
+  // must keep the ⚠ (the send may genuinely not have delivered).
+  it("(v0.1.88) does NOT emit 'reconnect-succeeded' when the recovery provider fails", async () => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    const provider = vi.fn().mockResolvedValue({ ok: false, reason: 'refresh-failed' });
+    client.setReconnectProvider(provider);
+    client.start();
+    const ws = WS.instances[WS.instances.length - 1];
+    ws.emit('open');
+
+    const reasons: string[] = [];
+    client.on('reconnect-succeeded', (r: string) => reasons.push(r));
+
+    client.requestUnconfirmedSendRecovery('send-unconfirmed');
+    await vi.advanceTimersByTimeAsync(2_500);
+
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(reasons).toHaveLength(0); // no success signal on a failed heal
+  });
+
+  // v0.1.88: the v0.1.86 drain-to-zero recovery path must ALSO emit
+  // 'reconnect-succeeded' on success (it shares the renderer sweep with the
+  // unconfirmed-send path).
+  it("(v0.1.88) emits 'reconnect-succeeded' when the v0.1.86 drain recovery succeeds", async () => {
+    const { client, provider, ws } = makeOpenClient();
+    const reasons: string[] = [];
+    client.on('reconnect-succeeded', (r: string) => reasons.push(r));
+
+    // Subscribe one platform, then drain it to zero while the socket is OPEN.
+    deliverConnectionInfo(ws, 'u-youtube-1', 'uuid-yt');
+    ws.emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({
+          action: 'connection_closed',
+          payload: { connectionUuid: 'uuid-yt', reason: 'replaced' },
+        }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(2_500);
+
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toBe('subscription-recovery:replaced');
+  });
 });

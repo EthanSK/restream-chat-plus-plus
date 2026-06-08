@@ -65,6 +65,21 @@ const api = {
     return () => ipcRenderer.removeListener(IPC.CHAT_MESSAGE, h);
   },
   /**
+   * v0.1.88 (voice 4504, 2026-06-08) — subscribe to "a managed reconnect just
+   * succeeded" pushes from main (automatic drain/unconfirmed recovery OR the
+   * manual Reconnect button). The renderer uses this to SWEEP its optimistic-
+   * send feed and clear the lingering red ⚠ on any send that POSTed HTTP 200 —
+   * those empirically delivered once the WS re-subscribed, so the warning is
+   * stale. `reason` is a best-effort label for logging only. See
+   * IPC.CONN_RECONNECT_SUCCEEDED for the full contract (HTTP-200 gate, no
+   * re-send, genuine failures stay flagged).
+   */
+  onReconnectSucceeded: (cb: (reason: string) => void): Unsub => {
+    const h = (_: unknown, reason: string) => cb(reason);
+    ipcRenderer.on(IPC.CONN_RECONNECT_SUCCEEDED, h);
+    return () => ipcRenderer.removeListener(IPC.CONN_RECONNECT_SUCCEEDED, h);
+  },
+  /**
    * Pull-fetch the latest snapshot of Restream `connection_info` entries
    * (one per platform/channel currently linked + a status). The renderer
    * calls this on mount so it doesn't have to wait for the next push.

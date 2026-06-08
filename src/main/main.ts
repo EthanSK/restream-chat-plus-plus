@@ -1393,7 +1393,20 @@ app.on('ready', async () => {
   // the auto-retry path uses. v0.1.45.
   ipcMain.handle(IPC.CONN_RECONNECT, async () => {
     const out = await performFullReconnect();
-    if (out.ok) return { ok: true as const };
+    if (out.ok) {
+      // v0.1.88 (voice 4504): the MANUAL Reconnect button just succeeded —
+      // re-subscribe is in flight. Tell the renderer so it sweeps + clears any
+      // lingering ⚠ on HTTP-200 sends (same resolution the automatic managed
+      // recoveries trigger via chat's 'reconnect-succeeded' event below). The
+      // manual path is owned by THIS handler — ws-client doesn't emit for it —
+      // so we send the IPC directly here to avoid a double-forward.
+      try {
+        mainWindow?.webContents.send(IPC.CONN_RECONNECT_SUCCEEDED, 'manual-reconnect');
+      } catch (err) {
+        console.error('[main] CONN_RECONNECT_SUCCEEDED (manual) emit failed', err);
+      }
+      return { ok: true as const };
+    }
     if (out.reason === 'not-authenticated' || out.reason === 'refresh-failed') {
       return { ok: false, reason: 'not-authenticated' as const };
     }
@@ -2250,6 +2263,19 @@ app.on('ready', async () => {
   chat.on('connections', (cs) =>
     mainWindow?.webContents.send(IPC.CONNECTIONS, cs),
   );
+  // v0.1.88 (voice 4504): when an AUTOMATIC managed reconnect (v0.1.86
+  // drain-to-zero recovery or v0.1.87 unconfirmed-send recovery) succeeds and
+  // re-subscribes, forward the signal to the renderer so it sweeps + clears the
+  // ⚠ on lingering HTTP-200 optimistic sends. (The MANUAL Reconnect button's
+  // success is sent directly from the CONN_RECONNECT handler above, so this
+  // listener only carries the automatic-recovery reasons — no double-emit.)
+  chat.on('reconnect-succeeded', (reason: string) => {
+    try {
+      mainWindow?.webContents.send(IPC.CONN_RECONNECT_SUCCEEDED, reason);
+    } catch (err) {
+      console.error('[main] CONN_RECONNECT_SUCCEEDED emit failed', err);
+    }
+  });
 
   // Start the in-process HTTP MCP server (v0.1.36+). Listens on
   // 127.0.0.1:19852/mcp by default. Any MCP client can read/write

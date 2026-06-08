@@ -447,6 +447,27 @@ export const IPC = {
   CONN_STATE: 'conn:state',
   CONN_STATE_GET: 'conn:state:get',
   CONN_RECONNECT: 'conn:reconnect',
+  /**
+   * v0.1.88 (voice 4504, 2026-06-08) — main → renderer push fired when a
+   * MANAGED reconnect SUCCEEDS and re-subscribes the chat WS. Sources:
+   *   - the v0.1.86 drain-to-zero subscription recovery (success branch),
+   *   - the v0.1.87 unconfirmed-send recovery (success branch),
+   *   - the manual Reconnect toolbar button (main's CONN_RECONNECT handler,
+   *     when performFullReconnect returns ok).
+   *
+   * WHY: v0.1.87 auto-reconnects when a send goes unconfirmed (POST 200 but no
+   * WS echo within 30s → the renderer flips the message to a red ⚠), so FUTURE
+   * sends confirm again — but the ALREADY-warned message keeps its stuck ⚠ even
+   * though it empirically delivered (every HTTP-200 send round-tripped once we
+   * re-subscribed). On this signal the renderer SWEEPS its optimistic-send feed
+   * and resolves any lingering `pendingSend:'failed'` placeholder whose send had
+   * an HTTP 200 (tracked renderer-side from the queue's `'sent'` status),
+   * clearing the ⚠. It deliberately does NOT clear a ⚠ for a send that never
+   * POSTed 200 (a genuine failure stays flagged) and never RE-SENDS anything
+   * (the POST already landed — re-sending risks a duplicate). Payload is a
+   * best-effort reason string for logging; the renderer doesn't branch on it.
+   */
+  CONN_RECONNECT_SUCCEEDED: 'conn:reconnect-succeeded',
   CHAT_MESSAGE: 'chat:message',
   /**
    * Push channel — main → renderer — fires whenever the in-memory map of

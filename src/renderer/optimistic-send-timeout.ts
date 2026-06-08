@@ -63,6 +63,56 @@ export function logOptimisticSendTimeout(
   clientId: string,
   queueState?: string,
 ): void {
+  emitChatSendLogRow({
+    phase: 'optimistic-timeout',
+    clientReplyUuid: clientId,
+    elapsedMs: OPTIMISTIC_SEND_TIMEOUT_MS,
+    queueState: queueState ?? 'still-sending',
+  });
+}
+
+/**
+ * v0.1.88 (voice 4504) — structured row written when a LATE WS echo resolves a
+ * placeholder the 30s timeout had already flipped to ⚠ `'failed'`. Lets a
+ * post-mortem grep `phase:"late-echo-resolved"` and correlate with the matching
+ * `optimistic-timeout` row (same `clientReplyUuid`) to see "the send was fine,
+ * the echo just arrived after the guard fired". Same fire-and-forget relay +
+ * swallow-everything contract as `logOptimisticSendTimeout`.
+ */
+export function logLateEchoResolved(clientId: string): void {
+  emitChatSendLogRow({
+    phase: 'late-echo-resolved',
+    clientReplyUuid: clientId,
+  });
+}
+
+/**
+ * v0.1.88 (voice 4504) — structured row written ONCE per managed
+ * reconnect-success sweep that cleared ≥1 lingering ⚠. `clearedCount` is the
+ * number of HTTP-200 failed sends resolved; `reason` is the reconnect-context
+ * label. The caller skips this when the sweep cleared zero. Same fire-and-forget
+ * relay + swallow-everything contract as the other renderer log helpers.
+ */
+export function logReconnectSweepCleared(
+  reason: string,
+  clearedCount: number,
+): void {
+  emitChatSendLogRow({
+    phase: 'reconnect-sweep-cleared',
+    reason,
+    clearedCount,
+  });
+}
+
+/**
+ * Shared fire-and-forget relay used by the renderer-side chat-send log helpers.
+ * The renderer has no fs access in preload, so every row is shipped over the
+ * `CHAT_SEND_LOG_EVENT` IPC channel and `appendChatSendLog` in main is the
+ * single writer. Missing `rcpp.emitChatSendLogEvent` (older preload / future
+ * refactor) is a silent no-op; any throw is swallowed — logging must NEVER
+ * break the renderer's send/echo/reconnect loops.
+ */
+function emitChatSendLogRow(record: Record<string, unknown>): void {
   try {
     const api = (
       globalThis as unknown as {
@@ -72,12 +122,7 @@ export function logOptimisticSendTimeout(
       }
     ).rcpp;
     if (!api?.emitChatSendLogEvent) return;
-    api.emitChatSendLogEvent({
-      phase: 'optimistic-timeout',
-      clientReplyUuid: clientId,
-      elapsedMs: OPTIMISTIC_SEND_TIMEOUT_MS,
-      queueState: queueState ?? 'still-sending',
-    });
+    api.emitChatSendLogEvent(record);
   } catch {
     // logging must never break the renderer's send loop
   }
