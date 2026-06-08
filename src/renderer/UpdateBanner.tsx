@@ -239,7 +239,18 @@ export interface ToastSpec {
 export function decideToast(result: StartDownloadResult): ToastSpec {
   if (result.ok) {
     if (result.mode === 'squirrel') {
-      return { kind: 'info', text: 'Downloading update…' };
+      // v0.1.89 (voice 4507) — the consolidated flow no longer shows a
+      // foreground top-bar download bar (see SUPPRESS_FOREGROUND_DOWNLOAD_UI
+      // in src/main/updater.ts). The bundle downloads in the BACKGROUND via
+      // Squirrel's hourly poll; the user's only job is to Restart once it's
+      // staged. So the snackbar now tells them exactly that instead of the
+      // old "Downloading update…" which implied a visible progress bar was
+      // coming. The banner will flip to "Restart to install" on its own when
+      // `update-downloaded` fires.
+      return {
+        kind: 'info',
+        text: "Update downloading in the background — you'll be prompted to restart when it's ready.",
+      };
     }
     return { kind: 'info', text: 'Opening release page in browser…' };
   }

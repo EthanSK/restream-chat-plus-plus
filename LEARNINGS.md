@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-08T18:43:21Z
+**Trigger:** voice 4507
+**Symptom:** App had two update UIs: a flaky top-bar download progress bar (Install Update button → foreground autoUpdater.checkForUpdates → broadcasts kind:downloading → DownloadingPane) that hits transient 'internet appears offline' errors and dead-ends ('worked after about three times'), vs a reliable snackbar+Restart path (background hourly Squirrel poll silently downloads → ready-to-install → Restart → quitAndInstall → quick toast, no re-download). Ethan wanted the reliable one everywhere.
+**Root cause:** update-electron-app's hourly background poll already downloads the bundle silently (main.log: checking-for-update → update downloaded, ready to install, no user action). But the banner's available-state Install Update button kicked a SEPARATE foreground download AND broadcast kind:downloading, forcing the top-bar progress pane — the path that fails on a network blip (logs 12:16 burned all 3 v0.1.85 retries → error pane). Two surfaces for the same download; the foreground one is the flaky one.
+**Fix:** src/main/updater.ts: added exported const SUPPRESS_FOREGROUND_DOWNLOAD_UI=true and gated it at the single broadcastSquirrelStatus choke point — every kind:'downloading' payload is now dropped (from ALL sources: user click, checking-for-update/update-available rebroadcasts, download-progress chunks, retry rebroadcasts). Banner never enters the flaky top-bar DownloadingPane; stays in 'available' (snackbar after click) until the BACKGROUND download fires update-downloaded → ready-to-install → Restart → quitAndInstall (the reliable snackbar path). checkForUpdates() still kicked (idempotent nudge), all internal state/retry/MCP bookkeeping intact, error pane NOT gated. UpdateBanner.tsx decideToast squirrel copy changed to 'Update downloading in the background — you will be prompted to restart…'. v0.1.89.
+**Commit:** 1f3dbf7 (LEARNINGS line is self-referential to this commit)
+**Guard:** src/__tests__/update-progress-feedback.test.ts rewritten: asserts NO kind:downloading reaches renderer from click/checking/update-available/download-progress, ready-to-install still fires, error pane still passes through, SUPPRESS_FOREGROUND_DOWNLOAD_UI===true. update-banner-installing-state.test.tsx toast copy assertions updated. 650 tests green, typecheck clean. Reversible: flip the const to re-enable top-bar bar.
+---
+
+---
 **Date:** 2026-06-08T17:06:13Z
 **Trigger:** voice 4504
 **Symptom:** Own sent message keeps stuck red ⚠ 'unconfirmed' badge even after the v0.1.87 auto-reconnect re-subscribes and the message actually delivered. The 30s OPTIMISTIC_SEND_TIMEOUT_MS flipped the placeholder to pendingSend:'failed' during the echo-dead window; nothing ever downgraded it back.

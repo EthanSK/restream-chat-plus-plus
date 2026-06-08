@@ -20,7 +20,10 @@ import type { UpdateInfo } from '../shared/types';
  *   2. When the structured `StartDownloadResult` resolves, the button
  *      flips back to "Install Update" and a toast appears in the top-
  *      right of the banner explaining what happened:
- *         - `mode: 'squirrel'` → info toast, "Downloading update…"
+ *         - `mode: 'squirrel'` → info toast (v0.1.89: "Update downloading in
+ *                                the background — you'll be prompted to
+ *                                restart…" — the consolidated flow no longer
+ *                                shows a top-bar progress bar)
  *         - `mode: 'browser'`  → info toast, "Opening release page in browser…"
  *         - `ok: false`        → error toast with the underlying message
  *   3. The toast auto-dismisses after TOAST_AUTO_DISMISS_MS (3s).
@@ -100,9 +103,15 @@ function findToastsByClassPrefix(
 }
 
 describe('decideToast — pure result → toast mapping', () => {
-  it('Squirrel success → info toast "Downloading update…"', () => {
+  it('Squirrel success → info toast about background download + restart (v0.1.89)', () => {
+    // v0.1.89 (voice 4507) — copy changed from "Downloading update…" (which
+    // implied a visible top-bar progress bar) to a background-download +
+    // restart message, because the consolidated flow suppresses the top-bar
+    // bar and relies on the background Squirrel download → Restart snackbar.
     const spec = decideToast({ ok: true, reason: 'started', mode: 'squirrel' });
-    expect(spec).toEqual({ kind: 'info', text: 'Downloading update…' });
+    expect(spec.kind).toBe('info');
+    expect(spec.text).toContain('background');
+    expect(spec.text).toContain('restart');
   });
 
   it('Browser fallback success → info toast "Opening release page in browser…"', () => {
@@ -222,7 +231,7 @@ describe('UpdateBanner — installing state + toast (v0.1.39)', () => {
     renderer.unmount();
   });
 
-  it('squirrel success result renders the "Downloading update…" info toast', async () => {
+  it('squirrel success result renders the background-download info toast (v0.1.89)', async () => {
     const onStartDownload = vi.fn().mockResolvedValue({
       ok: true,
       reason: 'started',
@@ -239,7 +248,8 @@ describe('UpdateBanner — installing state + toast (v0.1.39)', () => {
 
     const toast = findToastsByClassPrefix(renderer, 'update-banner-toast-info')[0];
     expect(toast, 'Info toast must render after squirrel-success result').toBeDefined();
-    expect(instanceText(toast!)).toContain('Downloading update');
+    // v0.1.89 — snackbar now reflects the background-download + restart flow.
+    expect(instanceText(toast!)).toContain('background');
 
     renderer.unmount();
   });
