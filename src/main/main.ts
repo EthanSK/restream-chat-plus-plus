@@ -2076,6 +2076,22 @@ app.on('ready', async () => {
       // between enqueue and actual POST (sign-out, token expiry). Re-check
       // here so a stale enqueue doesn't 401 against Restream.
       if (!(await oauth.isAuthenticatedAsync())) {
+        // v0.1.90 (voice 4512) — CLOSE THE LOGGING GAP. Pre-v0.1.90 this
+        // early bail returned `not-authenticated` with NO chat-send.jsonl row
+        // (sendChatText, which owns the preflight logging, was never reached).
+        // That is exactly the "16:50 message left ZERO trace" failure mode.
+        // Emit a `preflight` row here so the drop is always observable from
+        // disk, then let the queue's retry loop run the reconnect/"refresh"
+        // (performFullReconnect re-acquires OAuth) and re-POST.
+        appendChatSendLog({
+          phase: 'preflight',
+          reason: 'not-authenticated',
+          coldStartAttempted: false,
+          cookieCount: 0,
+          cookieNames: [],
+          hasXsrf: false,
+          connectionCount: chat.getConnections().length,
+        });
         return { ok: false, reason: 'not-authenticated' };
       }
       return sendChatText({
@@ -2108,6 +2124,27 @@ app.on('ready', async () => {
     // log path, same redaction guarantees (preflight/post/final-failure
     // rows already redact via chat-send.ts).
     logChatSend: appendChatSendLog,
+    // v0.1.90 (voice 4512) — the "refresh between retries" Ethan asked for.
+    // The queue's bounded exponential-backoff retry loop calls this BEFORE
+    // re-POSTing a transiently-failed send. We reuse `performFullReconnect`
+    // verbatim — the SAME managed reconnect the manual Reconnect button and
+    // the v0.1.86/87 recoveries use: OAuth refresh → chat.reconnect() →
+    // re-subscribe → chat-context re-sniff → cookie re-provision. So by the
+    // time the next POST fires, the exact things that caused the transient
+    // failure (lapsed token / drained connections / lost cookies / un-sniffed
+    // showId) have been refreshed. We don't gate the retry on its success;
+    // `performFullReconnect` already returns `{ ok }` so the loop just logs it.
+    reconnectBetweenRetries: async (reason) => {
+      // `reason` is the failure-class label (e.g. 'send-retry:no-session-cookies')
+      // — kept for future per-reason reconnect tuning; performFullReconnect is
+      // currently reason-agnostic. Swallow void to satisfy the unused param.
+      void reason;
+      const out = await performFullReconnect();
+      return { ok: out.ok };
+    },
+    // v0.1.90 — explicit (matches the default, but pin it so a future default
+    // change can't silently alter Ethan's "up to 5 times" contract).
+    maxSendAttempts: 5,
   });
   ipcMain.on(IPC.CHAT_SEND_ENQUEUE, (_evt, payload: ChatSendEnqueuePayload) => {
     try {

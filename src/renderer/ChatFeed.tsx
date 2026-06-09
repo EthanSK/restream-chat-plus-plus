@@ -30,6 +30,13 @@ interface Props {
    * through (tests that don't exercise hide can omit it).
    */
   onHideUser?: (username: string) => void;
+  /**
+   * v0.1.90 (voice 4512) — invoked when the user clicks the ⚠ on a
+   * terminally-failed (retries-exhausted) self send. App.tsx re-runs the
+   * whole bounded retry loop with the same clientReplyUuid. Optional so test
+   * mounts that don't exercise retry can omit it.
+   */
+  onRetrySend?: (message: ChatMessage) => void;
 }
 
 /**
@@ -57,6 +64,7 @@ export function ChatFeed({
   authenticated,
   connection,
   onHideUser,
+  onRetrySend,
 }: Props): React.ReactElement {
   if (!authenticated) {
     return (
@@ -95,7 +103,9 @@ export function ChatFeed({
         // independently decides whether to render the button (no-op when
         // the callback is undefined, e.g. test mounts that don't exercise
         // hide).
-        itemContent={(_, m) => <MessageRow message={m} onHideUser={onHideUser} />}
+        itemContent={(_, m) => (
+          <MessageRow message={m} onHideUser={onHideUser} onRetrySend={onRetrySend} />
+        )}
       />
     </div>
   );
@@ -177,12 +187,15 @@ function EmptyFeedBody({
 function MessageRow({
   message: m,
   onHideUser,
+  onRetrySend,
 }: {
   message: ChatMessage;
   // v0.1.72 — optional so test mounts that don't exercise the hide
   // affordance can leave this off; production always passes it via
   // ChatFeed → App.tsx → handleHideUser.
   onHideUser?: (username: string) => void;
+  // v0.1.90 (voice 4512) — optional manual-retry relay (same rationale).
+  onRetrySend?: (message: ChatMessage) => void;
 }): React.ReactElement {
   // Self-originated messages (echoes of replies WE sent via the inline
   // send bar at the bottom of the feed) render visually distinct
@@ -223,7 +236,21 @@ function MessageRow({
   // message body whose tooltip carries `pendingError`. Failed messages
   // are never auto-removed; subsequent sends are never blocked by them.
   const isSending = m.pendingSend === 'sending';
+  // v0.1.90 (voice 4512) — actively retrying via the bounded backoff loop.
+  // Renders "sending… (retry N/5)" so the user SEES the message fighting to
+  // deliver rather than silently disappearing.
+  const isRetrying = m.pendingSend === 'retrying';
   const isFailed = m.pendingSend === 'failed';
+  // The "(retry N/M)" suffix, only when we have both counters.
+  const retryLabel =
+    isRetrying &&
+    typeof m.sendAttempt === 'number' &&
+    typeof m.sendMaxAttempts === 'number'
+      ? ` (retry ${m.sendAttempt}/${m.sendMaxAttempts})`
+      : '';
+  // Whether the ⚠ is an interactive "tap to retry" button (only on terminal
+  // failures, only for our own sends, only when a retry handler is wired).
+  const canRetry = isFailed && m.self === true && typeof onRetrySend === 'function';
   // v0.1.72 — only surface the Hide-user affordance for incoming messages
   // from a NAMED user. Hiding "You" (self echoes), the anonymous
   // "via Restream" common-reply rows, or messages with an empty username
@@ -241,6 +268,7 @@ function MessageRow({
       className={
         `message-row${m.self ? ' self' : ''}` +
         (isSending ? ' pending-send' : '') +
+        (isRetrying ? ' pending-send retrying' : '') +
         (isFailed ? ' send-failed' : '')
       }
     >
@@ -263,6 +291,21 @@ function MessageRow({
               aria-label="Sending"
             >
               sending…
+            </span>
+          )}
+          {/*
+            v0.1.90 (voice 4512) — "sending… (retry N/5)" while the bounded
+            exponential-backoff loop is actively re-trying (with a managed
+            reconnect between attempts). Always visible so Ethan can SEE his
+            message is being fought for, never silently dropped.
+          */}
+          {isRetrying && (
+            <span
+              className="send-status-hint retrying"
+              title={`Retrying send to Restream…${retryLabel}`}
+              aria-label={`Retrying${retryLabel}`}
+            >
+              {`sending…${retryLabel}`}
             </span>
           )}
           {/*
@@ -299,16 +342,38 @@ function MessageRow({
         </div>
         <div className="body">
           {m.text}
-          {isFailed && (
-            <span
-              className="send-failed-icon"
-              title={m.pendingError ?? 'Send failed.'}
-              aria-label={`Send failed: ${m.pendingError ?? 'unknown error'}`}
-              role="img"
-            >
-              {'⚠'}
-            </span>
-          )}
+          {/*
+            v0.1.90 (voice 4512) — terminal ⚠ after the 5x auto-retry loop
+            exhausts. When a retry handler is wired (our own send), render it
+            as a CLICKABLE "tap to retry" button that re-runs the whole loop;
+            otherwise (no handler / not self) keep the static informational
+            icon. The tooltip surfaces the underlying error either way so the
+            user always knows WHY it failed.
+          */}
+          {isFailed &&
+            (canRetry ? (
+              <button
+                type="button"
+                className="send-failed-icon send-failed-retry"
+                title={`${m.pendingError ?? 'Send failed.'} — tap to retry`}
+                aria-label={`Send failed: ${m.pendingError ?? 'unknown error'}. Tap to retry.`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRetrySend?.(m);
+                }}
+              >
+                {'⚠'}
+              </button>
+            ) : (
+              <span
+                className="send-failed-icon"
+                title={m.pendingError ?? 'Send failed.'}
+                aria-label={`Send failed: ${m.pendingError ?? 'unknown error'}`}
+                role="img"
+              >
+                {'⚠'}
+              </span>
+            ))}
           {ignoredLabel && (
             <span
               className="regex-ignored-badge"

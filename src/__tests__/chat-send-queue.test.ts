@@ -86,6 +86,11 @@ describe('chat-send-queue (v0.1.43)', () => {
       },
       emitStatus: (s) => statuses.push(s),
       minSpacingMs: 0,
+      // v0.1.90: this test pins the "a failure doesn't poison the queue"
+      // contract, NOT the retry loop. Pin maxSendAttempts:1 so the
+      // single-attempt behaviour it asserts (one `failed`, three calls in
+      // order) is preserved now that the default is 5-attempt retry.
+      maxSendAttempts: 1,
     });
     queue.enqueue({ clientId: 'first', text: 'one' });
     queue.enqueue({ clientId: 'mid', text: 'fail-me' });
@@ -115,6 +120,9 @@ describe('chat-send-queue (v0.1.43)', () => {
       },
       emitStatus: (s) => statuses.push(s),
       minSpacingMs: 0,
+      // v0.1.90: single-attempt — this test pins "a thrown runSend becomes a
+      // failed status without breaking the queue", not the retry ladder.
+      maxSendAttempts: 1,
     });
     queue.enqueue({ clientId: 'before', text: 'a' });
     queue.enqueue({ clientId: 'throws', text: 'b' });

@@ -87,10 +87,46 @@ export function applyFailedSendStatus(
   );
   if (idx === -1) return prev;
   const next = prev.slice();
+  // v0.1.90 (voice 4512) — terminal failure. Strip the transient retry
+  // counters (sendAttempt/sendMaxAttempts) so the row renders the plain ⚠
+  // "failed — tap to retry" affordance rather than "(retry N/5)". The retry
+  // loop is OVER at this point.
+  const resolved = { ...next[idx] };
+  delete resolved.sendAttempt;
+  delete resolved.sendMaxAttempts;
+  resolved.pendingSend = 'failed';
+  resolved.pendingError = formatPendingError(status);
+  next[idx] = resolved;
+  return next;
+}
+
+/**
+ * v0.1.90 (voice 4512) — flip the matching optimistic placeholder to
+ * `pendingSend: 'retrying'` and stash the attempt counters so the feed can
+ * render "sending… (retry N/5)". This is the visible "it is actively fighting
+ * to deliver your message" state — Ethan's #1 demand that his own message
+ * NEVER silently disappears. Fired off the queue's intermediate `'retrying'`
+ * ChatSendStatus between backoff attempts. No-op if no matching placeholder
+ * exists (e.g. the WS echo already resolved it).
+ */
+export function applyRetryingSendStatus(
+  prev: ChatMessage[],
+  status: ChatSendStatus,
+): ChatMessage[] {
+  if (status.status !== 'retrying') return prev;
+  const idx = prev.findIndex(
+    (m) => m.id === status.clientId && m.pendingSend !== undefined,
+  );
+  if (idx === -1) return prev;
+  const next = prev.slice();
   next[idx] = {
     ...next[idx],
-    pendingSend: 'failed',
-    pendingError: formatPendingError(status),
+    pendingSend: 'retrying',
+    // Clear any stale ⚠ tooltip from a previous failed attempt — we're
+    // actively retrying again, not in a terminal failed state.
+    pendingError: undefined,
+    sendAttempt: status.attempt,
+    sendMaxAttempts: status.maxAttempts,
   };
   return next;
 }

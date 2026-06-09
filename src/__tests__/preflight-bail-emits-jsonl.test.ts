@@ -76,6 +76,11 @@ describe('preflight bail logging + queue status (v0.1.63)', () => {
         statuses.push(status);
       },
       minSpacingMs: 0,
+      // v0.1.90: this test pins the SINGLE-ATTEMPT preflight-bail logging
+      // (exactly one `preflight` row → one `failed` status). The v0.1.90
+      // retry loop is covered separately in chat-send-retry.test.ts, so pin
+      // maxSendAttempts:1 here to keep this assertion about the bail itself.
+      maxSendAttempts: 1,
     });
 
     queue.enqueue({ clientId: 'local-cookie-bail', text: 'hello from queue' });
