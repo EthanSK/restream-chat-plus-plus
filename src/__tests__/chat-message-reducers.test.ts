@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   applyFailedSendStatus,
+  applyRetryingSendStatus,
   dedupeOptimisticOnEcho,
   formatPendingError,
   pushOptimisticMessage,
@@ -170,6 +171,81 @@ describe('applyFailedSendStatus', () => {
     // Other placeholder + the incoming message untouched.
     expect(after[1].pendingSend).toBe('sending');
     expect(after[2].id).toBe('m-1');
+  });
+
+  // v0.1.90 (voice 4512) — the terminal `failed` reducer must STRIP the
+  // transient retry counters so the row renders "tap to retry", not
+  // "(retry N/5)".
+  it('strips sendAttempt/sendMaxAttempts when flipping to terminal failed', () => {
+    const retrying: ChatMessage = {
+      ...placeholder('local-r', 'was retrying'),
+      pendingSend: 'retrying',
+      sendAttempt: 5,
+      sendMaxAttempts: 5,
+    };
+    const status: ChatSendStatus = {
+      clientId: 'local-r',
+      status: 'failed',
+      reason: 'send-failed',
+      error: 'exhausted',
+      attempt: 5,
+      maxAttempts: 5,
+    };
+    const next = applyFailedSendStatus([retrying], status);
+    expect(next[0].pendingSend).toBe('failed');
+    expect(next[0].sendAttempt).toBeUndefined();
+    expect(next[0].sendMaxAttempts).toBeUndefined();
+    expect(next[0].pendingError).toBe('exhausted');
+  });
+});
+
+describe('applyRetryingSendStatus (v0.1.90 — voice 4512)', () => {
+  it('flips matching placeholder to pendingSend="retrying" with attempt counters', () => {
+    const prev: ChatMessage[] = [placeholder('local-x', 'retry me')];
+    const status: ChatSendStatus = {
+      clientId: 'local-x',
+      status: 'retrying',
+      attempt: 3,
+      maxAttempts: 5,
+    };
+    const next = applyRetryingSendStatus(prev, status);
+    expect(next[0].pendingSend).toBe('retrying');
+    expect(next[0].sendAttempt).toBe(3);
+    expect(next[0].sendMaxAttempts).toBe(5);
+    // Body preserved — the user's text stays visible the whole time.
+    expect(next[0].text).toBe('retry me');
+  });
+
+  it('clears a stale pendingError from a previous failed attempt', () => {
+    const failed: ChatMessage = {
+      ...placeholder('local-x'),
+      pendingSend: 'failed',
+      pendingError: 'old error',
+    };
+    const status: ChatSendStatus = {
+      clientId: 'local-x',
+      status: 'retrying',
+      attempt: 2,
+      maxAttempts: 5,
+    };
+    const next = applyRetryingSendStatus([failed], status);
+    expect(next[0].pendingSend).toBe('retrying');
+    expect(next[0].pendingError).toBeUndefined();
+  });
+
+  it('is a no-op when status is not "retrying" or no placeholder matches', () => {
+    const prev: ChatMessage[] = [placeholder('local-x')];
+    expect(
+      applyRetryingSendStatus(prev, { clientId: 'local-x', status: 'pending' }),
+    ).toBe(prev);
+    expect(
+      applyRetryingSendStatus([wsEcho('local-x')], {
+        clientId: 'local-x',
+        status: 'retrying',
+        attempt: 2,
+        maxAttempts: 5,
+      }),
+    ).toEqual([wsEcho('local-x')]);
   });
 });
 

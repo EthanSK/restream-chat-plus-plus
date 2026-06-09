@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-09T17:20:30Z
+**Trigger:** voice 4512
+**Symptom:** Sent chat message never appeared in app and left ZERO log trace (no 'send' row, no 'preflight' row, no 'optimistic-timeout' row in chat-send.jsonl). Send dropped during a connection-in-flux window right after a 'replaced' drain. Also: the queue tried each send EXACTLY ONCE — no retry, no reconnect-between-attempts — so a transient failure (no-session-cookies / no-active-connections / lapsed token / un-sniffed showId) permanently lost the message.
+**Root cause:** (1) The runSend wrapper's 'not-authenticated' early bail in main.ts returned without writing any chat-send.jsonl row (sendChatText, which owns preflight logging, was never reached) — the silent-drop, zero-trace gap. (2) chat-send-queue.ts ran runSend once and emitted 'sent'/'failed' with no retry loop at all.
+**Fix:** v0.1.90 (voice 4512): chat-send-queue.ts now wraps each send in a BOUNDED exponential-backoff retry loop (up to 5 attempts; ~1s,2s,4s,8s,16s capped) with a managed reconnect/'refresh' (performFullReconnect) between attempts, wired via new reconnectBetweenRetries option. isRetryableSendFailure() classifies transient reasons. SAFETY: only ok:false (== no confirmed 200) is ever re-POSTed, always reusing the same clientReplyUuid (Restream dedupes) → no double-send; ok:true short-circuits. New 'retrying' ChatSendStatus + ChatMessage.pendingSend='retrying' + sendAttempt/sendMaxAttempts render 'sending… (retry N/5)' so the message is ALWAYS visible. Terminal 'failed' renders a clickable ⚠ 'tap to retry' (handleRetrySend re-runs the loop). Every attempt writes a 'retry-attempt' chat-send.jsonl row; the not-authenticated gate in main.ts now emits a 'preflight' row — closes the zero-trace gap.
+**Commit:** e770de2
+**Guard:** src/__tests__/chat-send-retry.test.ts (retry ladder + reconnect-between + recover-mid-retry → sent + exhaust → failed + no double-POST + same-uuid + per-attempt logging + reconnect-throw resilience) + chat-message-reducers.test.ts (applyRetryingSendStatus, failed strips counters). Existing single-attempt tests pinned with maxSendAttempts:1.
+---
+
+---
 **Date:** 2026-06-08T18:43:21Z
 **Trigger:** voice 4507
 **Symptom:** App had two update UIs: a flaky top-bar download progress bar (Install Update button → foreground autoUpdater.checkForUpdates → broadcasts kind:downloading → DownloadingPane) that hits transient 'internet appears offline' errors and dead-ends ('worked after about three times'), vs a reliable snackbar+Restart path (background hourly Squirrel poll silently downloads → ready-to-install → Restart → quitAndInstall → quick toast, no re-download). Ethan wanted the reliable one everywhere.

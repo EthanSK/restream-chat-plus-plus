@@ -69,6 +69,84 @@ export interface ChatSendQueueOptions {
    * inside the queue — logging must never break the send pipeline.
    */
   logChatSend?: (record: ChatSendLogRecord) => void;
+  /**
+   * v0.1.90 (voice 4512) — max attempts in the bounded exponential-backoff
+   * retry loop. Ethan: "we should have exponential retry up to 5 times…
+   * because it's really important the messages I send get sent." Default 5.
+   * Set to 1 to disable retries (old single-attempt behaviour); tests vary it.
+   */
+  maxSendAttempts?: number;
+  /**
+   * v0.1.90 — base backoff (ms) for the retry loop. The wait BEFORE attempt
+   * N+1 is `backoffBaseMs * 2^(N-1)`, capped at `backoffMaxMs`:
+   * ~1s, 2s, 4s, 8s (16s capped). Default 1000. Tests set 0 for speed.
+   */
+  backoffBaseMs?: number;
+  /** v0.1.90 — cap for the exponential backoff (ms). Default 16000. */
+  backoffMaxMs?: number;
+  /**
+   * v0.1.90 — the "refresh" between retry attempts. Wired in main.ts to
+   * `performFullReconnect` (OAuth refresh → chat.reconnect() → re-subscribe →
+   * chat-context re-sniff), exactly the managed reconnect the manual Reconnect
+   * button + the v0.1.86/87 recoveries use. Called BEFORE each backoff sleep so
+   * cookies/context/connections are fresh by the time the next POST fires.
+   * Resolves with `{ ok }` (we don't block the retry on a failed reconnect —
+   * we still re-POST; the gate inside `sendChatText` will re-evaluate). Omit
+   * (or pass undefined) to skip the reconnect step (e.g. unit tests that only
+   * exercise the backoff ladder). Errors are swallowed — a reconnect that
+   * throws must NOT abort the retry loop.
+   */
+  reconnectBetweenRetries?: (reason: string) => Promise<{ ok: boolean }>;
+}
+
+/**
+ * v0.1.90 (voice 4512) — classify a failed `SendTextResult.reason` as
+ * RETRYABLE (transient/recoverable — worth a reconnect + re-POST) vs
+ * NON-RETRYABLE (re-trying can't help). This is the safety valve Ethan's
+ * "make damn sure it sends" loop hangs off.
+ *
+ * RETRYABLE (transient — a managed reconnect/"refresh" plausibly fixes it):
+ *   - no-session-cookies   : cookie jar lost the XSRF (post-reconnect drain) →
+ *                            reconnect re-provisions cookies.
+ *   - no-active-connections: connections map momentarily drained ("replaced") →
+ *                            reconnect re-subscribes the platforms.
+ *   - not-authenticated    : token lapsed between enqueue + POST → reconnect
+ *                            refreshes OAuth.
+ *   - no-show-id           : chat context (showId/eventId) not re-sniffed yet
+ *                            after a reconnect → reconnect + REST hydrate re-sniff.
+ *   - send-failed          : a non-2xx POST (5xx / transient backend error /
+ *                            non-404 4xx). The brief says retry these too; a
+ *                            real route-404 short-circuits inside sendChatText
+ *                            BEFORE returning send-failed for that case.
+ *   - error                : fetch threw / network blip / unexpected → retry.
+ *
+ * CRITICAL SAFETY (no double-POST): we ONLY ever reach this classifier on
+ * `ok:false`. `sendChatText` returns `ok:true` ONLY on a confirmed 2xx, so a
+ * retryable result NEVER corresponds to a POST that already landed 200 — it is
+ * always safe to re-POST. And every re-POST reuses the SAME `clientReplyUuid`
+ * (the queue keeps `item.clientId` constant across attempts), so even if a
+ * borderline send DID reach Restream, Restream dedupes on the uuid. The
+ * "POSTed-200-but-unconfirmed" case is a DIFFERENT path entirely (ok:true →
+ * never retried here; resolved by the v0.1.88 echo/reconnect-sweep).
+ *
+ * There is currently no non-retryable reason left (every union member is
+ * recoverable-or-worth-one-more-try), but the function is explicit so a future
+ * reason (e.g. a hard "message too long" 400) can be marked non-retryable in
+ * ONE place and immediately surface a terminal ⚠ instead of burning 5 attempts.
+ */
+export function isRetryableSendFailure(reason: string | undefined): boolean {
+  switch (reason) {
+    case 'no-session-cookies':
+    case 'no-active-connections':
+    case 'not-authenticated':
+    case 'no-show-id':
+    case 'send-failed':
+    case 'error':
+    case undefined: // defensive: a missing reason is treated as transient
+      return true;
+    default:
+      return false;
+  }
 }
 
 export interface ChatSendQueue {
@@ -86,6 +164,34 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
   const noopLog: NonNullable<ChatSendQueueOptions['log']> = () => undefined;
   const log = opts.log ?? noopLog;
   const minSpacingMs = opts.minSpacingMs ?? 1000;
+  // v0.1.90 (voice 4512) — bounded exponential-backoff retry knobs.
+  // `Math.max(1, …)` so a misconfigured 0/negative can never make the loop
+  // skip the send entirely (we always attempt at least once).
+  const maxSendAttempts = Math.max(1, opts.maxSendAttempts ?? 5);
+  const backoffBaseMs = opts.backoffBaseMs ?? 1000;
+  const backoffMaxMs = opts.backoffMaxMs ?? 16000;
+
+  // v0.1.90 — best-effort structured-log helper. Mirrors the swallow-errors
+  // contract everywhere else in this file: logging must NEVER break the send
+  // pipeline. Used for the new `retry-attempt` rows that close the 16:50
+  // "vanished message, zero log trace" gap.
+  const logRetry = (record: ChatSendLogRecord): void => {
+    if (!opts.logChatSend) return;
+    try {
+      opts.logChatSend(record);
+    } catch {
+      // logging must never break the send path
+    }
+  };
+
+  // v0.1.90 — backoff for the wait BEFORE attempt `nextAttempt` (1-based).
+  // Between attempt 1→2 we wait base*2^0, 2→3 base*2^1, … capped at max:
+  // ~1s, 2s, 4s, 8s, 16s. `nextAttempt` is the attempt we're about to make
+  // (so the first retry, attempt 2, uses exponent 0).
+  const backoffForAttempt = (nextAttempt: number): number => {
+    const exponent = Math.max(0, nextAttempt - 2);
+    return Math.min(backoffMaxMs, backoffBaseMs * 2 ** exponent);
+  };
 
   const queue: QueuedSend[] = [];
   let running = false;
@@ -100,6 +206,207 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
       } catch {
         // ignore
       }
+    }
+  };
+
+  // v0.1.90 — emit `'sent'` (2xx success). Keeps the v0.1.69 belt-and-braces
+  // IPC-failure logging (both app-errors.jsonl + chat-send.jsonl) so a lost
+  // success status — which would strand the placeholder on "sending" — is
+  // still grep-able.
+  const emitSent = (clientId: string): void => {
+    try {
+      opts.emitStatus({ clientId, status: 'sent' });
+    } catch (err) {
+      const errorMessage = String((err as Error)?.message ?? err);
+      log('queue.emit.threw', { clientId, phase: 'sent', error: errorMessage });
+      appendErrorLog({
+        subsystem: 'chat-send-queue',
+        phase: 'chat-send-queue.emit-sent-failed',
+        errorMessage,
+        context: { clientId },
+      });
+      logRetry({
+        phase: 'status-emit-failed',
+        clientReplyUuid: clientId,
+        reason: 'sent',
+        httpStatus: null,
+        errorMessage,
+      });
+    }
+  };
+
+  // v0.1.90 — emit the TERMINAL `'failed'` (retries exhausted OR non-retryable).
+  // Carries `attempt`/`maxAttempts` so the renderer can label the final state.
+  // Same v0.1.68/69 IPC-failure mirroring as before.
+  const emitFailed = (
+    clientId: string,
+    result: SendTextResult,
+    attempt: number,
+  ): void => {
+    try {
+      opts.emitStatus({
+        clientId,
+        status: 'failed',
+        reason: result.reason,
+        error: result.error,
+        httpStatus: result.status,
+        attempt,
+        maxAttempts: maxSendAttempts,
+      });
+    } catch (err) {
+      const errorMessage = String((err as Error)?.message ?? err);
+      log('queue.emit.threw', { clientId, phase: 'failed', error: errorMessage });
+      appendErrorLog({
+        subsystem: 'chat-send-queue',
+        phase: 'chat-send-queue.emit-failed-failed',
+        errorMessage,
+        context: {
+          clientId,
+          resultReason: result.reason,
+          httpStatus: result.status ?? null,
+        },
+      });
+      logRetry({
+        phase: 'status-emit-failed',
+        clientReplyUuid: clientId,
+        reason: result.reason ?? 'unknown',
+        httpStatus: result.status ?? null,
+        errorMessage,
+      });
+    }
+  };
+
+  // v0.1.90 — emit the intermediate `'retrying'` status. Best-effort: a lost
+  // retrying status is cosmetic (the placeholder just shows the previous
+  // "(retry N-1/5)" until the next attempt) and must NEVER abort the loop, so
+  // we swallow IPC failures here without the heavyweight mirroring above.
+  const emitRetrying = (clientId: string, attempt: number): void => {
+    try {
+      opts.emitStatus({
+        clientId,
+        status: 'retrying',
+        attempt,
+        maxAttempts: maxSendAttempts,
+      });
+    } catch (err) {
+      log('queue.emit.threw', {
+        clientId,
+        phase: 'retrying',
+        error: String((err as Error)?.message ?? err),
+      });
+    }
+  };
+
+  // v0.1.90 — run ONE POST attempt, converting an unexpected throw from
+  // `runSend` (== sendChatText, which should catch everything internally) into
+  // a `{ ok:false, reason:'error' }` result + structured row. Keeps the
+  // v0.1.69 run-send-threw observability.
+  const runSendOnce = async (item: QueuedSend): Promise<SendTextResult> => {
+    try {
+      return await opts.runSend(item);
+    } catch (err) {
+      const errorMessage = String((err as Error)?.message ?? err);
+      log('queue.send.threw', { clientId: item.clientId, error: errorMessage });
+      appendErrorLog({
+        subsystem: 'chat-send-queue',
+        phase: 'chat-send-queue.run-send-threw',
+        errorMessage: errorToString(err),
+        context: { clientId: item.clientId },
+      });
+      return { ok: false, reason: 'error', error: errorMessage };
+    }
+  };
+
+  // v0.1.90 (voice 4512) — the bounded exponential-backoff retry loop for a
+  // SINGLE queued send. See the big comment at the call site in `drain`.
+  const sendWithRetry = async (item: QueuedSend): Promise<void> => {
+    for (let attempt = 1; attempt <= maxSendAttempts; attempt++) {
+      const result = await runSendOnce(item);
+
+      // SUCCESS — a confirmed 2xx. Log the terminal `ok` row, emit `'sent'`,
+      // done. (The WS echo — matched by clientReplyUuid → id — is what
+      // actually replaces the placeholder in the feed; `'sent'` just lets the
+      // renderer track the HTTP-200 for the v0.1.88 reconnect sweep.)
+      if (result.ok) {
+        logRetry({
+          phase: 'retry-attempt',
+          clientReplyUuid: item.clientId,
+          attempt,
+          maxAttempts: maxSendAttempts,
+          outcome: 'ok',
+          decision: 'done',
+        });
+        emitSent(item.clientId);
+        return;
+      }
+
+      // FAILURE. Decide: retry (transient + attempts left) or give up.
+      const retryable = isRetryableSendFailure(result.reason);
+      const hasAttemptsLeft = attempt < maxSendAttempts;
+      const willRetry = retryable && hasAttemptsLeft;
+
+      if (!willRetry) {
+        // Terminal: either non-retryable, or we've burned the last attempt.
+        logRetry({
+          phase: 'retry-attempt',
+          clientReplyUuid: item.clientId,
+          attempt,
+          maxAttempts: maxSendAttempts,
+          outcome: 'failed',
+          reason: result.reason,
+          httpStatus: result.status ?? null,
+          decision: 'give-up',
+        });
+        emitFailed(item.clientId, result, attempt);
+        return;
+      }
+
+      // Will retry. Compute the backoff for the NEXT attempt and run the
+      // managed reconnect ("refresh") first so cookies/context/connections are
+      // fresh by the time we re-POST. The reconnect is fire-and-await but its
+      // success is NOT a precondition for retrying — even a failed reconnect
+      // leaves us to re-POST (the gate inside sendChatText re-evaluates state).
+      const nextAttempt = attempt + 1;
+      const backoffMs = backoffForAttempt(nextAttempt);
+      const reconnectRequested = Boolean(opts.reconnectBetweenRetries);
+
+      logRetry({
+        phase: 'retry-attempt',
+        clientReplyUuid: item.clientId,
+        attempt,
+        maxAttempts: maxSendAttempts,
+        outcome: 'failed',
+        reason: result.reason,
+        httpStatus: result.status ?? null,
+        decision: 'retry-after-reconnect',
+        backoffMs,
+        reconnectRequested,
+      });
+
+      // Flip the placeholder to "(retry N/5)" where N == the attempt we're
+      // ABOUT to make — so the user sees progress toward delivery.
+      emitRetrying(item.clientId, nextAttempt);
+
+      if (opts.reconnectBetweenRetries) {
+        try {
+          await opts.reconnectBetweenRetries(`send-retry:${result.reason ?? 'unknown'}`);
+        } catch (err) {
+          // A reconnect that throws must NEVER abort the retry loop — that
+          // would silently strand the send, the exact failure mode we're
+          // fixing. Log it and re-POST anyway.
+          appendErrorLog({
+            subsystem: 'chat-send-queue',
+            phase: 'chat-send-queue.reconnect-between-retries-threw',
+            errorMessage: errorToString(err),
+            context: { clientId: item.clientId, attempt },
+          });
+        }
+      }
+
+      if (backoffMs > 0) {
+        await sleep(backoffMs);
+      }
+      // loop continues → next POST attempt
     }
   };
 
@@ -118,123 +425,29 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
         if (wait > 0) {
           await sleep(wait);
         }
-        let result: SendTextResult;
-        try {
-          result = await opts.runSend(item);
-        } catch (err) {
-          result = {
-            ok: false,
-            reason: 'error',
-            error: String((err as Error)?.message ?? err),
-          };
-          log('queue.send.threw', { clientId: item.clientId, error: result.error });
-          // v0.1.69 (voice 4015): `runSend` (== `sendChatText`) shouldn't
-          // throw — it catches everything internally and returns a result
-          // object. If we land here something unexpected happened (a
-          // programming error in chat-send.ts, a synthetic test throw, an
-          // OOM mid-fetch). Worth a structured row even though the
-          // existing console.warn-equivalent is also fired.
-          appendErrorLog({
-            subsystem: 'chat-send-queue',
-            phase: 'chat-send-queue.run-send-threw',
-            errorMessage: errorToString(err),
-            context: { clientId: item.clientId },
-          });
-        }
+        // v0.1.90 (voice 4512) — BOUNDED EXPONENTIAL-BACKOFF RETRY LOOP.
+        // ===================================================================
+        // Ethan: "we should have exponential retry up to 5 times to send a
+        // message… and it should do the refresh [reconnect] if needed."
+        //
+        // The loop attempts the POST up to `maxSendAttempts` (default 5) times.
+        // After each failed attempt that is RETRYABLE (transient — see
+        // isRetryableSendFailure), it:
+        //   1. emits a `'retrying'` status so the feed shows "(retry N/5)" —
+        //      the placeholder NEVER vanishes, Ethan always sees it fighting;
+        //   2. runs the managed reconnect/"refresh" (reconnectBetweenRetries)
+        //      so cookies + chat-context + connections are fresh;
+        //   3. backs off exponentially (~1s,2s,4s,8s,16s capped);
+        //   4. re-POSTs with the SAME clientReplyUuid (Restream dedupes; we
+        //      only ever reach here on ok:false == no confirmed 200, so a
+        //      re-POST can't double-deliver — see isRetryableSendFailure doc).
+        // A confirmed 2xx (ok:true) ends the loop immediately (success). A
+        // NON-retryable failure ends it immediately (terminal ⚠). Exhausting
+        // all attempts ends it with terminal ⚠. EVERY attempt writes a
+        // `retry-attempt` chat-send.jsonl row — this is the gap-closer for the
+        // 16:50 "vanished message with zero log trace" incident.
+        await sendWithRetry(item);
         lastSentAt = Date.now();
-        if (result.ok) {
-          try {
-            opts.emitStatus({ clientId: item.clientId, status: 'sent' });
-          } catch (err) {
-            log('queue.emit.threw', {
-              clientId: item.clientId,
-              phase: 'sent',
-              error: String((err as Error)?.message ?? err),
-            });
-            // v0.1.69 (voice 4015): IPC failure on the SUCCESS path is
-            // arguably worse than on the failure path — the renderer
-            // never gets the `sent` status so the placeholder stays in
-            // "sending" forever even though Restream accepted the post.
-            // We mirror to chat-send.jsonl (via logChatSend if wired)
-            // AND to app-errors.jsonl so it's grep-able both ways.
-            const errorMessage = String((err as Error)?.message ?? err);
-            appendErrorLog({
-              subsystem: 'chat-send-queue',
-              phase: 'chat-send-queue.emit-sent-failed',
-              errorMessage,
-              context: { clientId: item.clientId },
-            });
-            if (opts.logChatSend) {
-              try {
-                opts.logChatSend({
-                  phase: 'status-emit-failed',
-                  clientReplyUuid: item.clientId,
-                  reason: 'sent',
-                  httpStatus: null,
-                  errorMessage,
-                });
-              } catch {
-                // logging must never break the send path
-              }
-            }
-          }
-        } else {
-          try {
-            // v0.1.63 audit: every `{ ok:false }` from `sendChatText`
-            // becomes a renderer-visible `failed` status, including
-            // preflight bails such as `no-session-cookies` where no HTTP
-            // request was attempted. This is the contract that prevents the
-            // optimistic placeholder from sitting on "sending" forever.
-            opts.emitStatus({
-              clientId: item.clientId,
-              status: 'failed',
-              reason: result.reason,
-              error: result.error,
-              httpStatus: result.status,
-            });
-          } catch (err) {
-            // v0.1.68 (voice 4013): mirror the IPC-emit failure into
-            // chat-send.jsonl so log forensics can correlate "renderer
-            // saw the placeholder stuck" against "the queue's `failed`
-            // status was lost en route to the renderer". Pre-v0.1.68
-            // this swallowed into a console.warn that never reached
-            // disk, so the smoking gun was invisible from log diffs.
-            const errorMessage = String((err as Error)?.message ?? err);
-            log('queue.emit.threw', {
-              clientId: item.clientId,
-              phase: 'failed',
-              error: errorMessage,
-            });
-            // v0.1.69 (voice 4015): mirror to app-errors.jsonl alongside
-            // the existing chat-send.jsonl status-emit-failed row so the
-            // catch-all error log shows IPC bridge failures from the
-            // queue without needing to know that chat-send.jsonl has
-            // its own dedicated phase for it.
-            appendErrorLog({
-              subsystem: 'chat-send-queue',
-              phase: 'chat-send-queue.emit-failed-failed',
-              errorMessage,
-              context: {
-                clientId: item.clientId,
-                resultReason: result.reason,
-                httpStatus: result.status ?? null,
-              },
-            });
-            if (opts.logChatSend) {
-              try {
-                opts.logChatSend({
-                  phase: 'status-emit-failed',
-                  clientReplyUuid: item.clientId,
-                  reason: result.reason ?? 'unknown',
-                  httpStatus: result.status ?? null,
-                  errorMessage,
-                });
-              } catch {
-                // logging must never break the send path
-              }
-            }
-          }
-        }
       }
     } finally {
       running = false;

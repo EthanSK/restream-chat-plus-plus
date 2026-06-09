@@ -575,7 +575,8 @@ export type ChatSendLogRecord =
   | ChatSendOptimisticTimeoutLogRecord
   | ChatSendWsEchoLogRecord
   | ChatSendLateEchoResolvedLogRecord
-  | ChatSendReconnectSweepLogRecord;
+  | ChatSendReconnectSweepLogRecord
+  | ChatSendRetryAttemptLogRecord;
 
 export interface ChatSendPostLogRecord {
   /** Discriminator. `'send'` for legacy / POST-round-trip rows. */
@@ -768,6 +769,51 @@ export interface ChatSendReconnectSweepLogRecord {
   reason: string;
   /** How many ⚠ (failed-but-HTTP-200) placeholders this sweep resolved. */
   clearedCount: number;
+}
+
+/**
+ * v0.1.90 (voice 4512) — written by `chat-send-queue.ts` on EVERY attempt of
+ * the exponential-backoff retry loop (the "make damn sure the message sends"
+ * loop Ethan asked for). One row per attempt — both the attempt that failed
+ * AND the decision about what comes next — so log-only forensics can
+ * reconstruct the whole 1→5 ladder for a single `clientReplyUuid` without
+ * needing the UI.
+ *
+ * Why this exists: pre-v0.1.90 a send was tried EXACTLY ONCE by the queue.
+ * When that one attempt bailed at a preflight gate (no-session-cookies /
+ * no-active-connections / not-authenticated / missing chat context) during a
+ * connection-in-flux window (right after a `"replaced"` drain), the message
+ * was dropped with no retry and — in the `not-authenticated` runSend gate —
+ * NO chat-send.jsonl row at all (the 2026-06-09 16:50 "vanished message"
+ * incident: zero `send` row, zero `preflight` row, zero `optimistic-timeout`
+ * row). This row closes that gap: the queue now logs at every attempt,
+ * including the gate-level bails that `sendChatText` may not have logged.
+ */
+export interface ChatSendRetryAttemptLogRecord {
+  phase: 'retry-attempt';
+  /** Renderer-minted UUID = optimistic placeholder id; cross-refs the ⚠ in the feed. */
+  clientReplyUuid: string;
+  /** 1-based attempt number within the bounded retry loop. */
+  attempt: number;
+  /** Total attempts the loop is allowed (== maxSendAttempts, normally 5). */
+  maxAttempts: number;
+  /** Outcome of THIS attempt: 'ok' (2xx — loop ends), or 'failed' (will retry or give up). */
+  outcome: 'ok' | 'failed';
+  /** When outcome==='failed', the SendTextResult.reason that came back. */
+  reason?: string;
+  /** When outcome==='failed' and it was a non-2xx POST, the HTTP status. */
+  httpStatus?: number | null;
+  /**
+   * What the loop decided to do next after a failed attempt:
+   *  - 'retry-after-reconnect' — schedule a managed reconnect + backoff, then re-POST
+   *  - 'give-up'               — attempts exhausted; surface terminal ⚠ failed
+   *  - 'done'                  — outcome was 'ok', nothing more to do
+   */
+  decision: 'retry-after-reconnect' | 'give-up' | 'done';
+  /** When decision==='retry-after-reconnect', the backoff sleep (ms) before the next attempt. */
+  backoffMs?: number;
+  /** Whether a managed reconnect ("refresh") ran between this attempt and the next. */
+  reconnectRequested?: boolean;
 }
 
 /**

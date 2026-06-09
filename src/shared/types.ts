@@ -61,26 +61,44 @@ export interface ChatMessage {
    * text instantly) and the main-process queue broadcasts a
    * `ChatSendStatus` back over `CHAT_SEND_STATUS`.
    *
-   *   - `'sending'` — POST hasn't completed yet; renders a faint
-   *                   "sending…" hint next to the timestamp.
-   *   - `'failed'`  — POST returned non-2xx (or auth/cookies missing).
-   *                   Renders a small ⚠ icon next to the message body
-   *                   whose `title` (tooltip) is `pendingError`.
+   *   - `'sending'`  — POST hasn't completed yet; renders a faint
+   *                    "sending…" hint next to the timestamp.
+   *   - `'retrying'` — v0.1.90 (voice 4512): a send attempt failed for a
+   *                    transient/recoverable reason and the bounded
+   *                    exponential-backoff retry loop is actively re-trying
+   *                    (with a managed reconnect/"refresh" between attempts).
+   *                    Renders "sending… (retry N/5)" so Ethan can SEE it is
+   *                    fighting to deliver, never silently dropped.
+   *   - `'failed'`   — every retry was exhausted (or a non-retryable bail).
+   *                    Renders a small ⚠ icon next to the message body whose
+   *                    `title` (tooltip) is `pendingError`. Clicking it
+   *                    re-runs the whole retry loop (manual "tap to retry").
    *
    * When the matching WS `reply_created` echo arrives (matched by
    * `id === clientReplyUuid`), the optimistic placeholder is REPLACED
    * with the echo — which has `self: true` and no `pendingSend` flag.
    * Failed placeholders are NEVER auto-removed: the user sees the ⚠
-   * persistently until they take action (clear chat, dismiss).
+   * persistently until they take action (clear chat, dismiss, tap-to-retry).
    *
    * Undefined for all incoming messages and for echoed self messages.
    */
-  pendingSend?: 'sending' | 'failed';
+  pendingSend?: 'sending' | 'retrying' | 'failed';
   /**
    * Human-readable error string surfaced as the ⚠ icon's tooltip when
    * `pendingSend === 'failed'`. v0.1.43.
    */
   pendingError?: string;
+  /**
+   * v0.1.90 (voice 4512) — the 1-based attempt number the retry loop is
+   * currently on, set on `pendingSend === 'retrying'` placeholders so the
+   * feed can render "(retry N/5)". Undefined unless actively retrying.
+   */
+  sendAttempt?: number;
+  /**
+   * v0.1.90 — total attempts the bounded retry loop is allowed (normally 5).
+   * Paired with `sendAttempt` for the "(retry N/M)" affordance.
+   */
+  sendMaxAttempts?: number;
 }
 
 /**
@@ -1089,15 +1107,22 @@ export interface ChatSendEnqueuePayload {
  *                  "sending…" affordance; the WS echo (matched by
  *                  clientReplyUuid → message id) is what actually
  *                  replaces the placeholder in the feed.
- *   - `failed`   — the POST failed (or the queue dropped the send for a
- *                  pre-POST reason — auth, cookies, no connections, etc.).
- *                  Renderer keeps the optimistic message in the feed with
- *                  a small ⚠ icon + tooltip carrying `error`. Subsequent
- *                  sends are NEVER blocked by a single failure.
+ *   - `retrying` — v0.1.90 (voice 4512): a send attempt failed for a
+ *                  transient reason and the bounded exponential-backoff
+ *                  retry loop is re-trying (with a managed reconnect between
+ *                  attempts). Carries `attempt`/`maxAttempts` so the feed can
+ *                  render "(retry N/5)". Subsequent retries re-emit this with
+ *                  an incremented `attempt`. The placeholder stays visible the
+ *                  WHOLE time — Ethan's #1 demand: never silently drop it.
+ *   - `failed`   — the retry loop is EXHAUSTED (all attempts failed) or the
+ *                  send was dropped for a non-retryable reason. Renderer keeps
+ *                  the optimistic message in the feed with a small ⚠ icon +
+ *                  tooltip carrying `error`; clicking it re-runs the loop.
+ *                  Subsequent sends are NEVER blocked by a single failure.
  */
 export interface ChatSendStatus {
   clientId: string;
-  status: 'pending' | 'sent' | 'failed';
+  status: 'pending' | 'sent' | 'retrying' | 'failed';
   /**
    * When status==='failed', the reason code from SendTextResult.
    *
@@ -1110,4 +1135,14 @@ export interface ChatSendStatus {
   error?: string;
   /** When status==='failed', the HTTP status (if the failure was a non-2xx). */
   httpStatus?: number;
+  /**
+   * v0.1.90 (voice 4512) — set on `'retrying'` (and echoed on the final
+   * `'failed'`): the 1-based attempt number the retry loop is on / ended on.
+   */
+  attempt?: number;
+  /**
+   * v0.1.90 — total attempts the loop is allowed (normally 5). Paired with
+   * `attempt` for the "(retry N/M)" affordance.
+   */
+  maxAttempts?: number;
 }

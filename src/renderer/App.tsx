@@ -48,6 +48,7 @@ import {
 } from './message-filters';
 import {
   applyFailedSendStatus,
+  applyRetryingSendStatus,
   dedupeOptimisticOnEcho,
   isLateEchoForFailedSend,
   pushOptimisticMessage,
@@ -524,6 +525,18 @@ export function App(): React.ReactElement {
         }
         return;
       }
+      // v0.1.90 (voice 4512) — intermediate retry status. The bounded
+      // exponential-backoff loop in main flips the placeholder to
+      // "sending… (retry N/5)" between attempts so Ethan always SEES his
+      // message fighting to deliver. We KEEP the optimistic-send timeout
+      // armed across retries — if the whole loop eventually succeeds the
+      // echo clears it; if it ends in terminal 'failed' that status cancels
+      // it (below). A 'retrying' is NOT a failure and NOT an HTTP-200, so it
+      // touches neither the timeout nor the httpOkSends set.
+      if (status.status === 'retrying') {
+        setMessages((prev) => applyRetryingSendStatus(prev, status));
+        return;
+      }
       if (status.status !== 'failed') return;
       // Explicit queue failures win over the timeout guard. The queue knows
       // the real reason (`no-session-cookies`, `send-failed`, auth drift,
@@ -702,6 +715,44 @@ export function App(): React.ReactElement {
     // process drops a preflight send without emitting `failed`, this callback
     // is the UX backstop that flips the message to a red warning after 15s.
     scheduleOptimisticSendTimeout(clientId);
+    dispatchEnqueueChatSend(text, clientId);
+  };
+
+  // v0.1.90 (voice 4512) — MANUAL "tap to retry" on a terminally-failed send.
+  // After the 5x auto-retry loop exhausts, the placeholder shows the ⚠
+  // "failed — tap to retry" affordance. Clicking it re-runs the WHOLE loop:
+  // we re-enqueue with the SAME clientId (== the placeholder id == the Restream
+  // clientReplyUuid) so (a) the existing placeholder is reused in-place rather
+  // than spawning a duplicate row, and (b) Restream dedupes on the uuid if the
+  // original send had somehow reached it. We flip the placeholder straight back
+  // to 'sending' and re-arm the optimistic-send timeout so the retry has the
+  // same stuck-send safety net as a fresh send.
+  const handleRetrySend = (message: ChatMessage): void => {
+    // Only retry our own failed placeholders. Guard against a stale/incoming
+    // row sneaking in (defence-in-depth; the UI only wires this on failed self
+    // placeholders).
+    if (message.pendingSend !== 'failed' || message.self !== true) return;
+    const text = message.text;
+    if (typeof text !== 'string' || text.trim().length === 0) return;
+    const clientId = message.id;
+    // Flip the existing placeholder back to 'sending' (clear the ⚠ + counters).
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === clientId
+          ? {
+              ...m,
+              pendingSend: 'sending',
+              pendingError: undefined,
+              sendAttempt: undefined,
+              sendMaxAttempts: undefined,
+            }
+          : m,
+      ),
+    );
+    // Re-arm the stuck-send timeout (re-uses the same id; scheduleOptimistic…
+    // defensively clears any prior timer for this id first).
+    scheduleOptimisticSendTimeout(clientId);
+    // Re-enqueue — runs the full bounded retry loop again in main.
     dispatchEnqueueChatSend(text, clientId);
   };
 
@@ -1120,6 +1171,9 @@ export function App(): React.ReactElement {
         // hidden-users list. ChatFeed is a pure render layer here; it
         // just surfaces the button + relays the click.
         onHideUser={handleHideUser}
+        // v0.1.90 (voice 4512) — manual "tap to retry" on a ⚠ failed send.
+        // ChatFeed relays the click on the ⚠ affordance; App re-runs the loop.
+        onRetrySend={handleRetrySend}
       />
       <ChatInputInline
         authenticated={auth.authenticated}
