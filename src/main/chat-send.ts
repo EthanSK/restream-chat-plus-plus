@@ -18,6 +18,13 @@ function getElectron(): {
   BrowserWindow: any;
   session: { fromPartition: (p: string) => Session };
 } | undefined {
+  // v0.1.92 CI hardening: the npm `electron` package can be resolvable from
+  // plain Node/Vitest even when we are NOT inside Electron's main process. In
+  // that state, touching Electron session/window APIs can hang instead of
+  // throwing promptly. The runtime always sets `process.versions.electron`, so
+  // use it as the first, cheap discriminator and keep Node-mode callers on the
+  // explicit `no-electron` path.
+  if (typeof process.versions.electron !== 'string') return undefined;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const electron = require('electron');

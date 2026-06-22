@@ -1113,27 +1113,23 @@ function resolveLogPathCandidates(): string[] {
   } catch {
     // not running under electron — fall through to platform defaults.
   }
-  // 2. Platform-specific fallbacks. Mirrors electron-log defaults so
-  //    the tool still works under unit tests.
-  if (process.platform === 'darwin') {
-    const home = process.env.HOME ?? '';
-    if (home) {
-      // Use the productName from package.json — `Restream Chat++` (the
-      // npm name is `restream-chat-plus-plus`; productName is what
-      // electron-log uses for the directory).
-      candidates.push(`${home}/Library/Logs/Restream Chat++/main.log`);
-      candidates.push(`${home}/Library/Logs/Restream Chat Plus Plus/main.log`);
-    }
-  } else if (process.platform === 'linux') {
-    const home = process.env.HOME ?? '';
-    if (home) {
-      candidates.push(`${home}/.config/Restream Chat++/logs/main.log`);
-    }
-  } else if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? '';
-    if (appData) {
-      candidates.push(`${appData}\\Restream Chat++\\logs\\main.log`);
-    }
+  // 2. Best-effort HOME/APPDATA fallbacks. v0.1.92: do NOT branch solely on
+  // `process.platform` here. The MCP test suite runs on Linux CI while faking
+  // a macOS `~/Library/Logs/...` tree; more importantly, agents often inspect
+  // logs copied from another machine. Trying all cheap, deterministic default
+  // locations makes the tool tolerant without touching any external state.
+  const home = process.env.HOME ?? '';
+  if (home) {
+    // ProductName path used by electron-log on macOS.
+    candidates.push(`${home}/Library/Logs/Restream Chat++/main.log`);
+    // Bundle/product-name fallback seen across older builds.
+    candidates.push(`${home}/Library/Logs/Restream Chat Plus Plus/main.log`);
+    // Linux electron-log-style fallback.
+    candidates.push(`${home}/.config/Restream Chat++/logs/main.log`);
+  }
+  const appData = process.env.APPDATA ?? '';
+  if (appData) {
+    candidates.push(`${appData}\\Restream Chat++\\logs\\main.log`);
   }
   return candidates;
 }
