@@ -77,6 +77,18 @@ vi.mock('electron', () => {
   };
 });
 
+// main.ts imports the updater module at top level, but this menu-focused suite
+// only exercises `openSettingsFromMenu()`. Loading the real updater loads
+// update-electron-app, which can require/download the Electron binary under
+// Linux CI before our mocked Electron module wins. Keep this test scoped to
+// the menu helper and return inert updater functions.
+vi.mock('../main/updater', () => ({
+  configureAutoUpdater: vi.fn(),
+  checkForUpdatesInteractive: vi.fn(async () => undefined),
+  quitAndInstallStagedUpdate: vi.fn(() => ({ ok: false, reason: 'test' })),
+  triggerSquirrelDownload: vi.fn(() => ({ ok: false, reason: 'not-packaged' })),
+}));
+
 // Minimal fake BrowserWindow handle for the helper. We only model the two
 // surfaces openSettingsFromMenu touches: `isDestroyed()` and
 // `webContents.send(...)`.

@@ -1099,19 +1099,21 @@ function resolveLogPathCandidates(): string[] {
   const candidates: string[] = [];
   // 1. Electron's `app.getPath('logs')` — the canonical path, available
   //    when running inside the packaged Electron process.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const electron = require('electron') as {
-      app?: { getPath?: (key: string) => string };
-    };
-    const dir = electron?.app?.getPath?.('logs');
-    if (typeof dir === 'string' && dir.length > 0) {
+  if (process.versions.electron) {
+    try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const path = require('node:path') as typeof import('node:path');
-      candidates.push(path.join(dir, 'main.log'));
+      const electron = require('electron') as {
+        app?: { getPath?: (key: string) => string };
+      };
+      const dir = electron?.app?.getPath?.('logs');
+      if (typeof dir === 'string' && dir.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const path = require('node:path') as typeof import('node:path');
+        candidates.push(path.join(dir, 'main.log'));
+      }
+    } catch {
+      // not running under electron — fall through to platform defaults.
     }
-  } catch {
-    // not running under electron — fall through to platform defaults.
   }
   // 2. Best-effort HOME/APPDATA fallbacks. v0.1.92: do NOT branch solely on
   // `process.platform` here. The MCP test suite runs on Linux CI while faking

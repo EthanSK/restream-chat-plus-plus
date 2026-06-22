@@ -78,6 +78,16 @@ vi.mock('electron-log/main', () => ({
   },
 }));
 
+// github-update-check only needs `rememberPendingDownloadVersion` from
+// updater.ts. Loading the real updater pulls in update-electron-app, which
+// pulls in Electron's binary package under plain Linux CI and can spend the
+// whole 5s Vitest timeout downloading Electron before the actual assertion
+// starts. Mock the narrow seam this suite cares about so the broadcast tests
+// stay pure and deterministic.
+vi.mock('../main/updater', () => ({
+  rememberPendingDownloadVersion: vi.fn(),
+}));
+
 describe('github-update-check broadcast (v0.1.35 stuck-spinner fix)', () => {
   beforeEach(() => {
     sentToRenderer.length = 0;
