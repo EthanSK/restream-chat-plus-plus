@@ -23,13 +23,18 @@ interface Props {
    */
   connection: ConnectionState;
   /**
-   * v0.1.72 (voice 4352, 2026-05-28) — invoked by the per-row hover
-   * "Hide user" button. App.tsx owns the hidden-users list + the persist
-   * round-trip; ChatFeed just surfaces the affordance + relays the
-   * click. Optional so older test-mount sites don't have to thread it
-   * through (tests that don't exercise hide can omit it).
+   * v0.1.91 (task: "silence user" button) — invoked by the per-row hover
+   * "Silence user" button. App.tsx owns the persist round-trip; ChatFeed
+   * just surfaces the affordance + relays the click. Optional so older
+   * test-mount sites don't have to thread it through (tests that don't
+   * exercise silence can omit it).
+   *
+   * RENAMED from `onHideUser` (v0.1.72): the action used to fully HIDE the
+   * user (drop their rows from the feed). It now SILENCES them — their
+   * messages still render but TTS skips them — by adding an anchored,
+   * regex-escaped entry to `settings.filters.tts.ignoreUsernameRegex`.
    */
-  onHideUser?: (username: string) => void;
+  onSilenceUser?: (username: string) => void;
   /**
    * v0.1.90 (voice 4512) — invoked when the user clicks the ⚠ on a
    * terminally-failed (retries-exhausted) self send. App.tsx re-runs the
@@ -63,7 +68,7 @@ export function ChatFeed({
   messages,
   authenticated,
   connection,
-  onHideUser,
+  onSilenceUser,
   onRetrySend,
 }: Props): React.ReactElement {
   if (!authenticated) {
@@ -97,14 +102,14 @@ export function ChatFeed({
         data={messages}
         followOutput="smooth"
         initialTopMostItemIndex={messages.length - 1}
-        // v0.1.72 — thread `onHideUser` down to each row so the hover-
+        // v0.1.91 — thread `onSilenceUser` down to each row so the hover-
         // affordance button can fire without ChatFeed reaching back into
         // its own props inside the itemContent closure. Each MessageRow
         // independently decides whether to render the button (no-op when
         // the callback is undefined, e.g. test mounts that don't exercise
-        // hide).
+        // silence).
         itemContent={(_, m) => (
-          <MessageRow message={m} onHideUser={onHideUser} onRetrySend={onRetrySend} />
+          <MessageRow message={m} onSilenceUser={onSilenceUser} onRetrySend={onRetrySend} />
         )}
       />
     </div>
@@ -186,14 +191,14 @@ function EmptyFeedBody({
 
 function MessageRow({
   message: m,
-  onHideUser,
+  onSilenceUser,
   onRetrySend,
 }: {
   message: ChatMessage;
-  // v0.1.72 — optional so test mounts that don't exercise the hide
+  // v0.1.91 — optional so test mounts that don't exercise the silence
   // affordance can leave this off; production always passes it via
-  // ChatFeed → App.tsx → handleHideUser.
-  onHideUser?: (username: string) => void;
+  // ChatFeed → App.tsx → handleSilenceUser.
+  onSilenceUser?: (username: string) => void;
   // v0.1.90 (voice 4512) — optional manual-retry relay (same rationale).
   onRetrySend?: (message: ChatMessage) => void;
 }): React.ReactElement {
@@ -251,18 +256,19 @@ function MessageRow({
   // Whether the ⚠ is an interactive "tap to retry" button (only on terminal
   // failures, only for our own sends, only when a retry handler is wired).
   const canRetry = isFailed && m.self === true && typeof onRetrySend === 'function';
-  // v0.1.72 — only surface the Hide-user affordance for incoming messages
-  // from a NAMED user. Hiding "You" (self echoes), the anonymous
-  // "via Restream" common-reply rows, or messages with an empty username
-  // would either be nonsensical ("hide myself") or poison the hidden-users
-  // list with a meaningless string. The Hide button is therefore gated on
-  // (a) not-self, (b) non-empty trimmed username, (c) parent passed
-  // `onHideUser`. The button itself appears via CSS hover on the row.
-  const canHide =
+  // v0.1.91 — only surface the Silence-user affordance for incoming
+  // messages from a NAMED user. Silencing "You" (self echoes), the
+  // anonymous "via Restream" common-reply rows, or messages with an empty
+  // username would either be nonsensical ("silence myself") or poison the
+  // TTS username ignore list with a meaningless `^$` pattern. The Silence
+  // button is therefore gated on (a) not-self, (b) non-empty trimmed
+  // username, (c) parent passed `onSilenceUser`. The button itself appears
+  // via CSS hover on the row.
+  const canSilence =
     !m.self &&
     typeof m.username === 'string' &&
     m.username.trim().length > 0 &&
-    typeof onHideUser === 'function';
+    typeof onSilenceUser === 'function';
   return (
     <div
       className={
@@ -309,34 +315,40 @@ function MessageRow({
             </span>
           )}
           {/*
-            v0.1.72 — per-row "Hide user" affordance (voice 4352, 2026-05-28).
-            Rendered last in the message-header so it sits at the right edge
-            of the row. CSS .hide-user-btn defaults to `visibility: hidden`
-            and the parent .message-row:hover .hide-user-btn flips it to
-            `visible` — that gives the hover-reveal UX without an
-            onMouseEnter / onMouseLeave state dance.
+            v0.1.91 — per-row "Silence user" affordance (was "Hide user" in
+            v0.1.72). Rendered last in the message-header so it sits at the
+            right edge of the row. CSS .silence-user-btn defaults to
+            `visibility: hidden` and the parent .message-row:hover
+            .silence-user-btn flips it to `visible` — hover-reveal UX
+            without an onMouseEnter / onMouseLeave state dance.
 
-            On click: append `m.username` (case-preserved trim) to the
-            persistent `settings.hiddenUsers` list. App.tsx owns the
-            mutation + persist round-trip; ChatFeed is purely the relay
-            surface.
+            On click: App.tsx adds an anchored, regex-escaped entry for
+            `m.username` to `settings.filters.tts.ignoreUsernameRegex`, so
+            the user's messages KEEP rendering in the feed but TTS skips
+            them (vs the old hide which dropped the rows entirely). App.tsx
+            owns the mutation + persist round-trip; ChatFeed is purely the
+            relay surface.
+
+            The 🔇 mute glyph matches the existing "🔇 regex-ignored (TTS)"
+            chip language so the affordance reads as "mute this user from
+            being read aloud".
 
             stopPropagation guards against the feed's right-click context
             menu opening — left clicks on the button shouldn't bubble up
             to a parent handler if a future redesign attaches one.
           */}
-          {canHide && (
+          {canSilence && (
             <button
-              className="hide-user-btn"
+              className="silence-user-btn"
               type="button"
-              title={`Hide all messages from ${m.username}`}
-              aria-label={`Hide user ${m.username}`}
+              title={`Silence ${m.username} — their messages still show but TTS won't read them aloud`}
+              aria-label={`Silence user ${m.username}`}
               onClick={(e) => {
                 e.stopPropagation();
-                onHideUser?.(m.username);
+                onSilenceUser?.(m.username);
               }}
             >
-              Hide user
+              🔇 Silence user
             </button>
           )}
         </div>
