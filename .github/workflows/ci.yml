@@ -37,5 +37,8 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Warm Electron binary
+        run: node -e "require('electron')"
+
       - name: Test
         run: npm test

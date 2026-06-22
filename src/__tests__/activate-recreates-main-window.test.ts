@@ -82,6 +82,17 @@ vi.mock('electron', () => {
   };
 });
 
+// main.ts imports updater.ts at module load, but this Dock-activate suite only
+// cares about the window recreation handler. Mock the updater boundary so Linux
+// CI doesn't pull update-electron-app -> Electron's binary package just to test
+// a menu/window helper.
+vi.mock('../main/updater', () => ({
+  configureAutoUpdater: vi.fn(),
+  checkForUpdatesInteractive: vi.fn(async () => undefined),
+  quitAndInstallStagedUpdate: vi.fn(() => ({ ok: false, reason: 'test' })),
+  triggerSquirrelDownload: vi.fn(() => ({ ok: false, reason: 'not-packaged' })),
+}));
+
 describe("app.on('activate') — recreate main window when gone (v0.1.84)", () => {
   beforeEach(() => {
     browserWindowCtor.mockClear();
