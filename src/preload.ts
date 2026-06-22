@@ -266,6 +266,8 @@ const api = {
    */
   startUpdateDownload: (): Promise<
     | { ok: true; reason: 'started'; mode: 'squirrel' }
+    | { ok: true; reason: 'already-downloading'; mode: 'squirrel' }
+    | { ok: true; reason: 'already-staged'; mode: 'squirrel' }
     | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
     | {
         ok: false;

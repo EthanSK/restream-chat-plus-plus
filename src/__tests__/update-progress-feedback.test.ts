@@ -207,6 +207,63 @@ describe('v0.1.89 — Install Update click no longer shows the flaky top-bar dow
     // And no `downloading` ever leaked to the renderer along the way.
     expect(findBroadcasts('downloading').length).toBe(0);
   });
+
+  it('rebroadcasts ready-to-install when Install Update is clicked after the bundle is already staged', async () => {
+    const updater = await loadUpdater();
+    updater.configureAutoUpdater();
+    updater.rememberPendingDownloadVersion('v0.1.60');
+    updater.triggerSquirrelDownload();
+    fakeAutoUpdater.emit('update-downloaded', {}, undefined, 'Restream Chat++ v0.1.60');
+    sentMessages.length = 0;
+
+    // v0.1.92 — this was a silent no-op: triggerSquirrelDownload returned
+    // `already-staged`, but the renderer was not reminded to show Restart.
+    const result = updater.triggerSquirrelDownload();
+
+    expect(result).toEqual({
+      ok: true,
+      reason: 'already-staged',
+      mode: 'squirrel',
+    });
+    const ready = findBroadcasts('ready-to-install');
+    expect(ready.length).toBe(1);
+    expect(ready[0]!.payload.latestVersion).toBe('v0.1.60');
+  });
+
+  it('surfaces a visible fallback when user-clicked Squirrel says no update but GitHub says newer exists', async () => {
+    const updater = await loadUpdater();
+    updater.configureAutoUpdater();
+    updater.rememberPendingDownloadVersion('v0.1.60');
+    updater.triggerSquirrelDownload();
+    sentMessages.length = 0;
+
+    // v0.1.92 — if update.electronjs.org/Squirrel answers "not available"
+    // after a visible Install Update click, while the GH poller has already
+    // cached a newer tag, the user must see an error/fallback instead of the
+    // banner appearing to do nothing.
+    fakeAutoUpdater.emit('update-not-available');
+
+    const errors = findBroadcasts('error');
+    expect(errors.length).toBe(1);
+    expect(errors[0]!.payload.error).toContain('GitHub says v0.1.60 is available');
+    expect(errors[0]!.payload.errorReleaseUrl).toContain(
+      'github.com/EthanSK/restream-chat-plus-plus',
+    );
+  });
+
+  it('does not show the fallback for a quiet background update-not-available', async () => {
+    const updater = await loadUpdater();
+    updater.configureAutoUpdater();
+    updater.rememberPendingDownloadVersion('v0.1.60');
+    sentMessages.length = 0;
+
+    // Background hourly Squirrel polls can say "not available" without a
+    // user click. The GH banner remains responsible for nudging the user; we
+    // only show the error when the user explicitly clicked Install Update.
+    fakeAutoUpdater.emit('update-not-available');
+
+    expect(findBroadcasts('error').length).toBe(0);
+  });
 });
 
 describe('v0.1.89 — download-progress field validation still runs (internally) but is not broadcast', () => {

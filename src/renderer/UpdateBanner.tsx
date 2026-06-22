@@ -208,6 +208,8 @@ export function decideErrorCopy(info: UpdateInfo): ErrorCopy {
  */
 export type StartDownloadResult =
   | { ok: true; reason: 'started'; mode: 'squirrel' }
+  | { ok: true; reason: 'already-downloading'; mode: 'squirrel' }
+  | { ok: true; reason: 'already-staged'; mode: 'squirrel' }
   | {
       ok: true;
       reason: 'opened-release-page';
@@ -239,6 +241,18 @@ export interface ToastSpec {
 export function decideToast(result: StartDownloadResult): ToastSpec {
   if (result.ok) {
     if (result.mode === 'squirrel') {
+      if (result.reason === 'already-staged') {
+        return {
+          kind: 'info',
+          text: 'Update is already ready — use Restart to install it.',
+        };
+      }
+      if (result.reason === 'already-downloading') {
+        return {
+          kind: 'info',
+          text: "Update is already being prepared in the background — you'll be prompted to restart when it's ready.",
+        };
+      }
       // v0.1.89 (voice 4507) — the consolidated flow no longer shows a
       // foreground top-bar download bar (see SUPPRESS_FOREGROUND_DOWNLOAD_UI
       // in src/main/updater.ts). The bundle downloads in the BACKGROUND via
@@ -285,6 +299,8 @@ export const TOAST_AUTO_DISMISS_MS = 3000;
  */
 export const INSTALL_BUTTON_LABEL_IDLE = 'Install Update';
 export const INSTALL_BUTTON_LABEL_INSTALLING = 'Installing…';
+export const RESTART_BUTTON_LABEL_IDLE = 'Restart';
+export const RESTART_BUTTON_LABEL_RESTARTING = 'Restarting…';
 
 interface Props {
   info: UpdateInfo | null;
@@ -312,7 +328,7 @@ interface Props {
    * Triggers Squirrel's `quitAndInstall()` via the preload
    * `rcpp.quitAndInstall` API. Injected for test-friendliness. v0.1.25.
    */
-  onRestart: () => void;
+  onRestart: () => Promise<{ ok: boolean; reason?: string }>;
 }
 
 export function UpdateBanner({
@@ -326,6 +342,7 @@ export function UpdateBanner({
   // the top of the component so React's hook count is stable across
   // renders regardless of which branch we return from (Rules of Hooks).
   const [installing, setInstalling] = React.useState(false);
+  const [restarting, setRestarting] = React.useState(false);
   const [toast, setToast] = React.useState<ToastSpec | null>(null);
 
   // Auto-dismiss the toast after TOAST_AUTO_DISMISS_MS. Effect tied to
@@ -341,6 +358,25 @@ export function UpdateBanner({
 
   const state = updateBannerState(info, dismissed);
   if (state === 'hidden') return null;
+
+  const renderToast = (): React.ReactNode =>
+    toast ? (
+      <div
+        className={`update-banner-toast update-banner-toast-${toast.kind}`}
+        role={toast.kind === 'error' ? 'alert' : 'status'}
+        aria-live={toast.kind === 'error' ? 'assertive' : 'polite'}
+      >
+        <span className="update-banner-toast-text">{toast.text}</span>
+        <button
+          className="update-banner-toast-dismiss"
+          onClick={() => setToast(null)}
+          aria-label="Dismiss notification"
+          type="button"
+        >
+          ×
+        </button>
+      </div>
+    ) : null;
 
   if (state === 'checking') {
     return (
@@ -418,23 +454,7 @@ export function UpdateBanner({
             Later
           </button>
         </div>
-        {toast && (
-          <div
-            className={`update-banner-toast update-banner-toast-${toast.kind}`}
-            role={toast.kind === 'error' ? 'alert' : 'status'}
-            aria-live={toast.kind === 'error' ? 'assertive' : 'polite'}
-          >
-            <span className="update-banner-toast-text">{toast.text}</span>
-            <button
-              className="update-banner-toast-dismiss"
-              onClick={() => setToast(null)}
-              aria-label="Dismiss notification"
-              type="button"
-            >
-              ×
-            </button>
-          </div>
-        )}
+        {renderToast()}
       </div>
     );
   }
@@ -497,13 +517,60 @@ export function UpdateBanner({
         Update ready{readyVersion ? ` (${readyVersion})` : ''} — Restart to install
       </span>
       <div className="update-banner-actions">
-        <button className="btn primary" onClick={onRestart}>
-          Restart
+        <button
+          className="btn primary"
+          disabled={restarting}
+          aria-busy={restarting}
+          onClick={() => {
+            // v0.1.92 — Restart used to be fire-and-forget (`void
+            // rcpp.quitAndInstall()` from App.tsx). If main refused because
+            // Squirrel no longer had a staged bundle, the click looked dead.
+            // Await the IPC result, keep the button busy while it resolves,
+            // and surface a toast on refusal/IPC failure so Restart is never
+            // a silent no-op again.
+            setRestarting(true);
+            void (async () => {
+              try {
+                const result = await onRestart();
+                if (result.ok) {
+                  setToast({
+                    kind: 'info',
+                    text: 'Restarting Restream Chat++ to install the update…',
+                  });
+                  return;
+                }
+                setToast({
+                  kind: 'error',
+                  text: `Update restart could not start: ${
+                    result.reason ?? 'unknown reason'
+                  }`,
+                });
+                setRestarting(false);
+              } catch (err) {
+                setToast({
+                  kind: 'error',
+                  text: `Update restart could not start: ${String(
+                    (err as Error)?.message ?? err,
+                  )}`,
+                });
+                setRestarting(false);
+              }
+            })();
+          }}
+        >
+          {restarting && (
+            <span
+              className="update-banner-spinner update-banner-button-spinner"
+              aria-hidden="true"
+            />
+          )}
+          {restarting ? RESTART_BUTTON_LABEL_RESTARTING : RESTART_BUTTON_LABEL_IDLE}
         </button>
-        <button className="btn ghost" onClick={onDismiss}>
+        <button className="btn ghost" onClick={onDismiss} disabled={restarting}>
           Later
         </button>
       </div>
+      {renderToast()}
     </div>
   );
 }

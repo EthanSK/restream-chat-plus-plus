@@ -19,6 +19,7 @@ import { app, autoUpdater, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
 import { updateElectronApp, UpdateSourceType } from 'update-electron-app';
 import { IPC, UpdateInfo } from '../shared/types';
+import { isNewerVersion } from '../shared/version';
 import { performGithubUpdateCheck } from './github-update-check';
 // v0.1.69 (voice 4015) — structured error log. The updater already writes
 // to electron-log's main.log via `log.error/warn`, but main.log is plain
@@ -65,6 +66,12 @@ let downloadStartedAt: number | undefined;
 // can show "Downloading Restream Chat++ v0.1.61… 42%" instead of an
 // anonymous percentage.
 let pendingDownloadVersion: string | undefined;
+// v0.1.92 — tracks whether the current Squirrel check was kicked by the
+// renderer's visible "Install Update" button. Background hourly checks are
+// allowed to fail quietly (the GH banner will poll again), but a user-clicked
+// check must never vanish into `update-not-available` silence when the GitHub
+// release poller already proved a newer version exists.
+let userRequestedSquirrelDownload = false;
 
 // ---------------------------------------------------------------------------
 // v0.1.85 (voice 7280) — DOWNLOAD-RETRY RESILIENCE.
@@ -530,12 +537,51 @@ function attachSquirrelProgressForwarders(): void {
     });
   });
   autoUpdater.on('update-not-available', () => {
+    const wasUserRequested = userRequestedSquirrelDownload;
+    userRequestedSquirrelDownload = false;
     downloadInFlight = false;
     downloadStartedAt = undefined;
     // v0.1.85 — nothing to download, so cancel any pending transient retry
     // and reset the per-session counter. (A retry that was armed by a blip
     // before Squirrel concluded "no update" would otherwise fire pointlessly.)
     resetDownloadRetryState();
+    // v0.1.92 — explicit no-silent-no-op guard for Ethan's "Install Update
+    // does nothing" report. The app has two independent signals:
+    //   1. GitHub Releases says a newer version exists (banner available).
+    //   2. Squirrel/update.electronjs.org says "update-not-available".
+    // If (2) happens immediately after a visible user click while (1) is
+    // true, the old code reset internal flags and told the renderer nothing,
+    // leaving the same banner on screen with no explanation. Surface a real
+    // error pane with the manual Releases fallback so the click always has a
+    // visible, diagnosable outcome.
+    if (
+      wasUserRequested &&
+      isNewerVersion(pendingDownloadVersion, app.getVersion())
+    ) {
+      const message =
+        `GitHub says ${pendingDownloadVersion} is available, but the native ` +
+        'update service did not offer an installable bundle yet.';
+      lastErrorMessage = message;
+      lastErrorCategory = 'unknown';
+      appendErrorLog({
+        subsystem: 'updater',
+        phase: 'updater.squirrel-not-available-after-user-click',
+        errorMessage: message,
+        context: {
+          currentVersion: app.getVersion(),
+          pendingVersion: pendingDownloadVersion ?? '',
+        },
+      });
+      broadcastSquirrelStatus({
+        kind: 'error',
+        currentVersion: app.getVersion(),
+        latestVersion: pendingDownloadVersion,
+        error: message,
+        errorCategory: 'unknown',
+        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
+        checkedAt: Date.now(),
+      });
+    }
   });
   autoUpdater.on('error', (err) => {
     // v0.1.61 — broadcast the error to the renderer so the banner can
@@ -587,6 +633,7 @@ function attachSquirrelProgressForwarders(): void {
         // rather than the error pane. Skip the terminal error broadcast.
         log.info('[updater] transient download error — retry armed, suppressing error pane');
       } else {
+        userRequestedSquirrelDownload = false;
         // Either a non-network category, or we've exhausted the retry budget.
         // Surface the error pane (with manual-fallback link) as before so the
         // user can install manually from the GitHub release page.
@@ -610,6 +657,7 @@ function attachSquirrelProgressForwarders(): void {
     (_evt: Electron.Event, _releaseNotes?: string, releaseName?: string) => {
       try {
         updateDownloaded = true;
+        userRequestedSquirrelDownload = false;
         downloadInFlight = false;
         downloadStartedAt = undefined;
         // v0.1.85 — download landed: cancel any pending transient retry timer
@@ -967,6 +1015,17 @@ export function triggerSquirrelDownload(): StartDownloadResult {
   // install on the next UpdateInfo broadcast.
   if (updateDownloaded) {
     log.info('[updater] download requested but update already staged — no-op');
+    // v0.1.92 — do not make an "Install Update" click look like a no-op when
+    // Squirrel has already staged the bundle. Re-broadcast ready-to-install so
+    // the renderer is forced onto the Restart banner even if it somehow missed
+    // the original `update-downloaded` event (window reload, listener race, or
+    // stale available-state UI).
+    broadcastSquirrelStatus({
+      kind: 'ready-to-install',
+      currentVersion: app.getVersion(),
+      latestVersion: pendingDownloadVersion,
+      checkedAt: Date.now(),
+    });
     return { ok: true, reason: 'already-staged', mode: 'squirrel' };
   }
   // v0.1.52: same guard against re-clicking while Squirrel is already
@@ -986,6 +1045,7 @@ export function triggerSquirrelDownload(): StartDownloadResult {
     // a user manually re-clicking Install after the auto-retries exhausted
     // would get no further auto-retries.
     resetDownloadRetryState();
+    userRequestedSquirrelDownload = true;
     downloadInFlight = true;
     downloadStartedAt = Date.now();
     // v0.1.61 — broadcast a `downloading` payload IMMEDIATELY (before

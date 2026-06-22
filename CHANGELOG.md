@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.1.92 — updater clicks always produce visible feedback (2026-06-22)
+
+Ethan:
+> the update mechanism is super dodge and [doesn't] work half the time... install update in the banner does nothing, or restart too does nothing
+
+### What's new
+
+- **Install Update no longer fails silently when Squirrel disagrees with GitHub.**
+  If the GitHub release poller has already found a newer version but the native
+  update service returns `update-not-available` after a visible banner click, the
+  banner now shows a persistent error pane with the manual Releases fallback
+  instead of resetting internal state and leaving the user staring at the same
+  button.
+- **Install Update re-shows Restart if the bundle is already staged.** A stale
+  `available` banner click now rebroadcasts `ready-to-install` and returns an
+  `already-staged` result, so the renderer is forced back onto the Restart
+  prompt even if it missed the original Squirrel event.
+- **Restart is no longer fire-and-forget.** The banner awaits the
+  `quitAndInstall()` IPC result, disables the button as `Restarting…`, and shows
+  a toast if main refuses with `no-update-downloaded` or the IPC layer throws.
+- **Renderer toasts cover every idempotent outcome.** `already-downloading` and
+  `already-staged` now get explicit copy instead of feeling like dead clicks.
+
+### Guard
+
+- Added updater tests for the user-clicked `update-not-available` mismatch, the
+  already-staged rebroadcast, and background no-update quiet path.
+- Added banner tests for idempotent Install toasts and Restart busy/error
+  feedback. Full local suite: 684 tests pass, typecheck clean.
+
 ## v0.1.87 — Auto-reconnect when a send goes unconfirmed (2026-06-07)
 
 Ethan (send-warning auto-reconnect request):

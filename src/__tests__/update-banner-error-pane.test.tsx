@@ -37,6 +37,8 @@ import {
 } from '../renderer/UpdateBanner';
 import type { UpdateInfo } from '../shared/types';
 
+const noop = (): void => undefined;
+
 function errorInfo(patch: Partial<UpdateInfo> = {}): UpdateInfo {
   return {
     kind: 'error',
@@ -183,7 +185,7 @@ describe('<UpdateBanner> — error pane render', () => {
         <UpdateBanner
           info={errorInfo()}
           dismissed={false}
-          onDismiss={() => {}}
+          onDismiss={noop}
           onStartDownload={() =>
             Promise.resolve({
               ok: true as const,
@@ -191,7 +193,7 @@ describe('<UpdateBanner> — error pane render', () => {
               mode: 'squirrel' as const,
             })
           }
-          onRestart={() => {}}
+          onRestart={async () => ({ ok: true })}
         />,
       );
     });
@@ -229,7 +231,7 @@ describe('<UpdateBanner> — error pane render', () => {
               mode: 'squirrel' as const,
             })
           }
-          onRestart={() => {}}
+          onRestart={async () => ({ ok: true })}
         />,
       );
     });
@@ -257,7 +259,7 @@ describe('<UpdateBanner> — downloading pane shows bytes + speed + elapsed', ()
         <UpdateBanner
           info={downloadingInfo()}
           dismissed={false}
-          onDismiss={() => {}}
+          onDismiss={noop}
           onStartDownload={() =>
             Promise.resolve({
               ok: true as const,
@@ -265,7 +267,7 @@ describe('<UpdateBanner> — downloading pane shows bytes + speed + elapsed', ()
               mode: 'squirrel' as const,
             })
           }
-          onRestart={() => {}}
+          onRestart={async () => ({ ok: true })}
         />,
       );
     });
@@ -301,7 +303,7 @@ describe('<UpdateBanner> — downloading pane shows bytes + speed + elapsed', ()
             downloadBytesPerSecond: undefined,
           })}
           dismissed={false}
-          onDismiss={() => {}}
+          onDismiss={noop}
           onStartDownload={() =>
             Promise.resolve({
               ok: true as const,
@@ -309,7 +311,7 @@ describe('<UpdateBanner> — downloading pane shows bytes + speed + elapsed', ()
               mode: 'squirrel' as const,
             })
           }
-          onRestart={() => {}}
+          onRestart={async () => ({ ok: true })}
         />,
       );
     });

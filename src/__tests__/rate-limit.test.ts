@@ -3,7 +3,7 @@ import { RateLimiter } from '../renderer/tts';
 
 describe('RateLimiter', () => {
   it('allows up to max-per-minute consumes', () => {
-    let now = 1_000_000;
+    const now = 1_000_000;
     const lim = new RateLimiter(3, () => now);
     expect(lim.tryConsume()).toBe(true);
     expect(lim.tryConsume()).toBe(true);

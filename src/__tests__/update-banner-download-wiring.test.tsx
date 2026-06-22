@@ -69,7 +69,7 @@ describe('UpdateBanner — Install Update button wiring (v0.1.32, relabelled v0.
       mode: 'squirrel',
     });
     const onDismiss = vi.fn();
-    const onRestart = vi.fn();
+    const onRestart = vi.fn().mockResolvedValue({ ok: true });
 
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
@@ -115,7 +115,7 @@ describe('UpdateBanner — Install Update button wiring (v0.1.32, relabelled v0.
       mode: 'squirrel',
     });
     const onDismiss = vi.fn();
-    const onRestart = vi.fn();
+    const onRestart = vi.fn().mockResolvedValue({ ok: true });
 
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
@@ -152,7 +152,7 @@ describe('UpdateBanner — Install Update button wiring (v0.1.32, relabelled v0.
       mode: 'squirrel',
     });
     const onDismiss = vi.fn();
-    const onRestart = vi.fn();
+    const onRestart = vi.fn().mockResolvedValue({ ok: true });
 
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {

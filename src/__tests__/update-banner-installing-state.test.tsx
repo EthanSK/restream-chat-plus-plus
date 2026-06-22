@@ -7,6 +7,8 @@ import {
   TOAST_AUTO_DISMISS_MS,
   INSTALL_BUTTON_LABEL_IDLE,
   INSTALL_BUTTON_LABEL_INSTALLING,
+  RESTART_BUTTON_LABEL_IDLE,
+  RESTART_BUTTON_LABEL_RESTARTING,
   type StartDownloadResult,
 } from '../renderer/UpdateBanner';
 import type { UpdateInfo } from '../shared/types';
@@ -42,6 +44,8 @@ import type { UpdateInfo } from '../shared/types';
  * full prop object including functions.
  */
 
+const noop = (): void => undefined;
+
 function availableInfo(): UpdateInfo {
   return {
     kind: 'available',
@@ -49,6 +53,15 @@ function availableInfo(): UpdateInfo {
     latestVersion: '0.1.39',
     releaseUrl:
       'https://github.com/EthanSK/restream-chat-plus-plus/releases/tag/v0.1.39',
+    checkedAt: 1_700_000_000_000,
+  };
+}
+
+function readyInfo(): UpdateInfo {
+  return {
+    kind: 'ready-to-install',
+    currentVersion: '0.1.91',
+    latestVersion: '0.1.92',
     checkedAt: 1_700_000_000_000,
   };
 }
@@ -127,6 +140,28 @@ describe('decideToast — pure result → toast mapping', () => {
     });
   });
 
+  it('Already-downloading success → info toast about background preparation', () => {
+    const spec = decideToast({
+      ok: true,
+      reason: 'already-downloading',
+      mode: 'squirrel',
+    });
+    expect(spec.kind).toBe('info');
+    expect(spec.text).toContain('already being prepared');
+    expect(spec.text).toContain('background');
+  });
+
+  it('Already-staged success → info toast pointing at Restart', () => {
+    const spec = decideToast({
+      ok: true,
+      reason: 'already-staged',
+      mode: 'squirrel',
+    });
+    expect(spec.kind).toBe('info');
+    expect(spec.text).toContain('already ready');
+    expect(spec.text).toContain('Restart');
+  });
+
   it('Failure with explicit error → error toast with the underlying message', () => {
     const spec = decideToast({
       ok: false,
@@ -166,9 +201,9 @@ describe('UpdateBanner — installing state + toast (v0.1.39)', () => {
         <UpdateBanner
           info={availableInfo()}
           dismissed={false}
-          onDismiss={() => {}}
+          onDismiss={noop}
           onStartDownload={onStartDownload}
-          onRestart={() => {}}
+          onRestart={async () => ({ ok: true })}
         />,
       );
     });
@@ -358,6 +393,104 @@ describe('UpdateBanner — installing state + toast (v0.1.39)', () => {
       findToastsByClassPrefix(renderer, 'update-banner-toast-'),
       'Toast should be removed immediately when user clicks ×',
     ).toHaveLength(0);
+
+    renderer.unmount();
+  });
+});
+
+describe('UpdateBanner — restart state + toast (v0.1.92)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function renderReadyBanner(
+    onRestart: () => Promise<{ ok: boolean; reason?: string }>,
+  ): Promise<TestRenderer.ReactTestRenderer> {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <UpdateBanner
+          info={readyInfo()}
+          dismissed={false}
+          onDismiss={noop}
+          onStartDownload={async () => ({
+            ok: true,
+            reason: 'already-staged',
+            mode: 'squirrel',
+          })}
+          onRestart={onRestart}
+        />,
+      );
+    });
+    return renderer;
+  }
+
+  it('clicking Restart disables the button until the IPC resolves, then shows a restart toast', async () => {
+    let resolveRestart!: (value: { ok: boolean; reason?: string }) => void;
+    const onRestart = vi.fn().mockImplementation(
+      () =>
+        new Promise<{ ok: boolean; reason?: string }>((resolve) => {
+          resolveRestart = resolve;
+        }),
+    );
+
+    const renderer = await renderReadyBanner(onRestart);
+    const restartBefore = findButtonByText(renderer, (t) =>
+      t.includes(RESTART_BUTTON_LABEL_IDLE),
+    );
+    expect(restartBefore, 'Restart button must be present before click').toBeDefined();
+    expect(restartBefore!.props.disabled).toBeFalsy();
+
+    await act(async () => {
+      restartBefore!.props.onClick();
+    });
+
+    const restartInFlight = findButtonByText(renderer, (t) =>
+      t.includes(RESTART_BUTTON_LABEL_RESTARTING),
+    );
+    expect(restartInFlight, 'Restart button must show busy copy while IPC is in flight').toBeDefined();
+    expect(restartInFlight!.props.disabled).toBe(true);
+    expect(restartInFlight!.props['aria-busy']).toBe(true);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveRestart({ ok: true });
+    });
+
+    const toast = findToastsByClassPrefix(renderer, 'update-banner-toast-info')[0];
+    expect(toast, 'Successful restart request must render an info toast').toBeDefined();
+    expect(instanceText(toast!)).toContain('Restarting Restream Chat++');
+
+    renderer.unmount();
+  });
+
+  it('failed Restart result resets the button and shows the refusal reason', async () => {
+    const onRestart = vi.fn().mockResolvedValue({
+      ok: false,
+      reason: 'no-update-downloaded',
+    });
+
+    const renderer = await renderReadyBanner(onRestart);
+    const restartBefore = findButtonByText(renderer, (t) =>
+      t.includes(RESTART_BUTTON_LABEL_IDLE),
+    );
+
+    await act(async () => {
+      restartBefore!.props.onClick();
+    });
+
+    const restartAfter = findButtonByText(renderer, (t) =>
+      t.includes(RESTART_BUTTON_LABEL_IDLE),
+    );
+    expect(restartAfter, 'Restart button must return to idle after a refused IPC result').toBeDefined();
+    expect(restartAfter!.props.disabled).toBeFalsy();
+
+    const toast = findToastsByClassPrefix(renderer, 'update-banner-toast-error')[0];
+    expect(toast, 'Refused restart must render an error toast').toBeDefined();
+    expect(instanceText(toast!)).toContain('no-update-downloaded');
 
     renderer.unmount();
   });

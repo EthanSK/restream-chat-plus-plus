@@ -1024,7 +1024,10 @@ export function App(): React.ReactElement {
         // v0.1.39: returns the StartDownloadResult so the banner can
         // surface a toast describing the outcome of the click.
         onStartDownload={() => rcpp.startUpdateDownload()}
-        onRestart={() => void rcpp.quitAndInstall()}
+        // v0.1.92: return the Restart IPC result to the banner so a refused
+        // or stale restart attempt produces visible feedback instead of a
+        // fire-and-forget no-op.
+        onRestart={() => rcpp.quitAndInstall()}
       />
       {sendNotice && (
         <div

@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-22T17:24:56Z
+**Trigger:** Ethan: "the update mechanism is super dodge... install update in the banner does nothing, or restart too does nothing"
+**Symptom:** Install Update could feel like a dead click when the GitHub banner said a newer release existed but Squirrel answered `update-not-available`; Restart could also feel dead because the renderer ignored `{ ok:false, reason:'no-update-downloaded' }` from main.
+**Root cause:** The update UI had idempotent/native mismatch branches with no visible renderer consequence. `triggerSquirrelDownload()` reset state silently on user-clicked `update-not-available`, and an already-staged click returned `already-staged` without rebroadcasting `ready-to-install`. In the ready banner, App.tsx fired `void rcpp.quitAndInstall()`, so refused/stale Restart results were discarded.
+**Fix:** v0.1.92: updater.ts tracks whether a Squirrel check was launched by the visible Install button; if that user-clicked check emits `update-not-available` while `pendingDownloadVersion` is newer than `app.getVersion()`, it logs `updater.squirrel-not-available-after-user-click` and broadcasts a visible error pane with the GitHub Releases fallback. Already-staged clicks rebroadcast `ready-to-install`. UpdateBanner.tsx now handles `already-downloading` / `already-staged` toasts and awaits Restart IPC, showing `Restarting…` plus an error toast on refusal. App.tsx returns the Restart promise instead of fire-and-forget.
+**Commit:** this commit
+**Guard:** src/__tests__/update-progress-feedback.test.ts user-click/no-update mismatch + already-staged rebroadcast + quiet background no-update; src/__tests__/update-banner-installing-state.test.tsx idempotent Install toasts + Restart busy/error feedback; update-banner-download-wiring/error-pane tests updated for async Restart. Full local suite: 684 tests pass, typecheck clean.
+---
+
+---
 **Date:** 2026-06-22T15:12:27Z
 **Trigger:** task: silence user button
 **Symptom:** Per-row 'Hide user' button fully dropped a user's messages from the feed AND suppressed all side effects; Ethan wanted messages to still SHOW but not be read by TTS.
@@ -243,4 +253,3 @@ Each entry looks like:
 **Commit:** a59300b
 **Guard:** src/__tests__/transient-refresh-retry.test.ts (12 cases pinning the state machine: 2m base, doubles, 30m cap, success/fatal/coalescing/cancel/throw-handling) + 5 new cases in oauth-refresh-failure.test.ts pinning getLastRefreshFailure() classification across all 4 outcomes. Plus extensive inline comment blocks in src/main/transient-refresh-retry.ts + src/main/oauth.ts referencing this bug.
 ---
-

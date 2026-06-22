@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-var-requires */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // We mock the `ws` module to a tiny EventEmitter-like fake so we can drive
@@ -13,8 +14,12 @@ vi.mock('ws', () => {
       // Caller will trigger events explicitly via `emit`.
       FakeWS.instances.push(this);
     }
-    ping() {}
-    close() {}
+    ping() {
+      // Test fake: the client only needs the method to exist.
+    }
+    close() {
+      // Test fake: close side effects are driven by explicit emitted events.
+    }
     removeAllListeners() {
       super.removeAllListeners();
     }

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-var-requires */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 /**
@@ -23,11 +24,15 @@ vi.mock('ws', () => {
       super();
       FakeWS.instances.push(this);
     }
-    ping() {}
+    ping() {
+      // Test fake: the client only needs the method to exist.
+    }
     terminate() {
       this.readyState = 3;
     }
-    close() {}
+    close() {
+      // Test fake: close side effects are driven by explicit emitted events.
+    }
     removeAllListeners() {
       super.removeAllListeners();
     }
