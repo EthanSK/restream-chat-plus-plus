@@ -234,6 +234,66 @@ export function removeHiddenUser(
 }
 
 /**
+ * v0.1.91 (task: "silence user" button) — pure reducer for the per-row
+ * "Silence user" action. Returns a NEW `ignoreUsernameRegex` list with an
+ * ANCHORED, REGEX-ESCAPED entry for `username` appended if not already
+ * present.
+ *
+ * WHY this replaced the old "Hide user" wiring: the button now SILENCES
+ * (TTS-ignores) the user — their messages still RENDER in the feed but TTS
+ * skips them — vs the old hide which dropped them from the feed entirely
+ * AND suppressed all side effects. We achieve the silence by adding the
+ * username to the TTS *username* ignore axis (`settings.filters.tts.
+ * ignoreUsernameRegex`), which `applyMessageFilters` matches against the
+ * author display name and turns into `ignoredByTts`.
+ *
+ * The entry we store is `^<escaped>$`:
+ *   - We REGEX-ESCAPE the username first so names containing regex
+ *     metacharacters (`.`, `+`, `(`, `[`, etc. — common in display names
+ *     like "Foo.Bar+1") match LITERALLY rather than as a pattern.
+ *   - We ANCHOR with `^...$` so silencing "bot" doesn't also silence
+ *     "botanist" / "robot_kappa" — superstring names must NOT over-match.
+ *   - Case-insensitivity is NOT baked into the source string; it's added
+ *     uniformly by `compileIgnorePatterns` (the `i` flag), matching how
+ *     every other entry in these textareas behaves.
+ *
+ * De-dup is case-insensitive against the existing entries (compare the
+ * candidate `^esc$` string case-insensitively). Empty / whitespace-only
+ * usernames are no-ops (returns a clone, NOT the same reference, so the
+ * caller's reference-equality "did anything change?" check stays simple —
+ * mirrors `addHiddenUser`'s contract).
+ */
+export function addSilencedUser(
+  existingPatterns: readonly string[],
+  username: string,
+): string[] {
+  // Defensive: non-string / empty / whitespace-only → no-op clone.
+  if (typeof username !== 'string') return existingPatterns.slice();
+  const trimmed = username.trim();
+  if (trimmed.length === 0) return existingPatterns.slice();
+  // Escape the standard JS regex metacharacter set. We anchor with ^...$
+  // (NOT a character class) so we escape the full set including `-` is
+  // unnecessary, but escaping it is harmless; we stick to the canonical
+  // set below. Backslash MUST be escaped first within the class itself —
+  // the `\\` in the class handles that.
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const candidate = `^${escaped}$`;
+  const candidateLower = candidate.toLowerCase();
+  for (const existing of existingPatterns) {
+    if (
+      typeof existing === 'string' &&
+      existing.trim().toLowerCase() === candidateLower
+    ) {
+      // Already silencing this exact (case-insensitive) anchored pattern —
+      // return a clone so the caller still detects "no change needed" via a
+      // length / value compare, never a double-add.
+      return existingPatterns.slice();
+    }
+  }
+  return [...existingPatterns, candidate];
+}
+
+/**
  * Per-line validation for the Settings drawer textareas. Returns an
  * array of `{ line, error }` entries for the lines that didn't compile
  * — used by the UI to draw a red border + tooltip on the textarea when

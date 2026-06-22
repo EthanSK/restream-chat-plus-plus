@@ -40,7 +40,7 @@ import { UpdateBanner } from './UpdateBanner';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
-  addHiddenUser,
+  addSilencedUser,
   applyMessageFilters,
   compileHiddenUsersSet,
   compileIgnorePatterns,
@@ -794,29 +794,54 @@ export function App(): React.ReactElement {
     [messages, settings.filter.platforms, hiddenUsersSet],
   );
 
-  // v0.1.72 — handler for the per-row "Hide user" hover button. Appends
-  // the username to `settings.hiddenUsers` (de-duped, case-insensitive)
-  // and persists via the normal updateSettings IPC round-trip. Async
-  // because settings persist is async; the renderer doesn't await the
-  // promise so the click feels instant — the in-memory `setSettings`
-  // call in updateSettings flips the local state synchronously, which
-  // re-runs `visibleMessages` on the next render, which hides the row.
-  const handleHideUser = (username: string): void => {
+  // v0.1.91 (task: "silence user" button) — handler for the per-row
+  // "Silence user" hover button. RENAMED + REWIRED from the old
+  // handleHideUser:
+  //
+  //   - OLD behavior (v0.1.72): appended the username to
+  //     `settings.hiddenUsers`, which DROPPED their rows from the visible
+  //     feed AND suppressed all side effects.
+  //   - NEW behavior: adds an anchored, regex-escaped entry for the
+  //     username to `settings.filters.tts.ignoreUsernameRegex`, so the
+  //     user's messages STILL RENDER in the feed but TTS skips them (the
+  //     main-process dispatcher reads ignoredByTts from applyMessageFilters,
+  //     which matches the TTS *username* axis against this list).
+  //
+  // We persist through the SAME nested-spread shape the Settings drawer's
+  // `patchTtsUsernameFilter` uses, so the new entry survives restart AND
+  // shows up in the Settings → TTS username-ignore textarea (one entry per
+  // line). The `hiddenUsers` plumbing is left dormant — it's still used by
+  // the Settings "Hidden Users" list + unhide, just no longer fed by this
+  // button.
+  //
+  // Async-flavored fire-and-forget like the old handler: updateSettings
+  // flips local state synchronously so the textarea / behavior update is
+  // effectively instant; the IPC persist happens in the background.
+  const handleSilenceUser = (username: string): void => {
     // Defensive: skip empty / whitespace-only usernames so a malformed
-    // ChatMessage can't poison the hidden list with `""`. addHiddenUser
-    // also guards but it never hurts to check at the call site too.
+    // ChatMessage can't poison the ignore list with a bare `^$` pattern.
+    // addSilencedUser also guards, but checking at the call site is cheap.
     if (typeof username !== 'string' || username.trim().length === 0) return;
-    const nextHidden = addHiddenUser(settings.hiddenUsers ?? [], username);
-    // Bail if nothing actually changed (already hidden) to avoid an
-    // unnecessary settings persist / IPC round-trip.
-    if (nextHidden.length === (settings.hiddenUsers ?? []).length) {
-      const before = (settings.hiddenUsers ?? []).map((u) => u.toLowerCase());
-      const after = nextHidden.map((u) => u.toLowerCase());
-      if (before.every((u, i) => u === after[i])) return;
-    }
+    const existing = settings.filters?.tts?.ignoreUsernameRegex ?? [];
+    // Anchored ^name$ + regex-escape so names with special chars and
+    // superstring names don't over-match; relies on the `i` flag added at
+    // compile time (compileIgnorePatterns) for case-insensitivity.
+    const next = addSilencedUser(existing, username);
+    // Bail (no persist) if nothing changed — already silenced (dedupe hit)
+    // or a no-op empty username. Avoids a redundant settings/IPC round-trip.
+    if (next.length === existing.length) return;
+    // Persist via the SAME nested-spread shape as patchTtsUsernameFilter,
+    // replicating its optional-chaining safety for a possibly-undefined
+    // `settings.filters` / `settings.filters.tts` (pre-v0.1.72 blobs).
     void updateSettings({
       ...settings,
-      hiddenUsers: nextHidden,
+      filters: {
+        ...settings.filters,
+        tts: {
+          ...settings.filters?.tts,
+          ignoreUsernameRegex: next,
+        },
+      },
     });
   };
 
@@ -1166,11 +1191,11 @@ export function App(): React.ReactElement {
         messages={visibleMessages}
         authenticated={auth.authenticated}
         connection={conn}
-        // v0.1.72 — per-row hover affordance fires this callback with the
+        // v0.1.91 — per-row hover affordance fires this callback with the
         // author's username. App.tsx owns the settings + persists the
-        // hidden-users list. ChatFeed is a pure render layer here; it
-        // just surfaces the button + relays the click.
-        onHideUser={handleHideUser}
+        // TTS username-ignore list (silence, not hide). ChatFeed is a pure
+        // render layer here; it just surfaces the button + relays the click.
+        onSilenceUser={handleSilenceUser}
         // v0.1.90 (voice 4512) — manual "tap to retry" on a ⚠ failed send.
         // ChatFeed relays the click on the ⚠ affordance; App re-runs the loop.
         onRetrySend={handleRetrySend}

@@ -1,10 +1,16 @@
-// v0.1.72 — Hide User affordance.
+// v0.1.72 — Hide User affordance (pure helpers).
+// v0.1.91 — the per-row BUTTON was repurposed from "Hide user" to
+//           "Silence user" (see addSilencedUser + the App.tsx
+//           handleSilenceUser handler). The hidden-users PLUMBING below
+//           (addHiddenUser / removeHiddenUser / isHiddenUser /
+//           compileHiddenUsersSet) is still LIVE — it backs the Settings
+//           "Hidden Users" list + unhide — so these pure-helper tests
+//           remain valid. What changed is which list the row button feeds:
+//           it now writes to settings.filters.tts.ignoreUsernameRegex
+//           (silence: message still shows, TTS skips it) instead of
+//           settings.hiddenUsers (hide: row dropped entirely).
 //
-// Voice 4352 (2026-05-28): Ethan wants a one-click "Hide user" button on
-// each chat row so messages from a specific viewer disappear from the
-// feed AND stop triggering TTS / notifications. Persistent across
-// settings reload. Unhide available via the Hidden Users section in the
-// Settings drawer.
+// Voice 4352 (2026-05-28): original one-click affordance request.
 //
 // These tests pin:
 //   1. compileHiddenUsersSet builds a lowercase Set defensively.
@@ -16,13 +22,19 @@
 //   6. End-to-end simulation: hide → message filtered out; unhide →
 //      message reappears; persistence round-trip (serialize +
 //      deserialize) retains the list.
+//   7. v0.1.91 addSilencedUser: anchored + regex-escaped entry, dedupe,
+//      no-op on empty, and the simulated row-click handler writing to
+//      the TTS username-ignore list (message stays visible, TTS skips).
 //
 // DOM-free pure-function tests.
 
 import { describe, expect, it } from 'vitest';
 import {
   addHiddenUser,
+  addSilencedUser,
+  applyMessageFilters,
   compileHiddenUsersSet,
+  compileIgnorePatterns,
   isHiddenUser,
   removeHiddenUser,
 } from '../renderer/message-filters';
@@ -335,5 +347,163 @@ describe('v0.1.72 hide-user — end-to-end filter behaviour', () => {
     };
     const hidden = compileHiddenUsersSet(['Alice']);
     expect(visible([m], hidden)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.1.91 — addSilencedUser + the row-button "Silence user" behavior.
+//
+// The per-row button now SILENCES the user: their messages still render in
+// the feed but TTS won't read them aloud. It does this by adding an
+// anchored, regex-escaped entry for the username to
+// settings.filters.tts.ignoreUsernameRegex (matched against the author
+// display name by applyMessageFilters' TTS username axis, with the `i`
+// flag added at compile time).
+// ---------------------------------------------------------------------------
+
+describe('addSilencedUser', () => {
+  it('wraps a plain username as an anchored ^name$ entry', () => {
+    expect(addSilencedUser([], 'someUser')).toEqual(['^someUser$']);
+  });
+
+  it('regex-escapes special characters so names match literally', () => {
+    // "a.b+c" must NOT be treated as a regex — escape . and + so it only
+    // matches the literal string "a.b+c", not e.g. "axbc" / "abbc".
+    expect(addSilencedUser([], 'a.b+c')).toEqual(['^a\\.b\\+c$']);
+  });
+
+  it('escapes the full metacharacter set (brackets, parens, etc.)', () => {
+    expect(addSilencedUser([], 'Foo.Bar+1')).toEqual(['^Foo\\.Bar\\+1$']);
+    expect(addSilencedUser([], '(x)[y]{z}')).toEqual(['^\\(x\\)\\[y\\]\\{z\\}$']);
+  });
+
+  it('trims surrounding whitespace before anchoring', () => {
+    expect(addSilencedUser([], '  bob  ')).toEqual(['^bob$']);
+  });
+
+  it('is idempotent — silencing the same user twice does not double-add', () => {
+    const once = addSilencedUser([], 'bob');
+    const twice = addSilencedUser(once, 'bob');
+    expect(twice).toEqual(['^bob$']);
+    expect(twice.length).toBe(1);
+  });
+
+  it('dedupe is case-insensitive against the anchored pattern', () => {
+    const once = addSilencedUser([], 'Bob');
+    // Clicking on a differently-cased echo of the same name must not add a
+    // second entry — compileIgnorePatterns applies `i` so they'd be
+    // functionally identical anyway, and a duplicate textarea line is ugly.
+    const twice = addSilencedUser(once, 'bob');
+    expect(twice).toEqual(['^Bob$']);
+    expect(twice.length).toBe(1);
+  });
+
+  it('appends alongside existing unrelated entries', () => {
+    const out = addSilencedUser(['^alice$', 'spam.*'], 'bob');
+    expect(out).toEqual(['^alice$', 'spam.*', '^bob$']);
+  });
+
+  it('no-ops (returns a clone) on empty / whitespace-only usernames', () => {
+    expect(addSilencedUser([], '')).toEqual([]);
+    expect(addSilencedUser([], '   ')).toEqual([]);
+    expect(addSilencedUser([], '\n\t')).toEqual([]);
+    // Clone, not same reference, so a caller length-compare still works.
+    const prev = ['^alice$'];
+    const out = addSilencedUser(prev, '');
+    expect(out).not.toBe(prev);
+    expect(out).toEqual(prev);
+  });
+
+  it('the anchored entry only matches the exact user (no superstring over-match)', () => {
+    // Compile the way the app does (i flag) and verify the TTS username
+    // axis silences exactly "bot" — not "botanist" / "robot_kappa".
+    const patterns = compileIgnorePatterns(addSilencedUser([], 'bot'));
+    expect(applyMessageFilters('hi', [], [], 'bot', patterns).ignoredByTts).toBe(true);
+    expect(applyMessageFilters('hi', [], [], 'BOT', patterns).ignoredByTts).toBe(true);
+    expect(applyMessageFilters('hi', [], [], 'botanist', patterns).ignoredByTts).toBeUndefined();
+    expect(applyMessageFilters('hi', [], [], 'robot_kappa', patterns).ignoredByTts).toBeUndefined();
+  });
+
+  it('special-char names match literally once compiled', () => {
+    const patterns = compileIgnorePatterns(addSilencedUser([], 'Foo.Bar+1'));
+    // Exact literal name → silenced.
+    expect(applyMessageFilters('x', [], [], 'Foo.Bar+1', patterns).ignoredByTts).toBe(true);
+    // A name that WOULD match the unescaped regex (. = any char) must NOT
+    // be silenced — proving we escaped correctly.
+    expect(applyMessageFilters('x', [], [], 'FooXBarY1', patterns).ignoredByTts).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Row-button click simulation: the App.tsx `handleSilenceUser` handler is a
+// thin wrapper over addSilencedUser + a nested settings spread. We reproduce
+// its exact shape here (without mounting React / Virtuoso) and assert the
+// click writes to settings.filters.tts.ignoreUsernameRegex — NOT to
+// hiddenUsers — and that the silenced user's message stays VISIBLE while
+// gaining the TTS-ignored flag.
+// ---------------------------------------------------------------------------
+
+describe('v0.1.91 Silence-user — row-button behavior (handler simulation)', () => {
+  // Mirror of App.tsx handleSilenceUser, sans the IPC/updateSettings call.
+  function silence(settings: Settings, username: string): Settings {
+    if (typeof username !== 'string' || username.trim().length === 0) return settings;
+    const existing = settings.filters?.tts?.ignoreUsernameRegex ?? [];
+    const next = addSilencedUser(existing, username);
+    if (next.length === existing.length) return settings; // bail: no change
+    return {
+      ...settings,
+      filters: {
+        ...settings.filters,
+        tts: { ...settings.filters?.tts, ignoreUsernameRegex: next },
+      },
+    };
+  }
+
+  it('clicking Silence writes an anchored entry to the TTS username-ignore list', () => {
+    const before: Settings = {
+      ...DEFAULT_SETTINGS,
+      filters: {
+        ...DEFAULT_SETTINGS.filters,
+        tts: { ...DEFAULT_SETTINGS.filters.tts, ignoreUsernameRegex: [] },
+      },
+    };
+    const after = silence(before, 'TrollUser');
+    expect(after.filters.tts.ignoreUsernameRegex).toEqual(['^TrollUser$']);
+  });
+
+  it('does NOT touch hiddenUsers (that plumbing is now dormant for this button)', () => {
+    const before: Settings = { ...DEFAULT_SETTINGS, hiddenUsers: [] };
+    const after = silence(before, 'TrollUser');
+    expect(after.hiddenUsers).toEqual([]);
+  });
+
+  it('silenced user stays VISIBLE in the feed but is flagged ignoredByTts', () => {
+    const settings = silence(DEFAULT_SETTINGS, 'TrollUser');
+    const ttsUsernamePatterns = compileIgnorePatterns(
+      settings.filters.tts.ignoreUsernameRegex,
+    );
+    // 1. Still visible — the silence path no longer feeds hiddenUsers, so
+    //    the visible-feed filter (hiddenUsers-based) does NOT drop the row.
+    const hiddenSet = compileHiddenUsersSet(settings.hiddenUsers);
+    const msg = mkMsg('TrollUser', 'spam spam');
+    expect(visible([msg], hiddenSet)).toHaveLength(1);
+    // 2. But TTS skips it — the username axis flags ignoredByTts.
+    const flags = applyMessageFilters(
+      msg.text,
+      [],
+      [],
+      msg.username,
+      ttsUsernamePatterns,
+    );
+    expect(flags.ignoredByTts).toBe(true);
+    expect(flags.ignoredByNotifications).toBeUndefined();
+  });
+
+  it('clicking Silence twice on the same user is a no-op (bails, no double entry)', () => {
+    const once = silence(DEFAULT_SETTINGS, 'TrollUser');
+    const twice = silence(once, 'TrollUser');
+    expect(twice.filters.tts.ignoreUsernameRegex).toEqual(['^TrollUser$']);
+    // Handler bails on no-change → returns the SAME settings object.
+    expect(twice).toBe(once);
   });
 });

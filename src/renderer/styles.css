@@ -1239,7 +1239,7 @@ body {
  * mounts and a screen reader can find it via Tab — only the visual
  * presentation is gated on hover.
  */
-.hide-user-btn {
+.silence-user-btn {
   display: inline-block;
   margin-left: 8px;
   padding: 1px 6px;
@@ -1253,13 +1253,13 @@ body {
   visibility: hidden; /* Hidden until the row is hovered (or button focused). */
   user-select: none;
 }
-.message-row:hover .hide-user-btn,
-.hide-user-btn:focus,
-.hide-user-btn:focus-visible {
+.message-row:hover .silence-user-btn,
+.silence-user-btn:focus,
+.silence-user-btn:focus-visible {
   /* Reveal on row-hover OR keyboard-focus so tab-nav can reach it. */
   visibility: visible;
 }
-.hide-user-btn:hover {
+.silence-user-btn:hover {
   color: var(--text-1, #fff);
   border-color: var(--text-1, #fff);
   background: rgba(255, 255, 255, 0.06);
