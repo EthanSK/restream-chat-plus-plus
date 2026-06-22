@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-22T15:12:27Z
+**Trigger:** task: silence user button
+**Symptom:** Per-row 'Hide user' button fully dropped a user's messages from the feed AND suppressed all side effects; Ethan wanted messages to still SHOW but not be read by TTS.
+**Root cause:** Button fed settings.hiddenUsers (drops rows + gates side-effects) instead of the TTS username ignore axis.
+**Fix:** Repurposed button to 'Silence user' (v0.1.91): new pure helper addSilencedUser() in src/shared/message-filters.ts adds an anchored regex-escaped ^name$ entry to settings.filters.tts.ignoreUsernameRegex; App.tsx handleSilenceUser persists via the same nested-spread as SettingsDrawer.patchTtsUsernameFilter; renamed onHideUser→onSilenceUser + CSS .hide-user-btn→.silence-user-btn. hiddenUsers plumbing left dormant for the Settings list/unhide.
+**Commit:** 68bf53d
+**Guard:** src/__tests__/hide-user.test.ts: addSilencedUser suite (escape/anchor/dedupe/no-op/superstring-no-overmatch) + handler-simulation suite (click writes TTS list, leaves hiddenUsers untouched, silenced user stays visible but ignoredByTts).
+---
+
+---
 **Date:** 2026-06-09T17:20:30Z
 **Trigger:** voice 4512
 **Symptom:** Sent chat message never appeared in app and left ZERO log trace (no 'send' row, no 'preflight' row, no 'optimistic-timeout' row in chat-send.jsonl). Send dropped during a connection-in-flux window right after a 'replaced' drain. Also: the queue tried each send EXACTLY ONCE — no retry, no reconnect-between-attempts — so a transient failure (no-session-cookies / no-active-connections / lapsed token / un-sniffed showId) permanently lost the message.
