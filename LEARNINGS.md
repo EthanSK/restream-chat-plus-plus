@@ -30,7 +30,7 @@ Each entry looks like:
 **Root cause:** n/a (new feature, not a bug). ChatInputInline owns the textarea ref; nothing focused it on window activation.
 **Fix:** v0.1.93. Main (src/main/main.ts): createMainWindow adds mainWindow.on('focus') to send IPC.FOCUS_CHAT_INPUT; app.on('activate') also sends it on the already-open-window branch. IPC.FOCUS_CHAT_INPUT added in src/shared/types.ts; preload onFocusChatInput subscription in src/preload.ts. Renderer (src/renderer/ChatInputInline.tsx): new useEffect ABOVE the !authenticated early-return (hook-order rule) subscribes to BOTH window.rcpp.onFocusChatInput AND the window focus DOM event, both calling a guarded focusInput() that focuses taRef.current — skips if input unmounted, if there is an active non-collapsed text selection, or if focus is already in another editable field. typeof window guard keeps it inert under node vitest env.
 **Commit:** (this feature commit; see PR #8)
-**Guard:** chat-input-hook-order.test.ts pins hooks-above-early-return (new useEffect sits above it). Full suite 677/677 green, typecheck clean. Thorough inline comments at all four edit sites.
+**Guard:** chat-input-hook-order.test.ts pins hooks-above-early-return (new useEffect sits above it). Full suite 684/684 green, typecheck clean. Thorough inline comments at all four edit sites.
 ---
 
 ---
