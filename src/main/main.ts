@@ -525,6 +525,26 @@ async function createMainWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+
+  // v0.1.93 — auto-focus the chat input whenever the window becomes frontmost.
+  //
+  // WHY: Ethan wants to activate Restream Chat++ (Dock click, Cmd+Tab, click
+  // the window) and immediately start typing a chat message without first
+  // clicking into the input. The renderer owns the textarea, so the main
+  // process just fires a FOCUS_CHAT_INPUT nudge on every window `'focus'`
+  // event; the renderer (ChatInputInline) moves keyboard focus into the
+  // textarea when it receives it.
+  //
+  // `'focus'` fires on EVERY path that makes the window key: Dock activation,
+  // Cmd+Tab, clicking the window, and the `app.on('activate')` recreate path
+  // (a freshly created window emits `'focus'` once it loads). We keep the
+  // renderer side idempotent + guarded (it skips if the user has an active
+  // text selection or is already typing in another field), so firing this a
+  // little eagerly is harmless. `webContents.send` is a no-op-safe push; the
+  // `mainWindow?.` guard covers the (closed → null) race.
+  mainWindow.on('focus', () => {
+    mainWindow?.webContents.send(IPC.FOCUS_CHAT_INPUT);
+  });
 }
 
 /**
@@ -2525,5 +2545,16 @@ app.on('activate', () => {
   // quitting. Keying off `mainWindow` directly fixes that edge while preserving
   // the existing behaviour when a main window already exists (no double-spawn).
   // `createMainWindow()` reassigns `mainWindow`, so the next activate is a no-op.
-  if (!mainWindow) createMainWindow();
+  if (!mainWindow) {
+    createMainWindow();
+  } else {
+    // v0.1.93 — belt-and-braces: when the window ALREADY exists, activation
+    // brings it forward and normally fires its `'focus'` handler (which sends
+    // FOCUS_CHAT_INPUT). We also push here directly so the chat input still
+    // gets focused on the rare activation path where `'focus'` doesn't re-fire
+    // (e.g. the window was already the key window at the Chromium level while
+    // the app itself was hidden). The renderer handler is idempotent + guarded,
+    // so a duplicate nudge is harmless.
+    mainWindow.webContents.send(IPC.FOCUS_CHAT_INPUT);
+  }
 });

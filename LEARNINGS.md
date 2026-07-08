@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-08T14:26:07Z
+**Trigger:** task: focus chat input on app activate
+**Symptom:** Feature request: when RC++ becomes frontmost (Dock click / Cmd+Tab / window click), the chat message input should auto-focus so Ethan can type immediately without clicking it. ALSO hit the stale-local-repo trap: local main was 4 commits behind origin which had already released v0.1.92, so the first version bump to 0.1.92 collided — shipped as 0.1.93 after rebasing onto origin/main.
+**Root cause:** n/a (new feature, not a bug). ChatInputInline owns the textarea ref; nothing focused it on window activation.
+**Fix:** v0.1.93. Main (src/main/main.ts): createMainWindow adds mainWindow.on('focus') to send IPC.FOCUS_CHAT_INPUT; app.on('activate') also sends it on the already-open-window branch. IPC.FOCUS_CHAT_INPUT added in src/shared/types.ts; preload onFocusChatInput subscription in src/preload.ts. Renderer (src/renderer/ChatInputInline.tsx): new useEffect ABOVE the !authenticated early-return (hook-order rule) subscribes to BOTH window.rcpp.onFocusChatInput AND the window focus DOM event, both calling a guarded focusInput() that focuses taRef.current — skips if input unmounted, if there is an active non-collapsed text selection, or if focus is already in another editable field. typeof window guard keeps it inert under node vitest env.
+**Commit:** (this feature commit; see PR #8)
+**Guard:** chat-input-hook-order.test.ts pins hooks-above-early-return (new useEffect sits above it). Full suite 684/684 green, typecheck clean. Thorough inline comments at all four edit sites.
+---
+
+---
 **Date:** 2026-06-22T17:24:56Z
 **Trigger:** Ethan: "the update mechanism is super dodge... install update in the banner does nothing, or restart too does nothing"
 **Symptom:** Install Update could feel like a dead click when the GitHub banner said a newer release existed but Squirrel answered `update-not-available`; Restart could also feel dead because the renderer ignored `{ ok:false, reason:'no-update-downloaded' }` from main.

@@ -88,6 +88,80 @@ export function ChatInputInline({
     el.style.height = Math.min(144, el.scrollHeight) + 'px';
   }, [text, authenticated]);
 
+  // v0.1.93 — auto-focus the chat input when the app/window becomes frontmost.
+  //
+  // WHY: Ethan activates Restream Chat++ (Dock click / Cmd+Tab / click the
+  // window) and wants to start typing a message straight away without having
+  // to click into the textarea first.
+  //
+  // Two independent trigger sources feed the SAME `focusInput()`, for
+  // robustness:
+  //   1. Main-process IPC (`window.rcpp.onFocusChatInput`) — fired from
+  //      `BrowserWindow`'s `'focus'` event + macOS `app.on('activate')`. This
+  //      is the reliable, Electron-level "window became key" signal.
+  //   2. The renderer's own `window` `'focus'` DOM event — a cheap in-process
+  //      backup that fires when the web contents regain focus.
+  // Both call the same guarded handler; focusing an already-focused element is
+  // a no-op, so the redundancy is harmless.
+  //
+  // This hook MUST stay ABOVE the `if (!authenticated) return null` early
+  // return so the hook count is identical on every render (see the auto-grow
+  // effect above + `chat-input-hook-order.test.ts` for the v0.1.15 blank-screen
+  // regression this guards against).
+  //
+  // Guards (avoid stealing focus in a way that would annoy the user):
+  //   - No textarea mounted yet (`taRef.current` null, e.g. signed out) → skip.
+  //   - The textarea is disabled while disconnected → `.focus()` is a browser
+  //     no-op, so nothing to special-case there.
+  //   - The user has an active (non-collapsed) text selection — e.g. they
+  //     highlighted a chat message to copy it — → skip so we don't blow away
+  //     their selection.
+  //   - Focus already sits in a DIFFERENT editable field (another input /
+  //     textarea / contenteditable, e.g. the Settings search) → skip so we
+  //     don't yank them out of what they're typing in.
+  // Empty deps: subscribe once on mount; the handler reads `taRef.current` at
+  // event time so it always targets the live textarea. `typeof window` guard
+  // keeps this inert under the Node (non-DOM) vitest environment.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const focusInput = (): void => {
+      const el = taRef.current;
+      if (!el) return; // input not mounted (signed out) — nothing to focus.
+
+      // Don't clobber an active text selection the user is making.
+      const sel = window.getSelection?.();
+      if (sel && !sel.isCollapsed && sel.toString().length > 0) return;
+
+      // Don't yank focus out of another editable field the user is typing in
+      // (but DO re-focus if focus is nowhere useful, e.g. <body>, or already
+      // on our own textarea).
+      const active = document.activeElement as HTMLElement | null;
+      if (active && active !== el) {
+        const tag = active.tagName;
+        const isEditableElsewhere =
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          active.isContentEditable === true;
+        if (isEditableElsewhere) return;
+      }
+
+      el.focus();
+    };
+
+    // Source 1: main-process IPC (Electron window/app focus). Optional-chained
+    // because `window.rcpp` is absent in unit tests / any non-preload context.
+    const offIpc = window.rcpp?.onFocusChatInput?.(focusInput);
+
+    // Source 2: renderer-local DOM focus event (backup).
+    window.addEventListener('focus', focusInput);
+
+    return () => {
+      offIpc?.();
+      window.removeEventListener('focus', focusInput);
+    };
+  }, []);
+
   // Hide entirely until the user is signed in. MUST stay below ALL hooks.
   if (!authenticated) return null;
 

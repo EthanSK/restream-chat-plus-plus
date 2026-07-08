@@ -581,6 +581,17 @@ export const IPC = {
    * menu's "Clear chat" item (Cmd+K). v0.1.18.
    */
   CHAT_CLEAR: 'chat:clear',
+  /**
+   * Main → renderer broadcast: focus the inline chat message input so the
+   * user can start typing immediately. Fired whenever the app/window becomes
+   * frontmost — the main process listens for `BrowserWindow`'s `'focus'` event
+   * (and the macOS `app.on('activate')` Dock re-activation) and pushes this so
+   * the renderer moves keyboard focus into the textarea without the user
+   * having to click it first. The renderer guards against stealing focus from
+   * an active text selection or another input (see `ChatInputInline.tsx`).
+   * v0.1.93.
+   */
+  FOCUS_CHAT_INPUT: 'chat:focus-input',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   /**
