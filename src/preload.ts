@@ -190,6 +190,17 @@ const api = {
     ipcRenderer.on(IPC.CHAT_CLEAR, h);
     return () => ipcRenderer.removeListener(IPC.CHAT_CLEAR, h);
   },
+  /**
+   * Subscribe to "focus the chat input" nudges from main — fired whenever the
+   * window/app becomes frontmost (see `IPC.FOCUS_CHAT_INPUT`). The renderer
+   * handler (ChatInputInline) moves keyboard focus into the message textarea
+   * so the user can start typing immediately after activating the app. v0.1.93.
+   */
+  onFocusChatInput: (cb: () => void): Unsub => {
+    const h = () => cb();
+    ipcRenderer.on(IPC.FOCUS_CHAT_INPUT, h);
+    return () => ipcRenderer.removeListener(IPC.FOCUS_CHAT_INPUT, h);
+  },
   onMenuOpenSettings: (cb: () => void): Unsub => {
     const h = () => cb();
     ipcRenderer.on('menu:open-settings', h);
