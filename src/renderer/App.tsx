@@ -31,6 +31,10 @@ import {
 } from './chat-send-client';
 import { SettingsDrawer } from './SettingsDrawer';
 import { UpdateBanner } from './UpdateBanner';
+// v0.1.94 — live viewer count toolbar chip (data: streaming-updates WS in
+// main; see src/shared/viewer-stats-core.ts for the source contract).
+import { ViewerCount } from './ViewerCount';
+import type { ViewerStatsSnapshot } from '../shared/viewer-stats-core';
 // v0.1.81 — the renderer no longer owns ANY speech engine. Speech is the native
 // OS voice in the MAIN process (src/main/tts-native.ts); the browser Web-Speech
 // `TTSEngine` + `makeTtsEngine` factory were deleted. The Settings voice list
@@ -106,6 +110,11 @@ export function App(): React.ReactElement {
   );
   const [conn, setConn] = useState<ConnectionState>({ status: 'idle', attempt: 0 });
   const [connections, setConnections] = useState<ChatConnection[]>([]);
+  // v0.1.94 — latest live-viewer snapshot (null until the first push/pull
+  // lands; the ViewerCount chip renders nothing for null OR not-live).
+  const [viewerStats, setViewerStats] = useState<ViewerStatsSnapshot | null>(
+    null,
+  );
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
@@ -412,6 +421,17 @@ export function App(): React.ReactElement {
       } catch (err) {
         console.error('[App] failed to fetch initial connections', err);
       }
+      // v0.1.94 — pull-fetch the current viewer-stats snapshot for the same
+      // mount-race reason as connections above. Optional-chained so an older
+      // preload (or a test's partial window.rcpp mock) without the method
+      // degrades to "no count" instead of throwing.
+      try {
+        const initialViewerStats = await rcpp.getViewerStats?.();
+        if (!alive) return;
+        if (initialViewerStats) setViewerStats(initialViewerStats);
+      } catch (err) {
+        console.error('[App] failed to fetch initial viewer stats', err);
+      }
       // Pull-fetch the most recent UpdateInfo on mount. The GH poller's
       // first check fires ~3s after `app.ready`, so a renderer that mounts
       // before that won't have anything to fetch yet — the subsequent push
@@ -432,6 +452,10 @@ export function App(): React.ReactElement {
     const offAuth = rcpp.onAuthStatus(applyAuthStatus);
     const offConn = rcpp.onConnectionState(setConn);
     const offConnections = rcpp.onConnections(setConnections);
+    // v0.1.94 — live viewer-count pushes. Optional-chained (see the pull
+    // above); falls back to a no-op unsubscriber for old preloads/mocks.
+    const offViewerStats =
+      rcpp.onViewerStats?.(setViewerStats) ?? (() => undefined);
     const offChat = rcpp.onChatMessage((m) => {
       // v0.1.26: apply regex-ignore filters BEFORE pushing to state so
       // the resulting ChatMessage carries `ignoredByTts` /
@@ -672,6 +696,7 @@ export function App(): React.ReactElement {
       offAuth();
       offConn();
       offConnections();
+      offViewerStats();
       offChat();
       offSendStatus();
       offReconnectSucceeded();
@@ -1133,6 +1158,16 @@ export function App(): React.ReactElement {
           </button>
         )}
         {auth.authenticated && <ChannelsPanel connections={connections} />}
+        {/*
+         * v0.1.94 — LIVE VIEWER COUNT chip (like the official Restream chat
+         * app). Sits next to the channels panel so "who's connected" and
+         * "how many are watching" read as one cluster. Renders NOTHING when
+         * not live (ViewerCount's own gate) and is additionally gated on
+         * auth here — a signed-out user has no streaming-updates socket, so
+         * a stale snapshot must never linger in the toolbar. Hover shows the
+         * per-platform breakdown via native tooltip.
+         */}
+        {auth.authenticated && <ViewerCount snapshot={viewerStats} />}
         <span className="spacer" />
         {/*
          * v0.1.77 (Ethan voice 4438, 2026-05-30) — ONE-CLICK MUTE button.

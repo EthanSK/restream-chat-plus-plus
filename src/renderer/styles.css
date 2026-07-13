@@ -457,6 +457,39 @@ body {
 
 .toolbar .spacer { flex: 1; }
 
+/*
+ * v0.1.94 — LIVE VIEWER COUNT chip (toolbar, next to the channels panel).
+ * Passive read-only indicator, so it's styled like the status-label tier
+ * (muted, small) rather than like a button — it must not read as clickable.
+ * The component renders nothing while not live, so no empty-state style is
+ * needed. tabular-nums stops the toolbar shifting as the count ticks.
+ */
+.viewer-count {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  flex: 0 0 auto;
+  /* Native title-attr tooltip carries the per-platform breakdown. */
+  cursor: default;
+}
+.viewer-count svg {
+  /* Eye icon slightly muted so the number is the visual anchor. */
+  color: var(--text-2);
+  flex: 0 0 auto;
+}
+.viewer-count-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-0);
+}
+
 .btn {
   -webkit-app-region: no-drag;
   display: inline-flex;

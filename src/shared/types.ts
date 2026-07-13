@@ -496,6 +496,21 @@ export const IPC = {
   /** Pull-fetch counterpart so the renderer can sync on mount. */
   CONNECTIONS_GET: 'connections:get',
   /**
+   * v0.1.94 — LIVE VIEWER COUNT push channel, main → renderer. Fires with a
+   * `ViewerStatsSnapshot` (see src/shared/viewer-stats-core.ts for the full
+   * data-source contract) whenever the aggregate changes. Source: the
+   * SEPARATE Restream "Streaming Updates" WebSocket
+   * (wss://streaming.api.restream.io/ws) — NOT the chat WS, which carries
+   * no viewer data. Drives the 👁 count in the toolbar.
+   */
+  VIEWER_STATS: 'viewer-stats:update',
+  /**
+   * Pull-fetch counterpart so a renderer that mounts AFTER the streaming WS
+   * already delivered its ~1-minute replay still paints the current count
+   * immediately (same mount-race pattern as CONNECTIONS_GET / CONN_STATE_GET).
+   */
+  VIEWER_STATS_GET: 'viewer-stats:get',
+  /**
    * Send a chat reply text directly via Restream's internal
    * `POST /api/client/reply` endpoint. The renderer's inline chat-input
    * bar invokes this.
