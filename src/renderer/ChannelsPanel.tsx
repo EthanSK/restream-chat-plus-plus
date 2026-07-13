@@ -235,10 +235,13 @@ function ChannelsPopover({
               ))}
             </ul>
           )}
+          {/* v0.1.95 — footer copy updated: viewer counts ARE now shown, via
+              the 👁 toolbar chip fed by Restream's separate Streaming Updates
+              WS (v0.1.94). The old text claimed they weren't available (true
+              for the CHAT API this panel reads, but stale as user guidance). */}
           <p className="channels-foot">
-            Viewer counts aren&apos;t exposed by Restream&apos;s Chat API — only
-            connect status and identity. To check viewers on a specific
-            platform, open its channel page via the link above.
+            This panel shows chat connection status. For live viewer counts
+            per platform, click the eye icon next to it while streaming.
           </p>
         </div>
       </div>
