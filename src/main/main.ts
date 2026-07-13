@@ -53,6 +53,9 @@ import {
   startGithubUpdatePoller,
 } from './github-update-check';
 import { startInProcessMcpServer } from './mcp-server';
+// v0.1.94 — live viewer count (streaming-updates WS client; see
+// src/shared/viewer-stats-core.ts for the data-source contract).
+import { ViewerStatsClient } from './viewer-stats';
 import {
   NativeTtsEngine,
   ttsToNativeSettings,
@@ -760,6 +763,15 @@ app.on('ready', async () => {
   const store = await createStore();
   const oauth = new OAuthCoordinator(store);
   const chat = new ChatClient();
+  // v0.1.94 — LIVE VIEWER COUNT. Second, independent WebSocket client for
+  // Restream's "Streaming Updates" feed (wss://streaming.api.restream.io/ws)
+  // which carries per-channel `viewers` numbers the chat WS does NOT have.
+  // Full data-source contract: top of src/shared/viewer-stats-core.ts.
+  // Shares NOTHING with ChatClient except the bearer token — every
+  // chat.setToken call site below also hands the token to this client so the
+  // two sockets never drift onto different credentials. Failure of this
+  // socket only blanks the toolbar count; chat is unaffected.
+  const viewerStats = new ViewerStatsClient();
 
   app.setName('Restream Chat++');
 
@@ -875,6 +887,10 @@ app.on('ready', async () => {
     try {
       mainWindow?.webContents.send(IPC.CONN_STATE, chat.getState());
       mainWindow?.webContents.send(IPC.CONNECTIONS, chat.getConnections());
+      // v0.1.94 — same mount-race fix for the viewer count: push the current
+      // snapshot so a reloaded renderer paints 👁 immediately instead of
+      // waiting for the next updateStatuses frame (~30s apart while live).
+      mainWindow?.webContents.send(IPC.VIEWER_STATS, viewerStats.getSnapshot());
     } catch (err) {
       console.error('[main] failed to send initial conn state on did-finish-load', err);
     }
@@ -963,6 +979,10 @@ app.on('ready', async () => {
       }
       chat.setToken(tok.accessToken);
       chat.start();
+      // v0.1.94 — hand the fresh sign-in token to the viewer-stats socket
+      // too (it uses the same OAuth bearer; see viewer-stats-core.ts).
+      viewerStats.setToken(tok.accessToken);
+      viewerStats.start();
       const status: AuthStatus = {
         authenticated: true,
         scope: tok.scope,
@@ -996,6 +1016,21 @@ app.on('ready', async () => {
   // calls this on mount to sync to the current truth (avoids the "stuck on
   // 'idle' because state transitioned before listener attached" bug).
   ipcMain.handle(IPC.CONN_STATE_GET, (): ConnectionState => chat.getState());
+
+  // ----- v0.1.94: live viewer count (streaming-updates WS) -----
+  // Push every aggregate change to the renderer; the pull handler covers the
+  // renderer-mount race (same push+pull pairing as CONN_STATE/CONNECTIONS).
+  // The 'stats' listener is installed ONCE here for the app lifetime.
+  viewerStats.on('stats', (snap) => {
+    try {
+      mainWindow?.webContents.send(IPC.VIEWER_STATS, snap);
+    } catch (err) {
+      // A destroyed window mid-send must never take down the main process
+      // for a cosmetic counter. Quietly log and move on.
+      console.error('[main] viewer-stats push failed', err);
+    }
+  });
+  ipcMain.handle(IPC.VIEWER_STATS_GET, () => viewerStats.getSnapshot());
 
   // ----- IPC: reveal logs in Finder/Explorer (renderer button) -----
   ipcMain.handle(IPC.REVEAL_LOGS, () => revealLogsInFinder(chat.getRawLogPath()));
@@ -1132,6 +1167,13 @@ app.on('ready', async () => {
     } catch (err) {
       console.warn('[main] cancelTransientRefreshRetry on quit failed', err);
     }
+    // v0.1.94 — close the viewer-stats socket + its ping/sweep timers so
+    // they don't keep the event loop alive past the window close either.
+    try {
+      viewerStats.stop();
+    } catch (err) {
+      console.warn('[main] viewerStats.stop on quit failed', err);
+    }
   });
 
   // -------------------------------------------------------------------
@@ -1178,6 +1220,9 @@ app.on('ready', async () => {
         try {
           chat.setToken(token.accessToken);
           chat.reconnect();
+          // v0.1.94 — recovered token also re-arms the viewer-stats socket.
+          viewerStats.setToken(token.accessToken);
+          viewerStats.reconnect();
         } catch (chatErr) {
           // chat.setToken / chat.reconnect failure here is rare and
           // doesn't undo the recovery — the renderer is already back
@@ -1351,6 +1396,11 @@ app.on('ready', async () => {
       }
       chat.setToken(token.accessToken);
       chat.reconnect();
+      // v0.1.94 — every managed reconnect refreshes the viewer-stats socket
+      // with the same (possibly just-refreshed) bearer token so the toolbar
+      // count recovers on the same gesture that recovers chat.
+      viewerStats.setToken(token.accessToken);
+      viewerStats.reconnect();
       // v0.1.70: the token works again, so any prior transient-refresh
       // retry cycle is moot. Cancel the timer + reset the backoff so the
       // NEXT transient cycle (next time the user puts the laptop to
@@ -1447,6 +1497,10 @@ app.on('ready', async () => {
     // user signed out. Race-free with this cancel-first ordering.
     cancelTransientRefreshRetry();
     chat.stop();
+    // v0.1.94 — sign-out also tears down the viewer-stats socket and clears
+    // its state (stop() broadcasts an empty snapshot so the toolbar count
+    // disappears rather than freezing at the last pre-signout value).
+    viewerStats.stop();
     await oauth.logout();
     const status: AuthStatus = { authenticated: false };
     mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
@@ -2424,7 +2478,21 @@ app.on('ready', async () => {
     // this `app.on('ready')` closure.
     await resumeAuthWithCookieRepair({
       oauth,
-      chat,
+      // v0.1.94 — fan-out shim: the startup resume path only needs
+      // setToken/start, so we intercept both and mirror the token into the
+      // viewer-stats socket. This keeps startup-auth-resume.ts unaware of
+      // the second socket (its contract stays "a chat-like client") while
+      // guaranteeing boot-resume ALSO lights up the toolbar viewer count.
+      chat: {
+        setToken: (accessToken: string) => {
+          chat.setToken(accessToken);
+          viewerStats.setToken(accessToken);
+        },
+        start: () => {
+          chat.start();
+          viewerStats.start();
+        },
+      },
       ensureRestreamChatCookies,
       parentWindow: mainWindow,
       pushAuthStatus,

@@ -15,6 +15,7 @@ import type {
   TtsNativeSettingsPayload,
   UpdateInfo,
 } from './shared/types';
+import type { ViewerStatsSnapshot } from './shared/viewer-stats-core';
 
 type Unsub = () => void;
 
@@ -95,6 +96,25 @@ const api = {
     const h = (_: unknown, cs: ChatConnection[]) => cb(cs);
     ipcRenderer.on(IPC.CONNECTIONS, h);
     return () => ipcRenderer.removeListener(IPC.CONNECTIONS, h);
+  },
+  /**
+   * v0.1.94 — LIVE VIEWER COUNT. Pull-fetch the latest aggregated
+   * `ViewerStatsSnapshot` (total concurrent viewers across online channels +
+   * per-channel breakdown). Data comes from Restream's separate "Streaming
+   * Updates" WebSocket in the main process — see the contract comment at the
+   * top of `src/shared/viewer-stats-core.ts`. Renderer calls this on mount so
+   * the toolbar count paints without waiting for the next push.
+   */
+  getViewerStats: (): Promise<ViewerStatsSnapshot> =>
+    ipcRenderer.invoke(IPC.VIEWER_STATS_GET),
+  /**
+   * Subscribe to live viewer-stat pushes. Fires whenever the aggregate
+   * changes (new `updateStatuses` frame, channel dropped, TTL sweep).
+   */
+  onViewerStats: (cb: (snap: ViewerStatsSnapshot) => void): Unsub => {
+    const h = (_: unknown, snap: ViewerStatsSnapshot) => cb(snap);
+    ipcRenderer.on(IPC.VIEWER_STATS, h);
+    return () => ipcRenderer.removeListener(IPC.VIEWER_STATS, h);
   },
   /**
    * Send a chat reply inline via Restream's internal

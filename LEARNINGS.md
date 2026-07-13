@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-13T13:17:27Z
+**Trigger:** task: live viewer count display (2026-07-13)
+**Symptom:** Feature request: show live viewer count in the app like the official Restream chat does. Open question was WHERE the number comes from — the chat WS raw-frames.jsonl carries NO viewer data (only heartbeat/connection_info/connection_closed/event/reply_*/relay_* actions).
+**Root cause:** n/a (new feature). Data source discovered: Restream's SEPARATE 'Streaming Updates' WebSocket wss://streaming.api.restream.io/ws?accessToken=<same OAuth bearer as chat WS; needs stream.read scope which the app already requests>. Docs: developers.restream.io/private-api/streaming-updates. On connect it replays ~1min of updates then streams live. The 'updateStatuses' frames carry per-channel viewers:number|null + online:boolean + platformId/channelId/channelIdentifier/updatedAt. viewers is null on platforms that hide it (X/Twitter commonly). No token -> HTTP 400 on handshake. REST alternative (GET /v2/user/events/{id}/analytics/viewers) is HISTORICAL only, not live — WS is the right source.
+**Fix:** v0.1.94. Pure core src/shared/viewer-stats-core.ts (applyStreamingUpdate folds updateStatuses/deleteOutgoing into a channelId map; aggregateViewerStats sums viewers over ONLINE channels, null-total when all hidden; sweepStaleViewerStats 5min TTL so a dead socket can't freeze the count). Thin socket shell src/main/viewer-stats.ts (5s->5min backoff, ws ping keepalive w/ 2-missed-pong terminate since the feed is silent when not live, 60s TTL sweep timer, viewer-stats.jsonl lifecycle log via appendJsonl). main.ts: every chat.setToken site also feeds viewerStats (sign-in, startup-resume via fan-out shim, performFullReconnect, transient-refresh recovery); stop on AUTH_LOGOUT + before-quit; IPC.VIEWER_STATS push + VIEWER_STATS_GET pull (mount-race pattern). Renderer: ViewerCount.tsx chip in toolbar next to ChannelsPanel — hidden when not live, '—' when live-but-counts-hidden, sum + per-platform native tooltip otherwise. Optional-chained rcpp.getViewerStats?./onViewerStats?. so old preloads/partial test mocks degrade quietly.
+**Commit:** this feature commit (PR follows)
+**Guard:** src/__tests__/viewer-stats.test.ts (fold/replace/delete/malformed/aggregate/TTL/platform-name + client no-token lifecycle) + viewer-count.test.tsx (render rules incl act() wrapper gotcha: react-test-renderer toJSON() is null without act in this repo's React-19 env). 705/705 green, typecheck+lint clean.
+---
+
+---
 **Date:** 2026-07-08T14:26:07Z
 **Trigger:** task: focus chat input on app activate
 **Symptom:** Feature request: when RC++ becomes frontmost (Dock click / Cmd+Tab / window click), the chat message input should auto-focus so Ethan can type immediately without clicking it. ALSO hit the stale-local-repo trap: local main was 4 commits behind origin which had already released v0.1.92, so the first version bump to 0.1.92 collided — shipped as 0.1.93 after rebasing onto origin/main.
