@@ -459,25 +459,33 @@ body {
 
 /*
  * v0.1.94 — LIVE VIEWER COUNT chip (toolbar, next to the channels panel).
- * Passive read-only indicator, so it's styled like the status-label tier
- * (muted, small) rather than like a button — it must not read as clickable.
+ * v0.1.95 — chip upgraded from a passive indicator to a CLICKABLE trigger
+ * that opens the per-platform breakdown popover (mirrors the
+ * channels-trigger/channels-popover pattern so the two toolbar dropdowns
+ * feel identical). Rendered as `btn ghost viewer-count`, so it inherits
+ * .btn's reset + hover (background: var(--bg-3)) for the clickable
+ * affordance; the rules below only override sizing/colour.
  * The component renders nothing while not live, so no empty-state style is
  * needed. tabular-nums stops the toolbar shifting as the count ticks.
  */
-.viewer-count {
+.viewer-count-panel {
+  /* Anchor for the absolutely-positioned popover (same as .channels-panel). */
+  position: relative;
   -webkit-app-region: no-drag;
+  flex: 0 0 auto;
+}
+.viewer-count {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   padding: 4px 8px;
   font-size: 12px;
   color: var(--text-1);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-2);
-  flex: 0 0 auto;
-  /* Native title-attr tooltip carries the per-platform breakdown. */
-  cursor: default;
+}
+.viewer-count.is-open {
+  /* Held-open state matches .channels-trigger.is-open. */
+  background: var(--bg-3);
+  color: var(--text-0);
 }
 .viewer-count svg {
   /* Eye icon slightly muted so the number is the visual anchor. */
@@ -485,6 +493,126 @@ body {
   flex: 0 0 auto;
 }
 .viewer-count-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-0);
+}
+
+/*
+ * v0.1.95 — viewer breakdown popover. Deliberately mirrors
+ * .channels-popover's geometry/chrome so the toolbar dropdowns are visually
+ * consistent; only the row layout differs (viewer rows are name + pill +
+ * right-aligned count, no colour badges/URLs). The scrim is the SAME
+ * .channels-scrim class (generic fixed inset-0 click-outside catcher).
+ */
+.viewer-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: min(280px, calc(100vw - 24px));
+  max-height: 60vh;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  z-index: 900; /* above the 800 scrim, same layering as channels-popover */
+  display: flex;
+  flex-direction: column;
+  -webkit-app-region: no-drag;
+}
+.viewer-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.viewer-popover-head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+}
+.viewer-popover-body {
+  padding: 4px 0 8px;
+  overflow-y: auto;
+  flex: 1;
+}
+.viewer-total-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.viewer-total-label {
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+}
+.viewer-total-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-0);
+}
+.viewer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.viewer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid #1c2128;
+  font-size: 12px;
+}
+.viewer-row:last-child { border-bottom: 0; }
+.viewer-row.is-offline {
+  /* Offline channels stay listed but visibly demoted. */
+  opacity: 0.55;
+}
+.viewer-row-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.viewer-row-platform {
+  color: var(--text-0);
+  font-weight: 600;
+}
+.viewer-row-channel {
+  color: var(--text-2);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viewer-row-pill {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+.viewer-row-pill.online {
+  color: #22c55e; /* same vivid green as the connected status-dot */
+  border-color: rgba(34, 197, 94, 0.4);
+}
+.viewer-row-num {
+  flex: 0 0 auto;
+  min-width: 40px;
+  text-align: right;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
   color: var(--text-0);
