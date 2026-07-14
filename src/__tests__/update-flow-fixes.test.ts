@@ -125,6 +125,7 @@ async function loadUpdater() {
   }
   fakeAutoUpdater.checkForUpdates.mockClear();
   fakeAutoUpdater.quitAndInstall.mockClear();
+  fakeAutoUpdater.setFeedURL.mockClear();
   fakeApp.relaunch.mockClear();
   fakeApp.exit.mockClear();
   fakeUpdateElectronApp.mockClear();
@@ -142,7 +143,8 @@ describe('v0.1.52 update-flow fixes', () => {
         reason: 'started',
         mode: 'squirrel',
       });
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      // One guarded startup poll + one explicit user poll.
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
     });
 
     it('second triggerSquirrelDownload() while already downloading returns success with reason=already-downloading (no throw)', async () => {
@@ -161,7 +163,7 @@ describe('v0.1.52 update-flow fixes', () => {
       });
       // checkForUpdates() must NOT be called twice — that's what would
       // throw "command is disabled" in production.
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
     });
 
     it('triggerSquirrelDownload() after update-downloaded returns reason=already-staged (no throw, no extra check)', async () => {
@@ -177,7 +179,7 @@ describe('v0.1.52 update-flow fixes', () => {
         reason: 'already-staged',
         mode: 'squirrel',
       });
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
     });
 
     it('after a synchronous checkForUpdates throw, the in-flight flag resets so a retry can succeed', async () => {
@@ -261,12 +263,36 @@ describe('v0.1.52 update-flow fixes', () => {
       expect(fakeAutoUpdater.quitAndInstall).not.toHaveBeenCalled();
     });
 
-    it('configureAutoUpdater passes notifyUser:false to update-electron-app (banner is the single source of truth)', async () => {
+    it('configures the public update feed directly (no unguarded third-party poller)', async () => {
       const updater = await loadUpdater();
       updater.configureAutoUpdater();
-      expect(fakeUpdateElectronApp).toHaveBeenCalledTimes(1);
-      const opts = fakeUpdateElectronApp.mock.calls[0][0];
-      expect(opts.notifyUser).toBe(false);
+      expect(fakeUpdateElectronApp).not.toHaveBeenCalled();
+      expect(fakeAutoUpdater.setFeedURL).toHaveBeenCalledTimes(1);
+      expect(fakeAutoUpdater.setFeedURL).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: expect.stringContaining(
+            'update.electronjs.org/EthanSK/restream-chat-plus-plus/darwin-',
+          ),
+        }),
+      );
+    });
+
+    it('does not run the hourly background poll after update-downloaded stages a bundle', async () => {
+      vi.useFakeTimers();
+      try {
+        const updater = await loadUpdater();
+        updater.configureAutoUpdater();
+        expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+
+        fakeAutoUpdater.emit('update-downloaded', {}, undefined, 'v0.1.53');
+        vi.advanceTimersByTime(updater.AUTO_UPDATE_INTERVAL_MS * 3);
+
+        // The startup call is the only call. Pre-fix, each interval invoked
+        // Squirrel again and invalidated its staged-install slot.
+        expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

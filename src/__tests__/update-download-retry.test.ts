@@ -114,16 +114,16 @@ describe('v0.1.85 download-retry resilience', () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.triggerSquirrelDownload();
-    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
 
     // Simulate Squirrel entering the download then a network drop mid-way.
     fakeAutoUpdater.emit('checking-for-update');
     fakeAutoUpdater.emit('error', new Error('net::ERR_CONNECTION_RESET'));
 
     // First retry is scheduled 5s out — not fired yet.
-    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(5_000);
     expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(5_000);
+    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(3);
   });
 
   it('exhausts the bounded retry budget (3 attempts) then stops auto-retrying', async () => {
@@ -134,7 +134,7 @@ describe('v0.1.85 download-retry resilience', () => {
     // Each error → retry fires checkForUpdates → another error. Walk the
     // full 5s/15s/45s ladder.
     const delays = [5_000, 15_000, 45_000];
-    let expectedChecks = 1; // the initial triggerSquirrelDownload
+    let expectedChecks = 2; // guarded startup poll + triggerSquirrelDownload
     for (const delay of delays) {
       fakeAutoUpdater.emit('error', new Error('network timeout'));
       vi.advanceTimersByTime(delay);
@@ -152,7 +152,7 @@ describe('v0.1.85 download-retry resilience', () => {
     const updater = await loadUpdater();
     updater.configureAutoUpdater();
     updater.triggerSquirrelDownload();
-    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
 
     fakeAutoUpdater.emit(
       'error',
@@ -160,7 +160,7 @@ describe('v0.1.85 download-retry resilience', () => {
     );
     // No retry should fire even after a long wait.
     vi.advanceTimersByTime(120_000);
-    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+    expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
   });
 
   it('update-not-available resets the retry counter so the next session gets the full ladder', async () => {

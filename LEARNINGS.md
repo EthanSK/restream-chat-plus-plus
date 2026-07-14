@@ -24,6 +24,26 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-14T12:52:59Z
+**Trigger:** Ethan: "also total live viewers is cut off" + screenshot
+**Symptom:** Opening the live-viewer breakdown near the toolbar's right edge showed only the panel's left portion. The Total label appeared without its value, and the header close button, live/offline pills, and per-platform counts were all outside the clipped window area.
+**Root cause:** `.viewer-popover` was absolutely positioned with `left: 0` relative to `.viewer-count-panel`. Because the viewer chip sits in the toolbar's right-hand cluster, the 280px panel grew rightward beyond the BrowserWindow viewport.
+**Fix:** v0.1.96 in `src/renderer/styles.css`: anchor the viewer popover inward with `right: 0; left: auto`; retain the existing viewport-capped width.
+**Commit:** this release commit (PR follows)
+**Guard:** `src/__tests__/viewer-count.test.tsx` statically pins the `.viewer-popover` right-edge anchor and rejects a regression to `left: 0`. Full suite 714/714 green, typecheck clean, lint 0 errors. Rebuilt arm64 app passed strict Developer-ID signature and Gatekeeper assessment; live visual verification at the narrow 460px window showed `TOTAL 1`, close button, all LIVE pills, and per-platform counts fully visible.
+---
+
+---
+**Date:** 2026-07-14T12:44:20Z
+**Trigger:** Ethan: "my restream chat++ app wont update ... install update and restart ... same update banner"
+**Symptom:** A release was downloaded and the banner showed Restart, but the first Restart relaunched the old version with the same banner. A later re-download/restart could succeed. Production evidence: v0.1.95 staged at 2026-07-13 20:16, hourly checks continued through 2026-07-14 13:15, the 13:20 Restart failed with `No update available, can't quit and install`, and only the fresh 13:20 download installed successfully at 13:30.
+**Root cause:** `update-electron-app` owns an unconditional internal `setInterval(autoUpdater.checkForUpdates)`. It kept polling after Squirrel.Mac emitted `update-downloaded`. Those later `update-available`/`update-not-available` cycles invalidated Squirrel's native staged-install slot, while our module-level `updateDownloaded=true` remained stale and continued presenting Restart.
+**Fix:** v0.1.96 in `src/main/updater.ts`: configure the same `update.electronjs.org` feed directly with `autoUpdater.setFeedURL`, own the startup/hourly checks, and skip every background native check while a check/download is in flight or an update is staged. The in-app banner remains the only Restart surface.
+**Commit:** this release commit (PR follows)
+**Guard:** `src/__tests__/update-flow-fixes.test.ts` advances three hourly intervals after `update-downloaded` and proves `checkForUpdates` is never called again; direct-feed configuration is pinned. Full suite 714/714 green, typecheck clean, lint 0 errors (pre-existing warnings only). A local arm64 package was Developer-ID signed, installed over `/Applications/Restream Chat Plus Plus.app`, relaunched connected with no update banner, and passed strict deep signature verification.
+---
+
+---
 **Date:** 2026-07-13T13:17:27Z
 **Trigger:** task: live viewer count display (2026-07-13)
 **Symptom:** Feature request: show live viewer count in the app like the official Restream chat does. Open question was WHERE the number comes from — the chat WS raw-frames.jsonl carries NO viewer data (only heartbeat/connection_info/connection_closed/event/reply_*/relay_* actions).
