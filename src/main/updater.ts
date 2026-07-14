@@ -1,23 +1,22 @@
 // Auto-update wiring for Restream Chat++.
 //
-// Uses the `update-electron-app` wrapper, which polls
+// Uses Electron's native autoUpdater against
 // `https://update.electronjs.org/<owner>/<repo>/<platform>-<arch>/<version>`
-// (Electron's free public service for open-source apps) and surfaces a
-// native restart-to-update dialog when a new release ships.
+// (Electron's free public service for open-source apps). We configure the
+// feed and own the polling timer so a staged update can freeze background
+// checks until it has been installed.
 //
 // Notes:
 // - The service requires the GitHub repo to be PUBLIC. Ours is.
 // - Auto-update only works when the app is signed + notarized on macOS
 //   (Squirrel.Mac refuses unsigned updates). The CI release job handles
-//   that; local `npm run make` produces unsigned builds that simply skip
-//   auto-update (the `update-electron-app` helper bails early when the
-//   app is in dev or not packaged).
-// - `update-electron-app` swallows errors from update.electronjs.org so
-//   they don't disrupt the user; we surface them through electron-log.
+//   that; configureAutoUpdater skips local development builds.
+// - Background checks are deliberately skipped while a download/check is in
+//   flight and after `update-downloaded`; Squirrel.Mac can invalidate its
+//   staged install if `checkForUpdates()` is called again before Restart.
 
 import { app, autoUpdater, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
-import { updateElectronApp, UpdateSourceType } from 'update-electron-app';
 import { IPC, UpdateInfo } from '../shared/types';
 import { isNewerVersion } from '../shared/version';
 import { performGithubUpdateCheck } from './github-update-check';
@@ -30,14 +29,16 @@ import { performGithubUpdateCheck } from './github-update-check';
 import { appendErrorLog, errorToString } from './structured-log';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
+export const AUTO_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
 
 let configured = false;
-// True once `updateElectronApp({...})` has run, i.e. `autoUpdater.setFeedURL`
-// has been called. We must not invoke `autoUpdater.checkForUpdates()` before
-// this — the native autoUpdater throws synchronously without a feed URL,
-// which in turn surfaces the macOS "this command is disabled and cannot be
-// executed" alert when the throw happens inside a menu click handler.
+// True once `autoUpdater.setFeedURL` has succeeded. We must not invoke
+// `autoUpdater.checkForUpdates()` before this — the native autoUpdater throws
+// synchronously without a feed URL, which in turn surfaces the macOS "this
+// command is disabled and cannot be executed" alert when the throw happens
+// inside a menu click handler.
 let feedURLReady = false;
+let backgroundUpdateTimer: NodeJS.Timeout | undefined;
 // Re-entrancy guard: stop the user spam-clicking the menu item while a
 // check is already mid-flight (each click adds a `once` listener; without
 // this guard multiple "you're on the latest version" dialogs would stack).
@@ -1110,6 +1111,39 @@ export function triggerSquirrelDownload(): StartDownloadResult {
   }
 }
 
+/**
+ * Run one native background check only when Squirrel has no active or staged
+ * work. The second condition is critical on macOS: the 2026-07-14 production
+ * logs showed `update-downloaded` at 20:16, followed by hourly checks that
+ * emitted `update-available`/`update-not-available`; Restart then failed with
+ * "No update available, can't quit and install" even though our JS flag still
+ * said the bundle was staged. Calling checkForUpdates again had invalidated
+ * Squirrel's native staged-install slot.
+ */
+function checkForUpdatesInBackground(origin: 'startup' | 'interval'): boolean {
+  if (updateDownloaded) {
+    log.info(`[updater] skipping ${origin} background check — update is staged`);
+    return false;
+  }
+  if (downloadInFlight) {
+    log.info(`[updater] skipping ${origin} background check — check/download in flight`);
+    return false;
+  }
+  try {
+    autoUpdater.checkForUpdates();
+    return true;
+  } catch (err) {
+    log.warn(`[updater] ${origin} background check threw`, err);
+    appendErrorLog({
+      subsystem: 'updater',
+      phase: 'updater.background-check-threw',
+      errorMessage: errorToString(err),
+      context: { origin },
+    });
+    return false;
+  }
+}
+
 export function configureAutoUpdater(): void {
   if (configured) return;
   configured = true;
@@ -1122,24 +1156,20 @@ export function configureAutoUpdater(): void {
   }
 
   try {
-    updateElectronApp({
-      updateSource: {
-        type: UpdateSourceType.ElectronPublicUpdateService,
-        repo: REPO,
+    // update-electron-app is intentionally not used here. Its internal
+    // setInterval cannot be paused after `update-downloaded`, which let a
+    // later hourly poll invalidate Squirrel.Mac's staged update. Configure
+    // the exact same public feed directly and own the guarded timer below.
+    const windowsStoreSegment = process.windowsStore ? '/msix' : '';
+    const feedURL =
+      `https://update.electronjs.org/${REPO}/` +
+      `${process.platform}-${process.arch}${windowsStoreSegment}/${app.getVersion()}`;
+    autoUpdater.setFeedURL({
+      url: feedURL,
+      headers: {
+        'User-Agent': `restream-chat-plus-plus/${app.getVersion()} ` +
+          `(${process.platform}: ${process.arch})`,
       },
-      // Poll every hour. The default is also 1h; we set it explicitly so
-      // tweaking later is one line.
-      updateInterval: '1 hour',
-      logger: log,
-      // v0.1.52: was `true`. The built-in "Restart to Install" dialog
-      // competes with our in-app `UpdateBanner` — both listen for
-      // `update-downloaded`, both call `quitAndInstall()` on user
-      // confirmation. When the user dismissed the native dialog with
-      // "Later", Squirrel's state machine internally reset the staged
-      // update, so the banner's Restart button then silently no-op'd —
-      // exactly Ethan's "click Restart, nothing happens" symptom.
-      // Single source of truth = the banner.
-      notifyUser: false,
     });
     feedURLReady = true;
     // Wire Squirrel download-progress + update-downloaded forwarders so
@@ -1148,6 +1178,13 @@ export function configureAutoUpdater(): void {
     // configures the feed URL — before that, the autoUpdater isn't set
     // up. v0.1.25.
     attachSquirrelProgressForwarders();
+    checkForUpdatesInBackground('startup');
+    backgroundUpdateTimer = setInterval(() => {
+      checkForUpdatesInBackground('interval');
+    }, AUTO_UPDATE_INTERVAL_MS);
+    // The updater timer is housekeeping and must not keep an otherwise-quit
+    // Electron main process alive during tests or shutdown.
+    backgroundUpdateTimer.unref?.();
     log.info('[updater] auto-update configured for', REPO);
   } catch (err) {
     log.error('[updater] failed to configure auto-update', err);

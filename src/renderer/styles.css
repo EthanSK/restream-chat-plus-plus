@@ -508,7 +508,12 @@ body {
 .viewer-popover {
   position: absolute;
   top: calc(100% + 6px);
-  left: 0;
+  /* The viewer chip lives in the toolbar's right-hand cluster. Anchoring the
+   * popover from its LEFT edge made the panel grow out past the window's
+   * right edge, clipping the Total value, close button, pills, and counts.
+   * Open inward from the chip's right edge so the entire panel stays visible. */
+  right: 0;
+  left: auto;
   width: min(280px, calc(100vw - 24px));
   max-height: 60vh;
   background: var(--bg-1);

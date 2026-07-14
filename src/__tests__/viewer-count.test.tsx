@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
+import { readFileSync } from 'node:fs';
 import { ViewerCount } from '../renderer/ViewerCount';
 import type {
   ViewerChannelStat,
@@ -97,6 +98,19 @@ function clickChip(r: TestRenderer.ReactTestRenderer): void {
     chipOf(r).props.onClick();
   });
 }
+
+describe('ViewerCount popover layout', () => {
+  it('anchors inward from the chip right edge so totals and controls are not clipped', () => {
+    const css = readFileSync(
+      new URL('../renderer/styles.css', import.meta.url),
+      'utf8',
+    );
+    const rule = css.match(/\.viewer-popover\s*\{([^}]*)\}/s)?.[1] ?? '';
+    expect(rule).toMatch(/right:\s*0\s*;/);
+    expect(rule).toMatch(/left:\s*auto\s*;/);
+    expect(rule).not.toMatch(/left:\s*0\s*;/);
+  });
+});
 
 describe('ViewerCount chip', () => {
   it('renders nothing for a null snapshot (renderer not yet synced)', () => {
