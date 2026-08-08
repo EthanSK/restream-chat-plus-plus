@@ -294,6 +294,42 @@ export function addSilencedUser(
 }
 
 /**
+ * Add one exact author to BOTH side-effect username filters. A pre-existing
+ * broad/manual regex counts as already silenced on that axis, so we do not add
+ * redundant anchored entries. Shared by renderer optimism and main's atomic
+ * persist path to keep the two lists and their de-dup semantics identical.
+ */
+export function addSilencedUserToBothFilters(
+  ttsPatterns: readonly string[],
+  notificationPatterns: readonly string[],
+  username: string,
+): {
+  ttsPatterns: string[];
+  notificationPatterns: string[];
+  addedTts: boolean;
+  addedNotifications: boolean;
+} {
+  const ttsAlreadySilenced = matchesAnyIgnorePattern(
+    username,
+    compileIgnorePatterns(ttsPatterns),
+  );
+  const notificationsAlreadySilenced = matchesAnyIgnorePattern(
+    username,
+    compileIgnorePatterns(notificationPatterns),
+  );
+  return {
+    ttsPatterns: ttsAlreadySilenced
+      ? ttsPatterns.slice()
+      : addSilencedUser(ttsPatterns, username),
+    notificationPatterns: notificationsAlreadySilenced
+      ? notificationPatterns.slice()
+      : addSilencedUser(notificationPatterns, username),
+    addedTts: !ttsAlreadySilenced,
+    addedNotifications: !notificationsAlreadySilenced,
+  };
+}
+
+/**
  * Per-line validation for the Settings drawer textareas. Returns an
  * array of `{ line, error }` entries for the lines that didn't compile
  * — used by the UI to draw a red border + tooltip on the textarea when

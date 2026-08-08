@@ -204,7 +204,7 @@ export interface NativeVoice {
   sample: string;
 }
 
-/** Per-utterance enqueue options. `messageId` is propagated into the JSONL log. */
+/** Per-utterance enqueue options. IDs are propagated into the JSONL log/queue. */
 export interface NativeEnqueueOpts {
   voice?: string;
   /** Unitless rate (Settings slider value). */
@@ -212,6 +212,8 @@ export interface NativeEnqueueOpts {
   /** Unitless volume 0.0–1.0 (Settings slider value). */
   volume?: number;
   messageId?: string;
+  /** Author identity used by cancelUsername() for exact targeted silence. */
+  username?: string;
 }
 
 /** Subset of Settings.tts the native engine consumes. */
@@ -478,6 +480,8 @@ export interface NativeTtsEngineOptions {
 export class NativeTtsEngine {
   private queue: QueueEntry[] = [];
   private current: NativeSpawnedChild | null = null;
+  /** Author of the currently-speaking entry, for targeted Silence-user stop. */
+  private currentUsername: string | undefined;
   private settings: NativeTtsSettings;
   private readonly log: NativeTtsLogger;
   private readonly spawner: NativeSpawner;
@@ -572,20 +576,76 @@ export class NativeTtsEngine {
     //
     // NOTE: untested from our dev machines (no Linux user in the loop) — this is
     // a correctness-by-inspection fix mirroring the spd-say documented behaviour.
-    if (this.adapter?.id === 'linux-spd') {
+    this.cancelLinuxSpdDaemon();
+    if (cleared > 0) this.log('native_queue_size', { queue_size: 0, cleared });
+  }
+
+  /**
+   * Stop only speech belonging to one exact author. This is the immediate half
+   * of the per-row Silence-user action: the Settings rule blocks future chat,
+   * while this method removes already-queued entries for that author and kills
+   * their currently-speaking child. Other viewers' queued speech is preserved.
+   */
+  cancelUsername(username: string): {
+    stoppedCurrent: boolean;
+    clearedQueued: number;
+  } {
+    const target = normaliseUsername(username);
+    if (!target) return { stoppedCurrent: false, clearedQueued: 0 };
+
+    const before = this.queue.length;
+    this.queue = this.queue.filter(
+      (entry) => normaliseUsername(entry.opts.username) !== target,
+    );
+    const clearedQueued = before - this.queue.length;
+
+    let stoppedCurrent = false;
+    if (this.current && normaliseUsername(this.currentUsername) === target) {
+      stoppedCurrent = true;
+      this.cancelling = true;
+      const pid = this.current.pid;
       try {
-        const canceller = this.spawner({ command: 'spd-say', args: ['--cancel'] });
-        // Reap quietly so a spawn-level error (e.g. spd-say vanished) doesn't
-        // surface as an unhandled 'error' event and crash main.
-        canceller.on('error', () => undefined);
+        this.current.kill('SIGTERM');
       } catch (err) {
         this.log('native_speak_error', {
-          stage: 'cancel-daemon',
+          stage: 'kill-username',
+          username,
           error: String((err as Error)?.message ?? err),
         });
       }
+      this.log('native_speak_killed', {
+        pid,
+        reason: 'silence-user',
+        username,
+      });
+      this.cancelLinuxSpdDaemon();
     }
-    if (cleared > 0) this.log('native_queue_size', { queue_size: 0, cleared });
+
+    if (clearedQueued > 0) {
+      this.log('native_queue_size', {
+        queue_size: this.queue.length,
+        cleared: clearedQueued,
+        reason: 'silence-user',
+        username,
+      });
+    }
+    return { stoppedCurrent, clearedQueued };
+  }
+
+  /** Tell speech-dispatcher's daemon to stop its current utterance on Linux. */
+  private cancelLinuxSpdDaemon(): void {
+    if (this.adapter?.id !== 'linux-spd') return;
+    try {
+      const canceller = this.spawner({ command: 'spd-say', args: ['--cancel'] });
+      // Reap quietly so a spawn-level error (e.g. spd-say vanished) doesn't
+      // surface as an unhandled 'error' event and crash main.
+      canceller.on('error', () => undefined);
+    } catch (err) {
+      this.log('native_speak_error', {
+        stage: 'cancel-daemon',
+        error: String((err as Error)?.message ?? err),
+      });
+    }
   }
 
   /**
@@ -686,15 +746,18 @@ export class NativeTtsEngine {
       });
       // Never let a single bad spawn wedge the queue.
       this.current = null;
+      this.currentUsername = undefined;
       setImmediate(() => this.drain());
       return;
     }
     this.current = subproc;
+    this.currentUsername = next.opts.username;
     let settled = false;
     const settle = (event: 'exit' | 'error', payload: Record<string, unknown>) => {
       if (settled) return;
       settled = true;
       this.current = null;
+      this.currentUsername = undefined;
       if (event === 'exit') {
         this.log('native_speak_end', {
           message_id: messageId,
@@ -755,6 +818,11 @@ export class NativeTtsEngine {
       settle('error', { error: String(err?.message ?? err) });
     });
   }
+}
+
+/** Case-insensitive exact author identity used only inside the native queue. */
+function normaliseUsername(username: string | undefined): string {
+  return typeof username === 'string' ? username.trim().toLowerCase() : '';
 }
 
 // ============================================================================

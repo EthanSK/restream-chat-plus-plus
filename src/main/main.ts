@@ -72,6 +72,7 @@ import { TtsDispatcher } from './tts-dispatch';
 // so the cancel is ATOMIC with the persist and covers EVERY entry point
 // (renderer toggle, header mute button, MCP set_tts_enabled). See saveSettings.
 import { shouldCancelNativeTtsOnSettingsChange } from '../shared/side-effect-decision';
+import { addSilencedUserToBothFilters } from '../shared/message-filters';
 import {
   DEFAULT_SETTINGS,
   IPC,
@@ -82,6 +83,7 @@ import {
   ChatSendStatus,
   NativeVoiceWire,
   SendTextResult,
+  SilenceUserResult,
   TtsLogEvent,
   TtsNativeEnqueuePayload,
   TtsNativeSettingsPayload,
@@ -1108,6 +1110,7 @@ app.on('ready', async () => {
       rate: payload.rate,
       volume: payload.volume,
       messageId: payload.messageId,
+      username: payload.username,
     });
   });
   ipcMain.on(IPC.TTS_NATIVE_CANCEL, () => {
@@ -1717,6 +1720,79 @@ app.on('ready', async () => {
   }
   ipcMain.handle(IPC.SETTINGS_GET, (): Settings => loadSettings());
   ipcMain.handle(IPC.SETTINGS_SET, (_evt, settings: Settings) => saveSettings(settings));
+  /**
+   * Atomic per-row Silence-user action. The old renderer path constructed and
+   * fire-and-forgot a whole Settings snapshot, gave no success/error feedback,
+   * and could not stop speech already in the native queue. Keeping the
+   * read-modify-write here makes concurrent settings edits safe; returning the
+   * saved value lets the renderer reconcile its optimistic row state.
+   */
+  ipcMain.handle(
+    IPC.SETTINGS_SILENCE_USER,
+    (_evt, rawUsername: unknown): SilenceUserResult => {
+      try {
+        if (typeof rawUsername !== 'string' || rawUsername.trim().length === 0) {
+          return { ok: false, error: 'Missing chat username' };
+        }
+        const username = rawUsername.trim();
+        const current = loadSettings();
+        const existingTts = current.filters?.tts?.ignoreUsernameRegex ?? [];
+        const existingNotifications =
+          current.filters?.notifications?.ignoreUsernameRegex ?? [];
+        const update = addSilencedUserToBothFilters(
+          existingTts,
+          existingNotifications,
+          username,
+        );
+        const fullySilenced = !update.addedTts && !update.addedNotifications;
+        const saved = fullySilenced
+          ? current
+          : saveSettings({
+              ...current,
+              filters: {
+                ...current.filters,
+                tts: {
+                  ...current.filters.tts,
+                  ignoreUsernameRegex: update.ttsPatterns,
+                },
+                notifications: {
+                  ...current.filters.notifications,
+                  ignoreUsernameRegex: update.notificationPatterns,
+                },
+              },
+            });
+
+        // The filter protects every future message. Remove only this author
+        // from the native queue as the immediate half of "Silence user".
+        const cancelled = nativeTts.cancelUsername(username);
+        appendTtsLog({
+          event: 'silence_user',
+          data: {
+            username,
+            addedTts: update.addedTts,
+            addedNotifications: update.addedNotifications,
+            stoppedCurrent: cancelled.stoppedCurrent,
+            clearedQueued: cancelled.clearedQueued,
+          },
+        });
+        return {
+          ok: true,
+          settings: saved,
+          addedTts: update.addedTts,
+          addedNotifications: update.addedNotifications,
+          ...cancelled,
+        };
+      } catch (err) {
+        const error = errorToString(err);
+        appendErrorLog({
+          subsystem: 'settings',
+          phase: 'settings.silence-user-failed',
+          errorMessage: error,
+        });
+        return { ok: false, error };
+      }
+    },
+  );
 
   // ----- IPC: GH-update status (pull-fetch on renderer mount) -----
   // The push channel (UPDATE_STATUS) only delivers updates; a renderer that

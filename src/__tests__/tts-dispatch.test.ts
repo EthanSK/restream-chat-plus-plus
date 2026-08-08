@@ -71,6 +71,7 @@ describe('TtsDispatcher speaks via the native OS voice (v0.1.81)', () => {
     // the "can volume n stuff work with that" guarantee.
     expect(c.opts.volume).toBe(0.4);
     expect(c.opts.messageId).toBe('m1');
+    expect(c.opts.username).toBe('alice');
     // PITCH is intentionally NOT passed — no cross-platform native pitch knob.
     expect(c.opts.pitch).toBeUndefined();
   });
