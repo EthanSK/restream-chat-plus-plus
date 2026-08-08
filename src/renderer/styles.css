@@ -1431,6 +1431,22 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
+/* Persistent success state after a per-row Silence-user action. Unlike the
+ * hover-only button, this stays visible so a successful click cannot look like
+ * a no-op. Existing rows switch to this state as soon as Settings changes. */
+.silence-user-status {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ok);
+  border: 1px solid rgba(63, 185, 80, 0.55);
+  border-radius: 4px;
+  background: rgba(63, 185, 80, 0.08);
+  user-select: none;
+}
+
 /* Hidden Users section in the Settings drawer — list each currently-hidden
  * username with a small Unhide button beside it. The empty-state copy
  * explains where the list comes from so a user who hasn't clicked Hide

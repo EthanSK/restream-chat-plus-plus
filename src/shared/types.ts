@@ -610,6 +610,15 @@ export const IPC = {
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   /**
+   * Renderer → main atomic "Silence user" action. Unlike SETTINGS_SET,
+   * this sends only the username: main reloads the latest persisted Settings,
+   * appends exact TTS and notification username rules, saves them together,
+   * and cancels speech already in flight/queued for that same user. Keeping the
+   * read-modify-write in main prevents a stale renderer Settings snapshot from
+   * overwriting a concurrent edit. The explicit result prevents silent failure.
+   */
+  SETTINGS_SILENCE_USER: 'settings:silence-user',
+  /**
    * Push channel — main → renderer — fires when the in-process HTTP MCP
    * server mutates Settings (v0.1.36+). Payload is the fully-merged
    * Settings object that just landed. The renderer subscribes so MCP
@@ -748,7 +757,21 @@ export interface TtsNativeEnqueuePayload {
   rate?: number;
   volume?: number;
   messageId?: string;
+  /** Author identity used for targeted per-user queue cancellation. */
+  username?: string;
 }
+
+/** Result returned by the atomic per-row Silence-user IPC. */
+export type SilenceUserResult =
+  | {
+      ok: true;
+      settings: Settings;
+      addedTts: boolean;
+      addedNotifications: boolean;
+      stoppedCurrent: boolean;
+      clearedQueued: number;
+    }
+  | { ok: false; error: string };
 
 /**
  * Wire payload for `IPC.TTS_NATIVE_UPDATE_SETTINGS`. Only the fields the
@@ -793,6 +816,9 @@ export interface TtsLogEvent {
     // platform (e.g. a bare Linux box with no spd-say/espeak). Speech then
     // no-ops silently; this row tells a forensic grep why nothing was voiced.
     | 'native_no_engine'
+    // Atomic per-row Silence-user action. Carries username + whether a rule
+    // was added and whether matching current/queued speech was cancelled.
+    | 'silence_user'
     // v0.1.73 (Ethan voice 4364, 2026-05-28) — explicit decision-gate
     // logging. EVERY message that flows through the App.tsx side-effect
     // useEffect now emits one of these rows BEFORE the engine is called

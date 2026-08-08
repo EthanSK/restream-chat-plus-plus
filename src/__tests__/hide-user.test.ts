@@ -32,6 +32,7 @@ import { describe, expect, it } from 'vitest';
 import {
   addHiddenUser,
   addSilencedUser,
+  addSilencedUserToBothFilters,
   applyMessageFilters,
   compileHiddenUsersSet,
   compileIgnorePatterns,
@@ -431,6 +432,43 @@ describe('addSilencedUser', () => {
     // A name that WOULD match the unescaped regex (. = any char) must NOT
     // be silenced — proving we escaped correctly.
     expect(applyMessageFilters('x', [], [], 'FooXBarY1', patterns).ignoredByTts).toBeUndefined();
+  });
+});
+
+describe('addSilencedUserToBothFilters', () => {
+  it('adds the exact username to TTS and notification filters together', () => {
+    expect(addSilencedUserToBothFilters([], [], 'burntballs_')).toEqual({
+      ttsPatterns: ['^burntballs_$'],
+      notificationPatterns: ['^burntballs_$'],
+      addedTts: true,
+      addedNotifications: true,
+    });
+  });
+
+  it('fills only the missing axis and respects an existing broad regex', () => {
+    expect(
+      addSilencedUserToBothFilters(['burntballs_'], [], 'burntballs_1'),
+    ).toEqual({
+      ttsPatterns: ['burntballs_'],
+      notificationPatterns: ['^burntballs_1$'],
+      addedTts: false,
+      addedNotifications: true,
+    });
+  });
+
+  it('is a no-op on both axes when both already suppress the user', () => {
+    expect(
+      addSilencedUserToBothFilters(
+        ['^Alice$'],
+        ['alice'],
+        'ALICE',
+      ),
+    ).toEqual({
+      ttsPatterns: ['^Alice$'],
+      notificationPatterns: ['alice'],
+      addedTts: false,
+      addedNotifications: false,
+    });
   });
 });
 

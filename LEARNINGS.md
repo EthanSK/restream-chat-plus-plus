@@ -24,6 +24,26 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-08T13:38:00Z
+**Trigger:** Ethan: "the silence user btn doesnt fully work ... it needs to turn off notifs and stt for that user when i click it"
+**Symptom:** Clicking the per-row Silence user button looked inert. Live evidence showed Twitch author `burntballs_` continued to be read before the settings edit, while the saved anchored rule `^burntballs_$` proved the button path could add a TTS rule. The clicked historical row never changed, the action did not touch the notification username filter, and speech already in flight/queued was unaffected, so Ethan had to open Settings and add rules manually.
+**Root cause:** The v0.1.91 implementation fire-and-forgot a whole renderer Settings snapshot into `SETTINGS_SET`, updated only `filters.tts.ignoreUsernameRegex`, attached ignored badges only when a message first arrived, exposed no success/failure state, and gave the native TTS queue only a message ID (no author identity for targeted cancellation).
+**Fix:** The per-row action now invokes atomic main-process `SETTINGS_SILENCE_USER`: main reloads current Settings, adds an exact regex-escaped rule to both TTS and notification username filters (respecting an existing broader rule), saves once, and cancels only that user's current/queued native speech. The renderer predicts both rules for immediate feedback, reconciles the returned Settings, surfaces IPC failures, recomputes old-row badges from live patterns, and replaces the hover button with persistent `✓ Silenced` only when both side effects are suppressed.
+**Commit:** v0.1.97 release
+**Guard:** `silence-user-button.test.tsx` exercises the real MessageRow click and live historical-row transition; `hide-user.test.ts` pins the shared both-filter reducer and partial-axis completion; `tts-dispatch.test.ts` pins username propagation into native enqueue; `tts-native.test.ts` pins exact case-insensitive author cancellation while preserving other viewers' queued speech. Verification: all 721 tests pass, typecheck is clean, lint has zero errors (pre-existing warnings only), and production packaging succeeds.
+---
+
+---
+**Date:** 2026-08-01T14:23:22Z
+**Trigger:** Ethan: "Restream Chat++ notifications arrive but no user's message is spoken"
+**Symptom:** Incoming messages, including `@TW_Guesty`, logged `tts_decision: read`, `native_speak_start`, and `native_speak_end` with exit code 0, but no speech was audible. Notifications and music remained audible, and neither the TTS mute nor username filters were responsible.
+**Root cause:** The persisted macOS TTS configuration had drifted to `voiceURI: "Daniel (Enhanced)"` at volume `0.54`; the current `say -v '?'` list exposes `Daniel`, not `Daniel (Enhanced)`. The live correction changed both variables to the verified working pair (`Daniel`, volume `1`), so this incident did not independently prove whether the stale voice name or attenuation was the sole cause.
+**Fix:** Through the running app's MCP settings bridge, set `voiceURI` to `Daniel` and TTS volume to `1`, leaving TTS enabled and unmuted. No app restart, reinstall, or macOS audio-service restart was needed.
+**Commit:** working-tree investigation note
+**Guard:** Verify the selected voice against the current native voice list, then confirm `list_settings` and a real incoming-message `native_speak_start` row. Physical acceptance in this incident: Ethan heard the plain `say -v Daniel` test and then heard three real Restream messages; their log rows used `voice: "Daniel"`, `volume: 1`, and exited 0.
+---
+
+---
 **Date:** 2026-07-14T12:52:59Z
 **Trigger:** Ethan: "also total live viewers is cut off" + screenshot
 **Symptom:** Opening the live-viewer breakdown near the toolbar's right edge showed only the panel's left portion. The Total label appeared without its value, and the header close button, live/offline pills, and per-platform counts were all outside the clipped window area.

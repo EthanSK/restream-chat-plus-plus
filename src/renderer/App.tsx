@@ -44,7 +44,7 @@ import type { ViewerStatsSnapshot } from '../shared/viewer-stats-core';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
-  addSilencedUser,
+  addSilencedUserToBothFilters,
   applyMessageFilters,
   compileHiddenUsersSet,
   compileIgnorePatterns,
@@ -120,6 +120,7 @@ export function App(): React.ReactElement {
   const [reconnecting, setReconnecting] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [sendNotice, setSendNotice] = useState<SendNotice | null>(null);
+  const [silenceError, setSilenceError] = useState<string | null>(null);
   // Banner-dismiss is session-only by design (see UpdateBanner.tsx docstring) —
   // we want a soft nag, not a sticky one. The next launch re-checks and
   // re-shows the banner if the user hasn't actually installed the new build.
@@ -826,48 +827,66 @@ export function App(): React.ReactElement {
   //   - OLD behavior (v0.1.72): appended the username to
   //     `settings.hiddenUsers`, which DROPPED their rows from the visible
   //     feed AND suppressed all side effects.
-  //   - NEW behavior: adds an anchored, regex-escaped entry for the
-  //     username to `settings.filters.tts.ignoreUsernameRegex`, so the
-  //     user's messages STILL RENDER in the feed but TTS skips them (the
-  //     main-process dispatcher reads ignoredByTts from applyMessageFilters,
-  //     which matches the TTS *username* axis against this list).
+  //   - NEW behavior: adds anchored, regex-escaped entries for the username to
+  //     BOTH the TTS and notification username-ignore lists, so the user's
+  //     messages STILL RENDER while spoken chat and native notifications stop.
   //
-  // We persist through the SAME nested-spread shape the Settings drawer's
-  // `patchTtsUsernameFilter` uses, so the new entry survives restart AND
-  // shows up in the Settings → TTS username-ignore textarea (one entry per
-  // line). The `hiddenUsers` plumbing is left dormant — it's still used by
-  // the Settings "Hidden Users" list + unhide, just no longer fed by this
-  // button.
-  //
-  // Async-flavored fire-and-forget like the old handler: updateSettings
-  // flips local state synchronously so the textarea / behavior update is
-  // effectively instant; the IPC persist happens in the background.
+  // v0.1.97 fix: persistence is now an ATOMIC username-only IPC. The old path
+  // fire-and-forgot a whole renderer Settings snapshot, exposed no result, and
+  // left already-playing/queued speech untouched. We still predict the exact
+  // next filter locally for instant row feedback; main reloads the current
+  // settings, persists both filters safely, cancels only this user's native
+  // queue entries, and returns the authoritative Settings. Any failure becomes
+  // a visible banner; we reload persisted truth instead of pretending it worked.
   const handleSilenceUser = (username: string): void => {
     // Defensive: skip empty / whitespace-only usernames so a malformed
     // ChatMessage can't poison the ignore list with a bare `^$` pattern.
-    // addSilencedUser also guards, but checking at the call site is cheap.
+    // The shared reducer also guards, but checking at the call site is cheap.
     if (typeof username !== 'string' || username.trim().length === 0) return;
-    const existing = settings.filters?.tts?.ignoreUsernameRegex ?? [];
+    const existingTts = settings.filters?.tts?.ignoreUsernameRegex ?? [];
+    const existingNotifications =
+      settings.filters?.notifications?.ignoreUsernameRegex ?? [];
     // Anchored ^name$ + regex-escape so names with special chars and
     // superstring names don't over-match; relies on the `i` flag added at
     // compile time (compileIgnorePatterns) for case-insensitivity.
-    const next = addSilencedUser(existing, username);
-    // Bail (no persist) if nothing changed — already silenced (dedupe hit)
-    // or a no-op empty username. Avoids a redundant settings/IPC round-trip.
-    if (next.length === existing.length) return;
-    // Persist via the SAME nested-spread shape as patchTtsUsernameFilter,
-    // replicating its optional-chaining safety for a possibly-undefined
-    // `settings.filters` / `settings.filters.tts` (pre-v0.1.72 blobs).
-    void updateSettings({
+    const update = addSilencedUserToBothFilters(
+      existingTts,
+      existingNotifications,
+      username,
+    );
+    // Already suppressed on both paths: still ask main to clear any matching
+    // speech that entered the native queue before the rules were saved.
+    const optimistic: Settings = {
       ...settings,
       filters: {
         ...settings.filters,
         tts: {
           ...settings.filters?.tts,
-          ignoreUsernameRegex: next,
+          ignoreUsernameRegex: update.ttsPatterns,
+        },
+        notifications: {
+          ...settings.filters?.notifications,
+          ignoreUsernameRegex: update.notificationPatterns,
         },
       },
-    });
+    };
+    setSilenceError(null);
+    setSettings(optimistic);
+    void rcpp
+      .silenceUser(username)
+      .then((result) => {
+        if (result.ok) {
+          setSettings(result.settings);
+          return;
+        }
+        setSilenceError(`Couldn’t silence ${username}: ${result.error}`);
+        void rcpp.getSettings().then(setSettings).catch(() => setSettings(settings));
+      })
+      .catch((err) => {
+        const detail = err instanceof Error ? err.message : String(err);
+        setSilenceError(`Couldn’t silence ${username}: ${detail}`);
+        void rcpp.getSettings().then(setSettings).catch(() => setSettings(settings));
+      });
   };
 
   // v0.1.77 (Ethan voice 4438, 2026-05-30) — header ONE-CLICK MUTE toggle.
@@ -1072,6 +1091,19 @@ export function App(): React.ReactElement {
           </button>
         </div>
       )}
+      {silenceError && (
+        <div className="send-notice" role="alert" aria-live="assertive">
+          <span className="send-notice-text">{silenceError}</span>
+          <button
+            className="send-notice-dismiss"
+            type="button"
+            aria-label="Dismiss silence warning"
+            onClick={() => setSilenceError(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/*
        * v0.1.70 (sign-out diagnosis 2026-05-25) — transient-refresh
        * recovery banner.
@@ -1234,6 +1266,11 @@ export function App(): React.ReactElement {
         // TTS username-ignore list (silence, not hide). ChatFeed is a pure
         // render layer here; it just surfaces the button + relays the click.
         onSilenceUser={handleSilenceUser}
+        // Live compiled patterns make existing rows update immediately: the
+        // hover button becomes a persistent "Silenced" status and the old row
+        // receives its combined ignore badge without waiting for a new message.
+        silencedTtsUsernamePatterns={ttsUsernameIgnoreCompiled}
+        silencedNotificationUsernamePatterns={notifUsernameIgnoreCompiled}
         // v0.1.90 (voice 4512) — manual "tap to retry" on a ⚠ failed send.
         // ChatFeed relays the click on the ⚠ affordance; App re-runs the loop.
         onRetrySend={handleRetrySend}

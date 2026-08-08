@@ -9,6 +9,7 @@ import type {
   ConnectionState,
   NativeVoiceWire,
   SendTextResult,
+  SilenceUserResult,
   Settings,
   TtsLogEvent,
   TtsNativeEnqueuePayload,
@@ -235,6 +236,13 @@ const api = {
   getSettings: (): Promise<Settings> => ipcRenderer.invoke(IPC.SETTINGS_GET),
   setSettings: (s: Settings): Promise<Settings> =>
     ipcRenderer.invoke(IPC.SETTINGS_SET, s),
+  /**
+   * Atomically silence one chat author in main. The result includes the saved
+   * Settings so the renderer can reconcile its optimistic row feedback, plus
+   * targeted-cancel details for diagnostics.
+   */
+  silenceUser: (username: string): Promise<SilenceUserResult> =>
+    ipcRenderer.invoke(IPC.SETTINGS_SILENCE_USER, username),
   /**
    * Subscribe to push-broadcasts of Settings changes coming from the
    * in-process HTTP MCP server (v0.1.36+). The renderer re-applies the

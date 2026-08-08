@@ -112,7 +112,13 @@ export interface TtsDispatchDeps {
    * path anymore. `pitch` is intentionally NOT passed (no cross-platform native
    * pitch knob — see the file header).
    */
-  speakNative(text: string, opts: { voice?: string; rate?: number; volume?: number; messageId?: string }): void;
+  speakNative(text: string, opts: {
+    voice?: string;
+    rate?: number;
+    volume?: number;
+    messageId?: string;
+    username?: string;
+  }): void;
   /** Fire a native OS notification. `silent` honours settings.notifications.soundEnabled. */
   notify(title: string, body: string, silent: boolean): void;
   /** Persist a tts-events.jsonl row. Best-effort; never throws into dispatch. */
@@ -338,6 +344,9 @@ export class TtsDispatcher {
       rate: settings.tts.rate,
       volume: settings.tts.volume,
       messageId: m.id,
+      // Queue identity lets the atomic Silence-user action cancel only this
+      // author's in-flight/queued speech, preserving every other viewer.
+      username: m.username,
     });
     return 'native';
   }

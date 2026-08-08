@@ -529,6 +529,52 @@ describe('NativeTtsEngine — queue / cancel / lifecycle', () => {
     expect(logs.find((l) => l.event === 'native_speak_killed')?.data?.reason).toBe('cancel');
   });
 
+  it('cancelUsername stops only that author and preserves other queued speech', async () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const logs: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const engine = new NativeTtsEngine({
+      settings: baseSettings,
+      spawner,
+      adapter: macAdapter,
+      log: (event, data) => logs.push({ event, data }),
+    });
+    engine.enqueue('alice current', { messageId: 'a1', username: 'Alice' });
+    engine.enqueue('bob stays', { messageId: 'b1', username: 'Bob' });
+    engine.enqueue('alice queued', { messageId: 'a2', username: 'alice' });
+
+    const result = engine.cancelUsername('ALICE');
+    expect(result).toEqual({ stoppedCurrent: true, clearedQueued: 1 });
+    expect(spawns[0].killed).toBe(true);
+    expect(engine.queueDepth).toBe(1);
+
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(spawns).toHaveLength(2);
+    expect(lastArg(spawns[1])).toContain('bob stays');
+    expect(lastArg(spawns[1])).not.toContain('alice queued');
+    expect(
+      logs.find((row) => row.event === 'native_speak_killed')?.data,
+    ).toMatchObject({ reason: 'silence-user', username: 'ALICE' });
+  });
+
+  it('cancelUsername removes a queued author without interrupting someone else', () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({
+      settings: baseSettings,
+      spawner,
+      adapter: macAdapter,
+    });
+    engine.enqueue('bob current', { username: 'bob' });
+    engine.enqueue('alice queued', { username: 'alice' });
+
+    expect(engine.cancelUsername('alice')).toEqual({
+      stoppedCurrent: false,
+      clearedQueued: 1,
+    });
+    expect(spawns[0].killed).toBe(false);
+    expect(engine.queueDepth).toBe(0);
+  });
+
   // v0.1.84 — Linux (spd-say) daemon stop. SIGTERM-ing the spd-say CLIENT does
   // NOT stop speech the speech-dispatcher DAEMON has already started, so on the
   // spd-say adapter cancel() must ALSO spawn `spd-say --cancel` to tell the
