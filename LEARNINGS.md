@@ -64,6 +64,16 @@ Each entry looks like:
 ---
 
 ---
+**Date:** 2026-08-17T12:44:00Z
+**Trigger:** Ethan: "combine the individual Twitch and Kick live viewers in this main viewers trigger and dropdown"
+**Symptom:** Direct Twitch and Kick counts were visible on their source chips, but the main eye total and dropdown still described only Restream destinations.
+**Root cause:** The renderer already held both live sources, but `ViewerCount` consumed only `ViewerStatsSnapshot`; direct counts stayed isolated in `DirectChatConnection` even though they represented the same user-facing total.
+**Fix:** v0.1.102 derives one toolbar total from the live Restream snapshot plus connected live direct sources, keeps Restream and Direct rows in separate dropdown sections, and remains visible for a direct-only stream.
+**Commit:** working-tree implementation
+**Guard:** Renderer tests cover the combined total, direct-only live and unknown-count states, section order, offline-count suppression, and the existing close paths. The installed signed app was manually verified with Restream 0 + 0 + unknown and direct Twitch 1 + Kick 1 producing a toolbar total of 2.
+---
+
+---
 **Date:** 2026-08-15T12:37:56Z
 **Trigger:** Ethan: "set it up both twitch and kick. also we should be able to see the view count for each individually"
 **Symptom:** The direct Twitch and Kick source controls showed connection health but no provider-specific audience count, while Restream's existing viewer total could not represent destinations disabled in Restream.

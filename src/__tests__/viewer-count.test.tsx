@@ -7,6 +7,7 @@ import type {
   ViewerChannelStat,
   ViewerStatsSnapshot,
 } from '../shared/viewer-stats-core';
+import type { DirectChatConnection } from '../shared/types';
 
 /**
  * v0.1.94 — LIVE VIEWER COUNT toolbar chip render rules.
@@ -44,6 +45,19 @@ function snap(over: Partial<ViewerStatsSnapshot> = {}): ViewerStatsSnapshot {
     anyOnline: true,
     channels: [chan()],
     computedAtMs: Date.now(),
+    ...over,
+  };
+}
+
+function direct(
+  over: Partial<DirectChatConnection> = {},
+): DirectChatConnection {
+  return {
+    provider: 'twitch',
+    status: 'connected',
+    accountName: 'reeethan_yt',
+    isLive: true,
+    viewerCount: 5,
     ...over,
   };
 }
@@ -149,6 +163,29 @@ describe('ViewerCount chip', () => {
     expect(textOf(r)).toBe((1234).toLocaleString());
   });
 
+  it('combines Restream, Twitch, and Kick in the toolbar total', () => {
+    const r = render(
+      <ViewerCount
+        snapshot={snap({ totalViewers: 10 })}
+        directConnections={[
+          direct({ viewerCount: 5 }),
+          direct({ provider: 'kick', accountName: 'reeethan', viewerCount: 3 }),
+        ]}
+      />,
+    );
+    expect(textOf(r)).toBe('18');
+  });
+
+  it('stays visible for a direct-only live stream', () => {
+    const r = render(
+      <ViewerCount
+        snapshot={null}
+        directConnections={[direct({ viewerCount: 12 })]}
+      />,
+    );
+    expect(textOf(r)).toBe('12');
+  });
+
   it('shows an em-dash placeholder when live but every count is hidden', () => {
     const r = render(
       <ViewerCount
@@ -156,6 +193,16 @@ describe('ViewerCount chip', () => {
           totalViewers: null,
           channels: [chan({ platformName: 'X (Twitter)', viewers: null })],
         })}
+      />,
+    );
+    expect(textOf(r)).toBe('—');
+  });
+
+  it('shows an em-dash when a direct-only live count is unavailable', () => {
+    const r = render(
+      <ViewerCount
+        snapshot={null}
+        directConnections={[direct({ viewerCount: undefined })]}
       />,
     );
     expect(textOf(r)).toBe('—');
@@ -230,6 +277,49 @@ describe('ViewerCount breakdown popover', () => {
     );
     expect(offlineRows).toHaveLength(1);
     // …and its stale pre-offline count (99) must NOT leak anywhere.
+    expect(text).not.toContain('99');
+  });
+
+  it('separates Restream channels from direct Twitch and Kick rows', () => {
+    const r = render(
+      <ViewerCount
+        snapshot={snap({
+          totalViewers: 7,
+          channels: [
+            chan({
+              platformName: 'YouTube',
+              channelIdentifier: 'REEEthan',
+            }),
+          ],
+        })}
+        directConnections={[
+          direct({ viewerCount: 5 }),
+          direct({
+            provider: 'kick',
+            accountName: 'reeethan',
+            isLive: false,
+            viewerCount: 99,
+          }),
+        ]}
+      />,
+    );
+    clickChip(r);
+
+    const labels = r.root
+      .findAll(
+        (n) =>
+          n.type === 'div' && n.props.className === 'viewer-section-label',
+      )
+      .map((node) => node.children.join(''));
+    expect(labels).toEqual(['Restream', 'Direct']);
+
+    const text = textOf(r);
+    expect(text).toContain('YouTube');
+    expect(text).toContain('Twitch');
+    expect(text).toContain('Kick');
+    expect(text).toContain('reeethan_yt');
+    expect(text).toContain('offline');
+    expect(text).toContain('12');
     expect(text).not.toContain('99');
   });
 

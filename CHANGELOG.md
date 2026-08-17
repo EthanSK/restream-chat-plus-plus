@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.102 — combined viewer breakdown (2026-08-17)
+
+### What's new
+
+- **The toolbar eye now shows every live viewer source together.** Its total
+  combines Restream's active destinations with the independently polled Twitch
+  and Kick counts.
+- **The dropdown keeps transport ownership obvious.** Existing Restream rows
+  stay grouped under Restream, while Twitch and Kick appear in a separate
+  Direct section with their own account, live state, and viewer count.
+- **Direct-only streams keep the viewer control visible.** Twitch or Kick can
+  now drive the eye total even when Restream has no active viewer snapshot.
+
+### Guard
+
+- Added renderer coverage for combined totals, direct-only streams, hidden
+  counts, and the two-section dropdown layout.
+
 ## v0.1.101 — direct chat liveness recovery (2026-08-17)
 
 ### What's fixed

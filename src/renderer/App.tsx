@@ -1213,13 +1213,14 @@ export function App(): React.ReactElement {
         {/*
          * v0.1.94 — LIVE VIEWER COUNT chip (like the official Restream chat
          * app). Sits next to the channels panel so "who's connected" and
-         * "how many are watching" read as one cluster. Renders NOTHING when
-         * not live (ViewerCount's own gate) and is additionally gated on
-         * auth here — a signed-out user has no streaming-updates socket, so
-         * a stale snapshot must never linger in the toolbar. Hover shows the
-         * per-platform breakdown via native tooltip.
+         * "how many are watching" read as one cluster. The Restream snapshot
+         * is suppressed while signed out so stale platform rows cannot leak,
+         * but direct Twitch/Kick counts remain independently available.
          */}
-        {auth.authenticated && <ViewerCount snapshot={viewerStats} />}
+        <ViewerCount
+          snapshot={auth.authenticated ? viewerStats : null}
+          directConnections={directConnections}
+        />
         <span className="spacer" />
         {/*
          * v0.1.77 (Ethan voice 4438, 2026-05-30) — ONE-CLICK MUTE button.

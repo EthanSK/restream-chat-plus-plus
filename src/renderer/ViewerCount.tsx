@@ -3,6 +3,7 @@ import type {
   ViewerChannelStat,
   ViewerStatsSnapshot,
 } from '../shared/viewer-stats-core';
+import type { DirectChatConnection } from '../shared/types';
 
 /**
  * v0.1.94 — LIVE VIEWER COUNT toolbar chip.
@@ -11,11 +12,12 @@ import type {
  * the breakdown per platform like Restream does it").
  *
  * Compact `👁 N` readout of total concurrent viewers across every currently
- * online channel — the same number the official Restream chat app shows.
- * Data flows main → renderer over IPC.VIEWER_STATS (see
- * src/shared/viewer-stats-core.ts for the source contract); this component
- * is a PURE view over the latest snapshot so it can be unit-tested without
- * IPC mocks (repo convention, mirrors ChannelsPanel).
+ * online Restream channel plus the independently connected Twitch and Kick
+ * channels.
+ * Restream data flows main → renderer over IPC.VIEWER_STATS, while Twitch and
+ * Kick reuse the existing DirectChatConnection state; this component is a
+ * PURE view over both latest snapshots so it can be unit-tested without IPC
+ * mocks (repo convention, mirrors ChannelsPanel).
  *
  * Chip render rules (deliberately quiet — this is an ambient indicator,
  * never an error surface):
@@ -41,15 +43,30 @@ import type {
  */
 export function ViewerCount({
   snapshot,
+  directConnections = [],
 }: {
   snapshot: ViewerStatsSnapshot | null;
+  directConnections?: DirectChatConnection[];
 }): React.ReactElement | null {
   // ALL hooks live above the early return (Rules of Hooks — the count of
   // hooks must be identical across renders even as `live` flips; same
   // discipline chat-input-hook-order.test.ts pins for ChatInputInline).
   const [open, setOpen] = useState(false);
 
-  const live = Boolean(snapshot?.anyOnline);
+  const liveDirectConnections = directConnections.filter(isDirectConnectionLive);
+  const live = Boolean(snapshot?.anyOnline) || liveDirectConnections.length > 0;
+  const knownTotals = [
+    ...(snapshot?.anyOnline && snapshot.totalViewers !== null
+      ? [snapshot.totalViewers]
+      : []),
+    ...liveDirectConnections.flatMap((connection) =>
+      connection.viewerCount === undefined ? [] : [connection.viewerCount],
+    ),
+  ];
+  const total =
+    knownTotals.length > 0
+      ? knownTotals.reduce((sum, viewers) => sum + viewers, 0)
+      : null;
 
   // Force-close the popover whenever the stream stops being live. Without
   // this, `open` would survive the chip disappearing (component stays
@@ -74,9 +91,7 @@ export function ViewerCount({
   }, [open]);
 
   // Hidden entirely while not live — see chip render rules above.
-  if (!snapshot || !live) return null;
-
-  const total = snapshot.totalViewers;
+  if (!live) return null;
 
   return (
     <div className="viewer-count-panel">
@@ -110,7 +125,12 @@ export function ViewerCount({
         </span>
       </button>
       {open && (
-        <ViewerPopover snapshot={snapshot} onClose={() => setOpen(false)} />
+        <ViewerPopover
+          snapshot={snapshot}
+          directConnections={directConnections}
+          total={total}
+          onClose={() => setOpen(false)}
+        />
       )}
     </div>
   );
@@ -124,9 +144,13 @@ export function ViewerCount({
  */
 function ViewerPopover({
   snapshot,
+  directConnections,
+  total,
   onClose,
 }: {
-  snapshot: ViewerStatsSnapshot;
+  snapshot: ViewerStatsSnapshot | null;
+  directConnections: DirectChatConnection[];
+  total: number | null;
   onClose: () => void;
 }): React.ReactElement {
   return (
@@ -151,16 +175,35 @@ function ViewerPopover({
           <div className="viewer-total-row">
             <span className="viewer-total-label">Total</span>
             <span className="viewer-total-num">
-              {snapshot.totalViewers === null
-                ? '—'
-                : snapshot.totalViewers.toLocaleString()}
+              {total === null ? '—' : total.toLocaleString()}
             </span>
           </div>
-          <ul className="viewer-list">
-            {snapshot.channels.map((c) => (
-              <ViewerRow key={c.channelId} stat={c} />
-            ))}
-          </ul>
+          {snapshot && snapshot.channels.length > 0 ? (
+            <ViewerSection label="Restream">
+              {snapshot.channels.map((stat) => (
+                <ViewerRow
+                  key={`restream-${stat.channelId}`}
+                  platformName={stat.platformName}
+                  channelIdentifier={stat.channelIdentifier}
+                  online={stat.online}
+                  viewers={stat.viewers}
+                />
+              ))}
+            </ViewerSection>
+          ) : null}
+          {directConnections.length > 0 ? (
+            <ViewerSection label="Direct">
+              {directConnections.map((connection) => (
+                <ViewerRow
+                  key={`direct-${connection.provider}`}
+                  platformName={providerLabel(connection.provider)}
+                  channelIdentifier={connection.accountName ?? ''}
+                  online={isDirectConnectionLive(connection)}
+                  viewers={connection.viewerCount ?? null}
+                />
+              ))}
+            </ViewerSection>
+          ) : null}
         </div>
       </div>
     </>
@@ -173,27 +216,59 @@ function ViewerPopover({
  * contribution) so the user can see which platform just dropped — same
  * philosophy as ChannelsPanel listing erroring connections.
  */
-function ViewerRow({ stat }: { stat: ViewerChannelStat }): React.ReactElement {
+function ViewerSection({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}): React.ReactElement {
   return (
-    <li className={`viewer-row${stat.online ? '' : ' is-offline'}`}>
+    <section className="viewer-section" aria-label={`${label} viewers`}>
+      <div className="viewer-section-label">{label}</div>
+      <ul className="viewer-list">{children}</ul>
+    </section>
+  );
+}
+
+function ViewerRow({
+  platformName,
+  channelIdentifier,
+  online,
+  viewers,
+}: Pick<
+  ViewerChannelStat,
+  'platformName' | 'channelIdentifier' | 'online' | 'viewers'
+>): React.ReactElement {
+  return (
+    <li className={`viewer-row${online ? '' : ' is-offline'}`}>
       <div className="viewer-row-meta">
-        <span className="viewer-row-platform">{stat.platformName}</span>
-        {stat.channelIdentifier ? (
-          <span className="viewer-row-channel">{stat.channelIdentifier}</span>
+        <span className="viewer-row-platform">{platformName}</span>
+        {channelIdentifier ? (
+          <span className="viewer-row-channel">{channelIdentifier}</span>
         ) : null}
       </div>
-      <span
-        className={`viewer-row-pill ${stat.online ? 'online' : 'offline'}`}
-      >
-        {stat.online ? 'live' : 'offline'}
+      <span className={`viewer-row-pill ${online ? 'online' : 'offline'}`}>
+        {online ? 'live' : 'offline'}
       </span>
       <span className="viewer-row-num">
         {/* "—" = platform hides concurrent viewers (viewers:null on the
             wire, e.g. X/Twitter) OR the channel is offline. */}
-        {stat.online && stat.viewers !== null
-          ? stat.viewers.toLocaleString()
-          : '—'}
+        {online && viewers !== null ? viewers.toLocaleString() : '—'}
       </span>
     </li>
   );
+}
+
+function isDirectConnectionLive(connection: DirectChatConnection): boolean {
+  return connection.status === 'connected' && connection.isLive === true;
+}
+
+function providerLabel(provider: DirectChatConnection['provider']): string {
+  switch (provider) {
+    case 'twitch':
+      return 'Twitch';
+    case 'kick':
+      return 'Kick';
+  }
 }

@@ -41,8 +41,10 @@ Self-hosted? You'll need a Restream developer app:
 
 The Chat sources row lets users connect either provider independently. Direct
 messages enter the same timeline, notification, filter, and TTS pipeline as
-Restream messages. Each connected source also shows its own official live
-viewer count. Messages are read and sent directly for connected Twitch and Kick accounts; other channels continue to send through Restream.
+Restream messages. The toolbar viewer total combines Restream with direct
+Twitch and Kick, while its dropdown keeps the Restream and Direct platform
+counts in separate sections. Messages are read and sent directly for connected
+Twitch and Kick accounts; other channels continue to send through Restream.
 
 - **Twitch:** register a public Chat Bot app, save its client ID as
   `TWITCH_CLIENT_ID` or in macOS Keychain under service `api.twitch.tv`, then
