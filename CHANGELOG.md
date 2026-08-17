@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.104 — quiet authoritative update checks (2026-08-17)
+
+### What's fixed
+
+- **Locally installed builds no longer show a false red update failure every
+  hour.** The native Squirrel feed now stays idle until the GitHub Releases
+  checker has proved that a genuinely newer public release exists.
+- **Real automatic updates still download normally.** A newer GitHub release
+  immediately starts the native background installer, while staged-update and
+  retry guards remain unchanged.
+
+### Guard
+
+- Added regression coverage for an installed build ahead of GitHub Releases,
+  the exact state where Electron's update service returns HTTP 404 and used to
+  surface “The server sent an invalid response.”
+
 ## v0.1.103 — aligned source viewer counts (2026-08-17)
 
 ### What's fixed

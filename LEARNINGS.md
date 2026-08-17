@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-17T15:05:00Z
+**Trigger:** Ethan: "why am I getting this banner all of a sudden; this is the second time"
+**Symptom:** Restream Chat++ automatically showed a red “Update failed — The server sent an invalid response” banner once per hour even though chat remained connected and no newer update existed.
+**Root cause:** The installed local build was v0.1.103 while GitHub's latest public release was v0.1.97. The authoritative GitHub API correctly returned v0.1.97, but a separate blind Squirrel poll requested `update.electronjs.org/.../0.1.103`; that service returned HTTP 404 “No updates found,” which Electron converted into an invalid-response error and the renderer treated as actionable.
+**Fix:** v0.1.104 makes the GitHub Releases result the source of truth. The native feed is configured at startup but only checked after GitHub reports a version newer than the running app; the existing hourly native timer becomes a retry/fallback only while a real newer release is pending.
+**Commit:** working-tree implementation
+**Guard:** `update-flow-fixes.test.ts` proves startup and repeated hourly ticks never touch Squirrel without a newer GitHub version, and that a newer remembered release still starts exactly one native background check and stays frozen after staging.
+---
+
+---
 **Date:** 2026-08-17T12:50:00Z
 **Trigger:** Ethan: "what's this clapped alignment"
 **Symptom:** A live Twitch or Kick source chip showed its separator at the top right and wrapped the numeric viewer count onto a second line.

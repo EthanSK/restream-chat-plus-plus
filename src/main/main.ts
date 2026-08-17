@@ -921,14 +921,15 @@ app.on('ready', async () => {
     }
   });
 
-  // Wire auto-update polling (update.electronjs.org → GitHub Releases).
-  // Skipped automatically in dev / when not packaged / when running unsigned.
+  // Configure the native installer feed. It only runs after the GitHub checker
+  // below proves a newer release exists, so locally installed builds ahead of
+  // the public release do not turn the feed's HTTP 404 into a false error banner.
   configureAutoUpdater();
 
   // Wire the GH-Releases-API-backed update checker. Unlike the Squirrel-based
-  // path above, this works on unsigned builds — it only ANSWERS "is there a
-  // newer release?" and "where is it?", then surfaces a banner with a
-  // Download button that opens the release page in the user's browser.
+  // path above, this works on unsigned builds and is the source of truth for
+  // whether a newer release exists. A positive result starts the native
+  // background download; otherwise the native feed stays idle.
   // The poller reads `settings.update.autoCheck` at every tick so toggling
   // the Settings switch takes effect without a restart.
   startGithubUpdatePoller(() => loadSettings().update.autoCheck);

@@ -143,8 +143,9 @@ describe('v0.1.52 update-flow fixes', () => {
         reason: 'started',
         mode: 'squirrel',
       });
-      // One guarded startup poll + one explicit user poll.
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
+      // The native feed stays idle until GitHub reports a newer release, so
+      // this is only the explicit user poll.
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
     });
 
     it('second triggerSquirrelDownload() while already downloading returns success with reason=already-downloading (no throw)', async () => {
@@ -163,7 +164,7 @@ describe('v0.1.52 update-flow fixes', () => {
       });
       // checkForUpdates() must NOT be called twice — that's what would
       // throw "command is disabled" in production.
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
     });
 
     it('triggerSquirrelDownload() after update-downloaded returns reason=already-staged (no throw, no extra check)', async () => {
@@ -179,7 +180,7 @@ describe('v0.1.52 update-flow fixes', () => {
         reason: 'already-staged',
         mode: 'squirrel',
       });
-      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
     });
 
     it('after a synchronous checkForUpdates throw, the in-flight flag resets so a retry can succeed', async () => {
@@ -282,14 +283,36 @@ describe('v0.1.52 update-flow fixes', () => {
       try {
         const updater = await loadUpdater();
         updater.configureAutoUpdater();
+        expect(fakeAutoUpdater.checkForUpdates).not.toHaveBeenCalled();
+
+        // GitHub is authoritative: only its newer-release result starts the
+        // native background check.
+        updater.rememberPendingDownloadVersion('v0.1.53');
         expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
 
         fakeAutoUpdater.emit('update-downloaded', {}, undefined, 'v0.1.53');
         vi.advanceTimersByTime(updater.AUTO_UPDATE_INTERVAL_MS * 3);
 
-        // The startup call is the only call. Pre-fix, each interval invoked
-        // Squirrel again and invalidated its staged-install slot.
+        // The release-triggered call is the only call. Pre-fix, each interval
+        // invoked Squirrel again and invalidated its staged-install slot.
         expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not call the native feed when the installed build is ahead of GitHub Releases', async () => {
+      vi.useFakeTimers();
+      try {
+        const updater = await loadUpdater();
+        updater.configureAutoUpdater();
+
+        vi.advanceTimersByTime(updater.AUTO_UPDATE_INTERVAL_MS * 2);
+
+        // update.electronjs.org returns HTTP 404 in this state. Before this
+        // guard, Squirrel converted that expected response into the red
+        // "server sent an invalid response" banner every hour.
+        expect(fakeAutoUpdater.checkForUpdates).not.toHaveBeenCalled();
       } finally {
         vi.useRealTimers();
       }

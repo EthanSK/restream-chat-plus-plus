@@ -3,8 +3,8 @@
 // Uses Electron's native autoUpdater against
 // `https://update.electronjs.org/<owner>/<repo>/<platform>-<arch>/<version>`
 // (Electron's free public service for open-source apps). We configure the
-// feed and own the polling timer so a staged update can freeze background
-// checks until it has been installed.
+// feed and let the GitHub Releases checker decide when a native download is
+// needed so a staged update can freeze background checks until installation.
 //
 // Notes:
 // - The service requires the GitHub repo to be PUBLIC. Ours is.
@@ -703,6 +703,7 @@ function attachSquirrelProgressForwarders(): void {
 export function rememberPendingDownloadVersion(version: string | undefined): void {
   if (typeof version === 'string' && version.length > 0) {
     pendingDownloadVersion = version;
+    checkForUpdatesInBackground('release-available'); // A blind native check returns HTTP 404 when this locally installed build is newer than the public release, which Squirrel presents as an alarming invalid-response banner; only start Squirrel after GitHub has proved a newer release exists. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
   }
 }
 
@@ -1120,7 +1121,18 @@ export function triggerSquirrelDownload(): StartDownloadResult {
  * said the bundle was staged. Calling checkForUpdates again had invalidated
  * Squirrel's native staged-install slot.
  */
-function checkForUpdatesInBackground(origin: 'startup' | 'interval'): boolean {
+function checkForUpdatesInBackground(
+  origin: 'release-available' | 'startup' | 'interval',
+): boolean {
+  if (
+    !feedURLReady ||
+    !isNewerVersion(pendingDownloadVersion, app.getVersion())
+  ) {
+    log.info(
+      `[updater] skipping ${origin} background check — GitHub has not reported a newer release`,
+    );
+    return false;
+  }
   if (updateDownloaded) {
     log.info(`[updater] skipping ${origin} background check — update is staged`);
     return false;
