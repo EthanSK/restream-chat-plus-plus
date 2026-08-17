@@ -11,6 +11,42 @@ export type Platform =
   | 'x'
   | 'unknown';
 
+export type DirectChatProvider = 'twitch' | 'kick';
+
+export type ChatSendDestination = 'restream' | DirectChatProvider;
+
+export interface DirectChatSendResult {
+  ok: boolean;
+  status?: number;
+  error?: string;
+  messageId?: string;
+  authorizationRequired?: boolean;
+}
+
+export interface ChatSendDestinationResult extends DirectChatSendResult {
+  destination: ChatSendDestination;
+}
+
+export type DirectChatConnectionStatus =
+  | 'not-configured'
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'error';
+
+/** One direct platform chat source that supplements Restream's combined feed. */
+export interface DirectChatConnection {
+  provider: DirectChatProvider;
+  status: DirectChatConnectionStatus;
+  accountName?: string;
+  /** Official per-provider live state, independent of Restream's destination list. */
+  isLive?: boolean;
+  /** Concurrent viewers reported by the provider while `isLive` is true. */
+  viewerCount?: number;
+  detail?: string;
+  lastError?: string;
+}
+
 export interface ChatMessage {
   id: string;
   platform: Platform;
@@ -18,6 +54,8 @@ export interface ChatMessage {
   text: string;
   ts: number; // epoch ms
   color?: string;
+  /** Identifies the transport so the main process can drop only cross-source duplicates. */
+  source?: 'restream' | 'twitch-direct' | 'kick-direct';
   raw?: unknown;
   /**
    * True when the message was originated by the local user — produced by
@@ -495,6 +533,14 @@ export const IPC = {
   CONNECTIONS: 'connections:list',
   /** Pull-fetch counterpart so the renderer can sync on mount. */
   CONNECTIONS_GET: 'connections:get',
+  /** Main → renderer snapshot of the direct Twitch and Kick chat sources. */
+  DIRECT_CHAT_CONNECTIONS: 'direct-chat:connections',
+  /** Pull-fetch counterpart for renderer mount races. */
+  DIRECT_CHAT_CONNECTIONS_GET: 'direct-chat:connections:get',
+  /** Renderer → main request to authorize and start one direct source. */
+  DIRECT_CHAT_CONNECT: 'direct-chat:connect',
+  /** Renderer → main request to revoke and stop one direct source. */
+  DIRECT_CHAT_DISCONNECT: 'direct-chat:disconnect',
   /**
    * v0.1.94 — LIVE VIEWER COUNT push channel, main → renderer. Fires with a
    * `ViewerStatsSnapshot` (see src/shared/viewer-stats-core.ts for the full
@@ -1128,9 +1174,13 @@ export interface SendTextResult {
     | 'no-active-connections'
     | 'no-show-id'
     | 'send-failed'
+    | 'destination-send-failed'
+    | 'provider-authorization-required'
     | 'error';
   status?: number;
   error?: string;
+  /** One result per frozen destination so retries never duplicate a destination that already accepted the message. */
+  destinations?: ChatSendDestinationResult[];
 }
 
 /**
@@ -1197,4 +1247,6 @@ export interface ChatSendStatus {
    * `attempt` for the "(retry N/M)" affordance.
    */
   maxAttempts?: number;
+  /** Delivery evidence for each intended destination, including partial failures. */
+  destinations?: ChatSendDestinationResult[];
 }

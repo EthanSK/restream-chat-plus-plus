@@ -6,6 +6,8 @@ import {
   ChatConnection,
   ChatMessage,
   ConnectionState,
+  DirectChatConnection,
+  DirectChatProvider,
   DEFAULT_SETTINGS,
   NativeVoiceWire,
   Platform,
@@ -22,7 +24,7 @@ import {
   reduceAuthBootOnStatus,
   shouldRenderBootOverlay,
 } from './auth-bootstate';
-import { ChannelsPanel } from './ChannelsPanel';
+import { ChatSourcesBar } from './ChatSourcesBar';
 import { ChatFeed } from './ChatFeed';
 import { ChatInputInline } from './ChatInputInline';
 import {
@@ -53,6 +55,7 @@ import {
 import {
   applyFailedSendStatus,
   applyRetryingSendStatus,
+  applySentSendStatus,
   dedupeOptimisticOnEcho,
   isLateEchoForFailedSend,
   pushOptimisticMessage,
@@ -110,6 +113,7 @@ export function App(): React.ReactElement {
   );
   const [conn, setConn] = useState<ConnectionState>({ status: 'idle', attempt: 0 });
   const [connections, setConnections] = useState<ChatConnection[]>([]);
+  const [directConnections, setDirectConnections] = useState<DirectChatConnection[]>([]);
   // v0.1.94 — latest live-viewer snapshot (null until the first push/pull
   // lands; the ViewerCount chip renders nothing for null OR not-live).
   const [viewerStats, setViewerStats] = useState<ViewerStatsSnapshot | null>(
@@ -237,7 +241,14 @@ export function App(): React.ReactElement {
 
   const clearOptimisticSendTimeout = (
     clientId: string,
-    reason: 'echo' | 'failed-status' | 'replace' | 'clear-chat' | 'sign-out' | 'unmount',
+    reason:
+      | 'echo'
+      | 'sent-status'
+      | 'failed-status'
+      | 'replace'
+      | 'clear-chat'
+      | 'sign-out'
+      | 'unmount',
   ): void => {
     const timeout = optimisticSendTimeoutsRef.current.get(clientId);
     if (!timeout) return;
@@ -422,6 +433,13 @@ export function App(): React.ReactElement {
       } catch (err) {
         console.error('[App] failed to fetch initial connections', err);
       }
+      try {
+        const initialDirectConnections = await rcpp.getDirectChatConnections?.();
+        if (!alive) return;
+        if (initialDirectConnections) setDirectConnections(initialDirectConnections);
+      } catch (err) {
+        console.error('[App] failed to fetch direct chat connections', err);
+      }
       // v0.1.94 — pull-fetch the current viewer-stats snapshot for the same
       // mount-race reason as connections above. Optional-chained so an older
       // preload (or a test's partial window.rcpp mock) without the method
@@ -453,6 +471,8 @@ export function App(): React.ReactElement {
     const offAuth = rcpp.onAuthStatus(applyAuthStatus);
     const offConn = rcpp.onConnectionState(setConn);
     const offConnections = rcpp.onConnections(setConnections);
+    const offDirectConnections =
+      rcpp.onDirectChatConnections?.(setDirectConnections) ?? (() => undefined);
     // v0.1.94 — live viewer-count pushes. Optional-chained (see the pull
     // above); falls back to a no-op unsubscriber for old preloads/mocks.
     const offViewerStats =
@@ -526,22 +546,22 @@ export function App(): React.ReactElement {
     });
     // v0.1.43 — listen for queue lifecycle updates and flip the matching
     // optimistic placeholder. `pending` is a no-op (the placeholder is
-    // already in the feed from the click handler). `sent` doesn't touch
-    // state either — the WS echo replaces the placeholder via the
-    // dedupe path above. `failed` keeps the placeholder visible with a
-    // small ⚠ + tooltip carrying the error.
+    // already in the feed from the click handler). `sent` confirms the local
+    // row after every frozen destination accepted it; provider self-echoes are
+    // suppressed in main so they cannot duplicate that row. `failed` keeps the
+    // placeholder visible with a small ⚠ + tooltip carrying the error.
     const offSendStatus = rcpp.onChatSendStatus((status) => {
       // v0.1.88 (voice 4504): record HTTP-200 sends so the reconnect-success
       // sweep can tell "Restream accepted this POST (it WILL deliver once we
       // re-subscribe)" from "this send genuinely never landed". The queue emits
-      // `'sent'` ONLY on a 2xx POST (see chat-send-queue.ts `result.ok` path),
-      // so it's the authoritative HTTP-200 signal. `'pending'` is the enqueue
-      // ack (no POST yet) and is ignored. We track the clientId here rather
-      // than touching the feed — `'sent'` does NOT replace the placeholder (the
-      // WS echo does that); it only tells us the POST succeeded, which is
-      // exactly the gate the sweep needs. Capped to avoid unbounded growth on a
-      // long stream (drop oldest-inserted; Set preserves insertion order).
+      // `'sent'` ONLY after every frozen destination succeeds (see the fan-out
+      // result returned through chat-send-queue.ts), so it is authoritative.
+      // Confirm the optimistic row immediately; also retain the clientId in the
+      // legacy reconnect-sweep evidence set. Capped to avoid unbounded growth
+      // on a long stream (drop oldest-inserted; Set preserves insertion order).
       if (status.status === 'sent') {
+        clearOptimisticSendTimeout(status.clientId, 'sent-status');
+        setMessages((prev) => applySentSendStatus(prev, status));
         const set = httpOkSendsRef.current;
         set.add(status.clientId);
         if (set.size > HTTP_OK_SENDS_MAX) {
@@ -697,6 +717,7 @@ export function App(): React.ReactElement {
       offAuth();
       offConn();
       offConnections();
+      offDirectConnections();
       offViewerStats();
       offChat();
       offSendStatus();
@@ -1189,7 +1210,6 @@ export function App(): React.ReactElement {
             </svg>
           </button>
         )}
-        {auth.authenticated && <ChannelsPanel connections={connections} />}
         {/*
          * v0.1.94 — LIVE VIEWER COUNT chip (like the official Restream chat
          * app). Sits next to the channels panel so "who's connected" and
@@ -1257,9 +1277,26 @@ export function App(): React.ReactElement {
           </button>
         )}
       </div>
+      <ChatSourcesBar
+        restreamAuth={auth}
+        restreamConnection={conn}
+        restreamChannels={connections}
+        directConnections={directConnections}
+        onDirectConnect={async (provider: DirectChatProvider) => {
+          const next = await rcpp.connectDirectChat(provider);
+          setDirectConnections(next);
+        }}
+        onDirectDisconnect={async (provider: DirectChatProvider) => {
+          const next = await rcpp.disconnectDirectChat(provider);
+          setDirectConnections(next);
+        }}
+      />
       <ChatFeed
         messages={visibleMessages}
-        authenticated={auth.authenticated}
+        authenticated={
+          auth.authenticated ||
+          directConnections.some((connection) => connection.status === 'connected')
+        }
         connection={conn}
         // v0.1.91 — per-row hover affordance fires this callback with the
         // author's username. App.tsx owns the settings + persists the

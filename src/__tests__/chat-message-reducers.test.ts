@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   applyFailedSendStatus,
   applyRetryingSendStatus,
+  applySentSendStatus,
   dedupeOptimisticOnEcho,
   formatPendingError,
   pushOptimisticMessage,
@@ -196,6 +197,22 @@ describe('applyFailedSendStatus', () => {
     expect(next[0].sendAttempt).toBeUndefined();
     expect(next[0].sendMaxAttempts).toBeUndefined();
     expect(next[0].pendingError).toBe('exhausted');
+  });
+});
+
+describe('applySentSendStatus', () => {
+  it('confirms the optimistic row after every fan-out destination accepts it', () => {
+    const next = applySentSendStatus([placeholder('local-x')], {
+      clientId: 'local-x',
+      status: 'sent',
+      destinations: [
+        { destination: 'restream', ok: true },
+        { destination: 'twitch', ok: true },
+        { destination: 'kick', ok: true },
+      ],
+    });
+    expect(next[0]).toMatchObject({ id: 'local-x', self: true });
+    expect(next[0].pendingSend).toBeUndefined();
   });
 });
 

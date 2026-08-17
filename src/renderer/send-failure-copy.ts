@@ -44,6 +44,12 @@ export function formatSendFailureTooltip(status: ChatSendStatus): string {
  * message is wrong", so they deserve a visible app-level nudge.
  */
 export function sendFailureNoticeText(status: ChatSendStatus): string | undefined {
+  if (
+    status.reason === 'destination-send-failed' ||
+    status.reason === 'provider-authorization-required'
+  ) {
+    return status.error ?? 'One or more chat destinations failed.';
+  }
   if (status.reason === 'no-session-cookies') {
     return SEND_SESSION_EXPIRED_TEXT;
   }

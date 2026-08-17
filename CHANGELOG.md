@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.1.101 — direct chat liveness recovery (2026-08-17)
+
+### What's fixed
+
+- **Twitch and Kick no longer stay falsely green after their inbound sockets go
+  stale.** Twitch watches the EventSub keepalive stream and Kick sends an
+  application heartbeat to the existing signed relay. Either source now
+  reconnects automatically when its inbound transport stops responding.
+- **Reconnect refreshes all chat sources.** The existing toolbar button now
+  rebuilds Restream, Twitch, and Kick connections together while preserving
+  the direct-provider authorizations.
+- **Direct chat has a dedicated forensic log.** `direct-chat.jsonl` records
+  provider lifecycle, heartbeat, received-message IDs, forwarding, and
+  outgoing-self-echo suppression without logging message text or credentials.
+
+### Guard
+
+- Added regression tests for a silent Twitch EventSub socket, a silent Kick
+  relay, and a healthy Kick relay answering pongs. All 754 app tests and the
+  relay signature test pass, both TypeScript projects typecheck, and lint has
+  zero errors (pre-existing warnings only).
+
+## v0.1.100 — direct Twitch and Kick sending (2026-08-15)
+
+### What's new
+
+- **One Chat++ message now reaches every connected route.** Restream continues
+  to send to its active destinations, while Twitch and Kick receive the same
+  message through their official direct APIs when they are connected directly.
+- **Retries cannot duplicate a confirmed destination.** The target list is
+  frozen per message and each successful destination is remembered; only the
+  failed destinations run again. Direct Twitch/Kick sends are skipped when the
+  same platform is already active through Restream.
+- **Direct authorization includes sending.** Twitch now requests
+  `user:write:chat`; Kick requests `chat:write`. Existing read-only tokens are
+  rejected with a clear reconnect instruction rather than failing silently.
+- **Kick no longer requests account email access.** Channel identity now comes
+  from Kick's authenticated channel endpoint, so direct chat needs only
+  `channel:read`, `events:subscribe`, and `chat:write`.
+- **Kick validates the effective grant returned by token introspection.** An
+  incomplete token-exchange scope no longer discards an otherwise valid grant,
+  while a genuinely missing permission names the exact scope Kick omitted.
+- **Twitch device authorization survives brief network loss.** A failed token
+  poll remains pending until Twitch answers or the device code expires instead
+  of throwing away an authorization the user already approved.
+- **Partial delivery is visible.** A failed destination names itself and any
+  already-successful destinations in the message warning and app notice.
+
+### Guard
+
+- Added fan-out, retry isolation, official API payload, authorization-failure,
+  optimistic-confirmation, connection-panel, Kick-scope, and least-privilege Kick identity tests. All 751 tests pass,
+  typecheck is clean, and lint reports zero errors (pre-existing warnings only).
+
+## v0.1.99 — direct Twitch and Kick viewer counts (2026-08-15)
+
+### What's new
+
+- **Twitch and Kick show separate live viewer counts.** Each direct source chip
+  and connection row displays the count reported by that provider rather than
+  folding it into Restream's aggregate.
+- **Counts follow the direct connection lifecycle.** Twitch polls Helix and Kick
+  polls its public livestream endpoint every 30 seconds only while that source
+  is connected. An offline channel says `Stream offline`; a transient polling
+  failure preserves the last confirmed state without disconnecting chat.
+- **The Restream viewer breakdown stays inside the app window.** Its panel now
+  anchors to the full toolbar instead of the viewer chip, so adding or wrapping
+  header controls cannot clip the platform names off the left edge.
+
+### Guard
+
+- Added provider-response parser and connection-row tests. The full local suite
+  passes 737/737 tests, typecheck is clean, and lint reports zero errors.
+
+## v0.1.98 — direct Twitch and Kick chat sources (2026-08-14)
+
+### What's new
+
+- **Twitch and Kick can feed the combined timeline without being enabled as
+  Restream destinations.** A compact Chat sources row shows Restream, Twitch,
+  and Kick separately and opens one connection panel with account names,
+  health, Connect, and Disconnect controls.
+- **Direct messages use the same feed, filters, notifications, and TTS.** The
+  main process drops only messages duplicated between Restream and a direct
+  source; intentional repeated messages from one source remain visible.
+- **Provider authorization is secure and persistent.** Twitch uses its public
+  Device Code flow and EventSub WebSocket. Kick uses OAuth PKCE plus its signed
+  public webhook API; access and refresh tokens are encrypted through the OS
+  keyring, while developer credentials stay in Keychain or environment
+  variables.
+- **Kick's webhook bridge rejects unsigned traffic.** The included Cloudflare
+  Worker verifies Kick's official RSA signature before relaying chat over an
+  authenticated WebSocket, and briefly replays recent verified messages after
+  a desktop reconnect.
+
+### Guard
+
+- Added source normalizer, cross-source deduplication, authorization-state,
+  and connection-panel tests. The relay separately typechecks and rejects a
+  forged webhook signature in its test suite.
+
 ## v0.1.92 — updater clicks always produce visible feedback (2026-06-22)
 
 Ethan:

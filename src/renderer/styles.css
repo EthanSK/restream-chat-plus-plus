@@ -130,6 +130,7 @@ body {
 }
 
 .toolbar {
+  position: relative;
   display: flex;
   /* flex-wrap: wrap so the header items wrap onto a new row instead of being
    * clipped when they overflow horizontally.
@@ -457,6 +458,102 @@ body {
 
 .toolbar .spacer { flex: 1; }
 
+.chat-sources-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #121820;
+}
+.chat-sources-label {
+  margin-right: 2px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-1);
+  color: var(--text-1);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.source-chip:hover { background: var(--bg-2); color: var(--text-0); }
+.source-twitch { border-color: rgba(145, 70, 255, 0.45); }
+.source-kick { border-color: rgba(83, 252, 24, 0.38); }
+.source-viewers {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.source-status {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.source-status.connected { background: var(--ok); }
+.source-status.connecting,
+.source-status.reconnecting { background: var(--warn); animation: pulse 1.2s infinite ease-in-out; }
+.source-status.error { background: var(--danger); }
+.source-status.not-configured { background: var(--text-3); }
+.chat-sources-help {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.chat-sources-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 12px;
+  width: min(430px, calc(100vw - 24px));
+  max-height: 70vh;
+  z-index: 900;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.chat-source-list { padding: 4px; }
+.chat-source-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 48px;
+  padding: 7px 8px;
+  border-bottom: 1px solid #1c2128;
+}
+.chat-source-row:last-child { border-bottom: 0; }
+.chat-source-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+}
+.chat-source-copy strong { color: var(--text-0); font-size: 12px; }
+.chat-source-copy span { color: var(--text-2); font-size: 11px; overflow-wrap: anywhere; }
+.chat-source-copy .chat-source-viewers { color: var(--text-1); font-variant-numeric: tabular-nums; }
+.chat-source-row .btn { flex: 0 0 auto; }
+.chat-sources-foot {
+  margin: 0;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
 /*
  * v0.1.94 — LIVE VIEWER COUNT chip (toolbar, next to the channels panel).
  * v0.1.95 — chip upgraded from a passive indicator to a CLICKABLE trigger
@@ -469,8 +566,7 @@ body {
  * needed. tabular-nums stops the toolbar shifting as the count ticks.
  */
 .viewer-count-panel {
-  /* Anchor for the absolutely-positioned popover (same as .channels-panel). */
-  position: relative;
+  position: static; /* Anchor the popover to the whole toolbar so moving the viewer chip left cannot push the fixed-width panel past the window edge. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe) */
   -webkit-app-region: no-drag;
   flex: 0 0 auto;
 }
@@ -508,11 +604,7 @@ body {
 .viewer-popover {
   position: absolute;
   top: calc(100% + 6px);
-  /* The viewer chip lives in the toolbar's right-hand cluster. Anchoring the
-   * popover from its LEFT edge made the panel grow out past the window's
-   * right edge, clipping the Total value, close button, pills, and counts.
-   * Open inward from the chip's right edge so the entire panel stays visible. */
-  right: 0;
+  right: 12px;
   left: auto;
   width: min(280px, calc(100vw - 24px));
   max-height: 60vh;

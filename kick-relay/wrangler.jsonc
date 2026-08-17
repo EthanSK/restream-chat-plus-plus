@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "restream-chat-plus-plus-kick-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-14",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT_RELAY",
+        "class_name": "KickChatRelay"
+      }
+    ]
+  },
+  "exports": {
+    "KickChatRelay": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

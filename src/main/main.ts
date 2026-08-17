@@ -21,6 +21,7 @@ import {
   type ChatContext,
 } from './chat-send';
 import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
+import { createChatSendFanout } from './chat-send-fanout';
 import { resumeAuthWithCookieRepair } from './startup-auth-resume';
 // v0.1.70 (sign-out diagnosis 2026-05-25) — transient-refresh-retry
 // watchdog. Factored out of main.ts so the exponential-backoff state
@@ -56,6 +57,8 @@ import { startInProcessMcpServer } from './mcp-server';
 // v0.1.94 — live viewer count (streaming-updates WS client; see
 // src/shared/viewer-stats-core.ts for the data-source contract).
 import { ViewerStatsClient } from './viewer-stats';
+import { CrossSourceDeduper } from './cross-source-deduper';
+import { DirectChatSources } from './direct-chat-sources';
 import {
   NativeTtsEngine,
   ttsToNativeSettings,
@@ -81,6 +84,8 @@ import {
   ConnectionState,
   ChatSendEnqueuePayload,
   ChatSendStatus,
+  ChatMessage,
+  DirectChatProvider,
   NativeVoiceWire,
   SendTextResult,
   SilenceUserResult,
@@ -92,6 +97,11 @@ import {
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
+
+function parseDirectChatProvider(value: unknown): DirectChatProvider {
+  if (value === 'twitch' || value === 'kick') return value;
+  throw new Error('Unknown direct chat provider.');
+}
 
 // ---------------------------------------------------------------------------
 // Renderer background-throttling switches (kept; rationale updated v0.1.81).
@@ -765,6 +775,9 @@ app.on('ready', async () => {
   const store = await createStore();
   const oauth = new OAuthCoordinator(store);
   const chat = new ChatClient();
+  const directChat = new DirectChatSources(store);
+  const crossSourceDeduper = new CrossSourceDeduper();
+  const ownOutgoingClientIds = new Set<string>();
   // v0.1.94 — LIVE VIEWER COUNT. Second, independent WebSocket client for
   // Restream's "Streaming Updates" feed (wss://streaming.api.restream.io/ws)
   // which carries per-channel `viewers` numbers the chat WS does NOT have.
@@ -889,6 +902,10 @@ app.on('ready', async () => {
     try {
       mainWindow?.webContents.send(IPC.CONN_STATE, chat.getState());
       mainWindow?.webContents.send(IPC.CONNECTIONS, chat.getConnections());
+      mainWindow?.webContents.send(
+        IPC.DIRECT_CHAT_CONNECTIONS,
+        directChat.getConnections(),
+      );
       // v0.1.94 — same mount-race fix for the viewer count: push the current
       // snapshot so a reloaded renderer paints 👁 immediately instead of
       // waiting for the next updateStatuses frame (~30s apart while live).
@@ -1018,6 +1035,18 @@ app.on('ready', async () => {
   // calls this on mount to sync to the current truth (avoids the "stuck on
   // 'idle' because state transitioned before listener attached" bug).
   ipcMain.handle(IPC.CONN_STATE_GET, (): ConnectionState => chat.getState());
+
+  ipcMain.handle(IPC.DIRECT_CHAT_CONNECTIONS_GET, () =>
+    directChat.getConnections(),
+  );
+  ipcMain.handle(
+    IPC.DIRECT_CHAT_CONNECT,
+    async (_event, provider: unknown) => directChat.connect(parseDirectChatProvider(provider)),
+  );
+  ipcMain.handle(
+    IPC.DIRECT_CHAT_DISCONNECT,
+    async (_event, provider: unknown) => directChat.disconnect(parseDirectChatProvider(provider)),
+  );
 
   // ----- v0.1.94: live viewer count (streaming-updates WS) -----
   // Push every aggregate change to the renderer; the pull handler covers the
@@ -1465,7 +1494,10 @@ app.on('ready', async () => {
   // Wires the manual button to the SAME performFullReconnect function
   // the auto-retry path uses. v0.1.45.
   ipcMain.handle(IPC.CONN_RECONNECT, async () => {
-    const out = await performFullReconnect();
+    const [out] = await Promise.all([
+      performFullReconnect(),
+      directChat.reconnect(), // The toolbar refresh used to repair Restream only, leaving green-but-deaf direct sockets untouched after network loss. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
+    ]);
     if (out.ok) {
       // v0.1.88 (voice 4504): the MANUAL Reconnect button just succeeded —
       // re-subscribe is in flight. Tell the renderer so it sweeps + clears any
@@ -2208,9 +2240,9 @@ app.on('ready', async () => {
   //   - A failure on one send NEVER blocks subsequent sends.
   //   - The renderer renders the optimistic placeholder from the click
   //     handler immediately; the queue's `pending` status is a no-op
-  //     confirmation. `sent` lets the renderer downgrade any "sending…"
-  //     affordance (the WS echo, matched by clientReplyUuid → id, is
-  //     what actually replaces the placeholder in the feed). `failed`
+  //     confirmation. `sent` confirms the placeholder after every frozen
+  //     destination accepts the message. Provider self-echoes are suppressed
+  //     because that confirmed local row is the one visible copy. `failed`
   //     keeps the placeholder + paints a small ⚠ with the error in
   //     a tooltip.
   const emitSendStatus = (status: ChatSendStatus): void => {
@@ -2220,8 +2252,11 @@ app.on('ready', async () => {
       console.error('[main] CHAT_SEND_STATUS emit failed', err);
     }
   };
-  const sendQueue: ChatSendQueue = createChatSendQueue({
-    runSend: async (item) => {
+  const sendFanout = createChatSendFanout({
+    getRestreamConnections: () => chat.getConnections(),
+    getDirectConnections: () => directChat.getConnections(),
+    sendDirect: (provider, text) => directChat.send(provider, text),
+    sendRestream: async (item) => {
       // Per-send auth gate: chat.getConnections() / oauth state can drift
       // between enqueue and actual POST (sign-out, token expiry). Re-check
       // here so a stale enqueue doesn't 401 against Restream.
@@ -2262,6 +2297,9 @@ app.on('ready', async () => {
         uuid: () => item.clientId,
       });
     },
+  });
+  const sendQueue: ChatSendQueue = createChatSendQueue({
+    runSend: (item) => sendFanout.send(item),
     emitStatus: emitSendStatus,
     // Keep the 1 msg/sec spacing the v0.1.42 IPC gate enforced. This
     // protects against Restream's own throttle on rapid spam.
@@ -2284,11 +2322,20 @@ app.on('ready', async () => {
     // failure (lapsed token / drained connections / lost cookies / un-sniffed
     // showId) have been refreshed. We don't gate the retry on its success;
     // `performFullReconnect` already returns `{ ok }` so the loop just logs it.
-    reconnectBetweenRetries: async (reason) => {
-      // `reason` is the failure-class label (e.g. 'send-retry:no-session-cookies')
-      // — kept for future per-reason reconnect tuning; performFullReconnect is
-      // currently reason-agnostic. Swallow void to satisfy the unused param.
+    reconnectBetweenRetries: async (reason, result) => {
+      // `reason` remains in the queue contract for logging. Direct-only
+      // retries must not churn the healthy Restream socket; reconnect it only
+      // when Restream itself is one of the failed destinations.
       void reason;
+      if (
+        result.destinations &&
+        !result.destinations.some(
+          (destination) =>
+            destination.destination === 'restream' && !destination.ok,
+        )
+      ) {
+        return { ok: true };
+      }
       const out = await performFullReconnect();
       return { ok: out.ok };
     },
@@ -2308,6 +2355,11 @@ app.on('ready', async () => {
       }
       const text = payload.text.trim();
       if (!text) return;
+      ownOutgoingClientIds.add(payload.clientId);
+      if (ownOutgoingClientIds.size > 2_000) {
+        const oldest = ownOutgoingClientIds.values().next().value;
+        if (oldest !== undefined) ownOutgoingClientIds.delete(oldest);
+      }
       sendQueue.enqueue({ clientId: payload.clientId, text });
     } catch (err) {
       console.error('[main] CHAT_SEND_ENQUEUE handler failed', err);
@@ -2442,9 +2494,27 @@ app.on('ready', async () => {
   // Order: forward to the feed FIRST (so the row appears), then dispatch TTS.
   // handleMessage is wrapped in its own try/catch internally so a dispatch
   // error can never break the feed forward.
-  chat.on('message', (m) => {
-    mainWindow?.webContents.send(IPC.CHAT_MESSAGE, m);
-    ttsDispatcher.handleMessage(m);
+  const forwardChatMessage = (message: ChatMessage): void => {
+    if (
+      message.source === 'restream' &&
+      message.self === true &&
+      ownOutgoingClientIds.has(message.id)
+    ) {
+      return;
+    }
+    if (!crossSourceDeduper.shouldEmit(message)) return;
+    mainWindow?.webContents.send(IPC.CHAT_MESSAGE, message);
+    ttsDispatcher.handleMessage(message);
+  };
+  chat.on('message', (message) =>
+    forwardChatMessage({ ...message, source: 'restream' }),
+  );
+  directChat.on('message', forwardChatMessage);
+  directChat.on('state', (connections) =>
+    mainWindow?.webContents.send(IPC.DIRECT_CHAT_CONNECTIONS, connections),
+  );
+  void directChat.start().catch((err) => {
+    console.error('[main] direct chat source startup failed', err);
   });
   chat.on('state', (s) => mainWindow?.webContents.send(IPC.CONN_STATE, s));
   chat.on('connections', (cs) =>
@@ -2630,6 +2700,7 @@ app.on('ready', async () => {
   // Clear on quit so the timer doesn't keep the event loop alive past
   // shutdown (Node would otherwise wait the full 24 h before exiting).
   app.on('before-quit', () => {
+    directChat.stop();
     clearInterval(pruneInterval);
   });
 });

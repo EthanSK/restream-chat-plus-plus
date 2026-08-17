@@ -100,13 +100,18 @@ function clickChip(r: TestRenderer.ReactTestRenderer): void {
 }
 
 describe('ViewerCount popover layout', () => {
-  it('anchors inward from the chip right edge so totals and controls are not clipped', () => {
+  it('anchors to the toolbar so every column stays inside the window when the chip moves left', () => {
     const css = readFileSync(
       new URL('../renderer/styles.css', import.meta.url),
       'utf8',
     );
+    const toolbarRule = css.match(/\.toolbar\s*\{([^}]*)\}/s)?.[1] ?? '';
+    const panelRule =
+      css.match(/\.viewer-count-panel\s*\{([^}]*)\}/s)?.[1] ?? '';
     const rule = css.match(/\.viewer-popover\s*\{([^}]*)\}/s)?.[1] ?? '';
-    expect(rule).toMatch(/right:\s*0\s*;/);
+    expect(toolbarRule).toMatch(/position:\s*relative\s*;/);
+    expect(panelRule).toMatch(/position:\s*static\s*;/);
+    expect(rule).toMatch(/right:\s*12px\s*;/);
     expect(rule).toMatch(/left:\s*auto\s*;/);
     expect(rule).not.toMatch(/left:\s*0\s*;/);
   });

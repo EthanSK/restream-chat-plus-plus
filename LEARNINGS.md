@@ -24,6 +24,96 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-17T12:20:00Z
+**Trigger:** Ethan: "messages sent from Twitch don't show up in Restream Chat++ ... same with Kick"
+**Symptom:** Chat++ could send to Twitch and Kick, both direct-source chips stayed green, and both provider viewer counts updated, but messages originating on either platform no longer reached the combined feed.
+**Root cause:** Direct send, direct receive, and viewer count use separate transports. The direct-source status was set to `connected` when Twitch EventSub or the Kick relay socket opened, but neither source had a liveness guard that could revoke that green state after a network interruption left the socket open but no longer delivering inbound data. The current app had experienced repeated DNS/offline failures, while the independently polled provider viewer APIs later recovered, so the counts did not prove the chat sockets were healthy. The old build also had no direct-source lifecycle/frame log, which prevented proving the exact last provider frame after the fact.
+**Fix:** v0.1.101 adds a 75-second Twitch EventSub inbound watchdog, a 30-second Kick relay application heartbeat with a two-miss budget, automatic forced reconnect through the existing token-preserving source lifecycle, and `direct-chat.jsonl` lifecycle/message-forwarding evidence. The toolbar Reconnect action now refreshes Restream plus every currently active direct source without revoking Twitch or Kick authorization.
+**Commit:** working-tree implementation
+**Guard:** `direct-chat-liveness.test.ts` reproduces a green Twitch source with no keepalives, a green Kick source with no pong, and a healthy Kick relay that continues answering. All 754 app tests and the relay signature test pass, both TypeScript projects typecheck, and lint reports zero errors (pre-existing warnings only). Do not treat viewer polling or a last-known green socket-open state as proof that inbound provider chat is live.
+---
+
+---
+**Date:** 2026-08-15T17:08:00Z
+**Trigger:** Live Twitch and Kick account setup for direct read and send chat.
+**Symptom:** One transient Twitch token-poll fetch failure abandoned an otherwise valid device authorization. Kick's consent screen also disclosed that the requested `user:read` scope included the account email even though Chat++ only needed broadcaster identity. After approving the narrowed Kick grant, Chat++ returned to Disconnected before contacting the channel or relay because the token-exchange scope did not satisfy its local permission check.
+**Root cause:** Twitch's Device Code poll treated transport failure as a terminal OAuth reply. Kick loaded identity from `GET /public/v1/users`, which requires the broader `user:read` scope; Kick's authenticated `GET /public/v1/channels` already returns the broadcaster ID and slug under `channel:read`. Chat++ also treated the token-exchange response as the authoritative effective Kick grant even though Kick documents token introspection as the endpoint that reports an active token's scopes.
+**Fix:** v0.1.100 keeps Twitch polling after transport errors until the device code expires, removes Kick `user:read`, derives Kick identity from authenticated channel data, and updates the encrypted token's scope from successful introspection before checking permissions. A genuinely missing grant now names the omitted scope rather than falling back to assumed access.
+**Commit:** working-tree implementation
+**Guard:** Kick scope tests reject assumed permissions and pin explicit missing-grant reporting; the identity parser test pins the channel response contract and README pins the minimum scopes. Keep OAuth scopes to the least privilege supported by official provider endpoints; do not restore `user:read` merely to fetch the same broadcaster ID.
+---
+
+---
+**Date:** 2026-08-15T14:33:14Z
+**Trigger:** Ethan: "my messages should also go to Kick and Twitch etc not just read from them"
+**Symptom:** Direct Twitch and Kick connections could populate the combined timeline, but the composer still posted only through Restream. Because those destinations were deliberately disabled in Restream, a Chat++ reply never reached them.
+**Root cause:** v0.1.98 deliberately stopped at receive-only provider adapters. The outgoing queue had a single Restream sender, its optimistic confirmation depended on Restream's WebSocket echo, and it had no per-destination progress to prevent duplicate sends after partial failure.
+**Fix:** v0.1.100 adds official Twitch `POST /helix/chat/messages` and Kick `POST /public/v1/chat` senders, requests their write scopes, and fans one queued message out to Restream plus eligible direct providers. The target set freezes on the first attempt and confirmed successes persist across automatic and manual retries. Provider self-echoes are suppressed while the renderer confirms the original optimistic row from the aggregate send result.
+**Commit:** working-tree implementation
+**Guard:** Fan-out tests pin target selection and retry isolation; provider tests pin official request bodies and authorization errors; the optimistic reducer test pins direct confirmation without an echo. Never send directly to Twitch or Kick when Restream already reports that same platform connected, or one composer action will appear twice there. All 751 tests pass, typecheck is clean, and lint reports zero errors (pre-existing warnings only).
+---
+
+---
+**Date:** 2026-08-15T12:53:09Z
+**Trigger:** Ethan: "also the normal view count is now cut off"
+**Symptom:** Opening the existing Restream live-viewer breakdown after adding the Chat sources row clipped the panel's heading, platform names, and channel identifiers against the app window's left edge; counts and live pills remained visible.
+**Root cause:** v0.1.96 correctly changed the panel from left-opening to right-opening, but it still positioned the 280px panel relative to the small viewer chip. Later header controls moved that chip left far enough that a trigger-relative panel extended beyond the viewport on the current scaled macOS window.
+**Fix:** v0.1.99 makes the toolbar the containing block and the viewer-count wrapper position-neutral, then places the breakdown 12px inside the toolbar's right edge. The panel therefore stays inside the window regardless of where wrapping or added controls place the trigger.
+**Commit:** working-tree implementation
+**Guard:** `viewer-count.test.tsx` requires the toolbar containing block, neutral trigger wrapper, and 12px right inset. All 13 focused viewer-count tests and typecheck pass.
+---
+
+---
+**Date:** 2026-08-15T12:37:56Z
+**Trigger:** Ethan: "set it up both twitch and kick. also we should be able to see the view count for each individually"
+**Symptom:** The direct Twitch and Kick source controls showed connection health but no provider-specific audience count, while Restream's existing viewer total could not represent destinations disabled in Restream.
+**Root cause:** Direct chat and Restream viewer statistics are independent transports. Twitch exposes `viewer_count` through Helix Get Streams, and Kick exposes its own `viewer_count` through the authenticated user-livestream endpoint; neither value arrives in the direct chat event stream.
+**Fix:** v0.1.99 polls each provider's official live endpoint every 30 seconds while its direct chat source is connected and carries that provider's independent live state/count through `DirectChatConnection` into the source chip and connection panel. An empty stream result means offline; a polling error preserves the last confirmed value and never disconnects chat.
+**Commit:** working-tree implementation
+**Guard:** Parser tests cover offline and numeric live responses for both providers; the source-row test proves simultaneous Twitch and Kick counts stay separate. The full suite passes 737/737 tests, typecheck is clean, and lint reports zero errors.
+---
+
+---
+**Date:** 2026-08-14T19:27:00Z
+**Trigger:** Local v0.1.98 installation for offline Twitch/Kick connection verification.
+**Symptom:** The manually signed app passed `codesign --verify --deep --strict` but terminated at launch with a dyld `Library missing` crash. The crash report named `libffmpeg.dylib` and said the mapped file and process had different Team IDs.
+**Root cause:** Raw `codesign --force --deep` signed the outer Electron bundle but left Electron's vendor-signed nested `libffmpeg.dylib` under a different Team ID. Deep verification alone did not prove that hardened-runtime library loading would accept every nested binary.
+**Fix:** Repackage a clean arm64 app and sign it with `@electron/osx-sign.signAsync`, using the Developer ID identity, hardened runtime, and project entitlements. Reinstall the newly signed bundle only after both the outer app and `libffmpeg.dylib` reported Team ID `T34G959ZG8`; the app then launched normally.
+**Commit:** working-tree packaging verification
+**Guard:** Never use raw `codesign --deep` as the local Electron release-signing workflow. Use `@electron/osx-sign` (the same signer Electron Forge uses), run strict deep verification, inspect a nested runtime library's Team ID, then perform an actual cold launch before replacing the verified rollback copy.
+---
+
+---
+**Date:** 2026-08-14T19:15:00Z
+**Trigger:** Ethan: "integrate the restream chat thing ... Twitch button and the Kick button that we can connect and see"
+**Symptom:** Twitch and Kick chat disappeared from the combined Restream Chat++ feed when those destinations were disabled in Restream, even though OBS sent to the platforms directly.
+**Root cause:** The app had only one inbound transport: Restream's combined Chat API WebSocket. Restream does not aggregate a platform chat after that destination is disabled, and Kick's official API delivers chat through signed public webhooks rather than a desktop WebSocket endpoint.
+**Fix:** v0.1.98 adds independent Twitch Device Code/EventSub and Kick PKCE/signed-webhook-relay sources. Their messages enter the existing main-process feed, filter, notification, and TTS path. A compact second header row exposes separate Restream, Twitch, and Kick health plus Connect/Disconnect controls. Provider tokens use OS-keyring encryption; macOS Keychain or environment variables hold app/relay credentials. The cross-source deduper rejects exact message-ID replays and same-message copies seen through different transports without dropping repeated text from one source.
+**Commit:** working-tree implementation
+**Guard:** Keep platform destinations and chat-source connections independent. Use Twitch's public-client flow without a secret; verify Kick's RSA signature before relaying; never store provider tokens in plaintext; keep direct replies routed through Restream until official provider-specific send support is deliberately added. Tests cover both normalizers, token/connection states, cross-source deduplication, source-row UX, and forged Kick signatures.
+---
+
+---
+**Date:** 2026-08-12T14:55:00Z
+**Trigger:** Ethan: "whta hapnede to yt view count investiage log and cu"
+**Symptom:** During a live four-platform stream, the viewer popover showed `TOTAL 0`, Facebook/Twitch/X as `0`, and YouTube as `LIVE —` even though YouTube chat remained connected. The supplied screenshot was captured at 2026-08-12T14:52:27Z.
+**Root cause:** Restream's separate Streaming Updates feed kept YouTube `online:true` but temporarily supplied no numeric YouTube `viewers` value. `viewer-stats.jsonl` records YouTube changing from `1` to `null` at 14:47:43Z while the other three platforms remained numeric zero; it changed back to `1` at 14:53:19Z, 52 seconds after the screenshot. The chat feed independently kept receiving heartbeats and reported the exact YouTube event `yVuv1MZeG1c` connected, so this was not a YouTube-chat disconnect or a dead local socket. Computer Use then confirmed the unchanged live app showed `TOTAL 1` and `YouTube ... LIVE 1`. Earlier logs show the same upstream number/null cycling, so the exact provider-side reason for omitting the count remains unknown.
+**Fix:** No code, reconnect, restart, destination, or stream-setting change. Let the next Restream `updateStatuses` frame restore the numeric value. The current renderer behavior is intentional: an online platform with no numeric count renders `—`, while the aggregate can remain `0` when another online platform reports numeric zero. At 2026-08-12T15:07Z, Gmail confirmed `Message sent` from the matching account to `support@restream.io` with subject `Intermittent YouTube live viewer count missing while channel remains online`; the report included the event ID and transition timestamps but no raw logs, access token, attachments, or unrelated data.
+**Commit:** working-tree investigation note
+**Guard:** For a live `—` row, correlate the screenshot timestamp with `~/Library/Logs/Restream Chat++/viewer-stats.jsonl`, distinguish `online:true/viewers:null` from socket lifecycle errors, and verify current state through Computer Use before changing anything. Do not infer a chat outage from the separate viewer feed.
+---
+
+---
+**Date:** 2026-08-09T12:16:45Z
+**Trigger:** Ethan: "is youtube chat in restream down or smth check myresteam chat+"
+**Symptom:** Restream Chat++ stayed globally Connected but the channels panel showed YouTube alone as `ERROR youtube_livechat_not_found`; Twitch, Facebook, X, and Discord remained connected, and no YouTube messages for the current broadcast reached the app.
+**Root cause:** This incident was upstream of Restream Chat++. Its live Chat API WebSocket remained healthy and kept delivering heartbeats. Restream initially reported the exact YouTube event `QqwxyKLdPmA` connected, then changed it to `youtube_livechat_not_found` at 2026-08-09T11:38:35Z and repeated that state. At investigation time, YouTube's public watch page reported the same event live and exposed `liveChatRenderer`, while Restream's public status page reported Chat operational with no recent incident. Restream began reporting the same event connected again at 2026-08-09T12:31:20Z and kept reconnecting successfully afterward without any destination, event, OBS, YouTube, or stream-setting change. That evidence supports a transient per-broadcast Restream-to-YouTube chat lookup failure, not a broad outage or a local client/socket failure; the exact upstream provider cause remains unknown.
+**Fix:** No code, destination, OBS, or stream-setting change. A manual Restream Chat++ Reconnect at 2026-08-09T12:20:21Z safely refreshed OAuth and rebuilt the chat/viewer WebSockets, but Restream immediately returned the same YouTube-only `youtube_livechat_not_found` state while all other connections succeeded. The connection then recovered autonomously about 11 minutes later. Avoid restarting the app or toggling a live destination as a first response; confirm the exact event in `raw-frames.jsonl`, verify public YouTube live-chat availability, then report the per-broadcast failure to Restream Support. At 2026-08-09T12:26Z Gmail confirmed delivery of the timestamped evidence and safe-recovery result to Restream's official `support@restream.io` address from the matching Restream account email; no raw logs or unrelated personal data were attached.
+**Commit:** working-tree investigation note
+**Guard:** For a single-platform connection error, inspect recent `connection_info` plus continuing heartbeats in `~/Library/Logs/Restream Chat++/raw-frames.jsonl`. Separate app/socket health, Restream's per-channel reason, the exact public event state, and the provider status page before calling it a client bug or global outage.
+---
+
+---
 **Date:** 2026-08-08T13:38:00Z
 **Trigger:** Ethan: "the silence user btn doesnt fully work ... it needs to turn off notifs and stt for that user when i click it"
 **Symptom:** Clicking the per-row Silence user button looked inert. Live evidence showed Twitch author `burntballs_` continued to be read before the settings edit, while the saved anchored rule `^burntballs_$` proved the button path could add a TTS rule. The clicked historical row never changed, the action did not touch the notification username filter, and speech already in flight/queued was unaffected, so Ethan had to open Settings and add rules manually.

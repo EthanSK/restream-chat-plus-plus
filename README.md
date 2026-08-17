@@ -7,7 +7,7 @@ A native, cross-platform replacement for the official [Restream Chat](https://re
 
 ## What
 
-A free, open-source desktop client that connects to Restream's chat WebSocket and renders multi-platform chat (Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X) in a single virtualised feed. TTS, notifications, per-platform filters, automatic reconnect — all native.
+A free, open-source desktop client that renders multi-platform chat (Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X) in a single virtualised feed. Restream supplies the combined feed, while optional direct Twitch and Kick connections keep those chats visible even when the channels are not enabled as Restream destinations. TTS, notifications, per-platform filters, automatic reconnect — all native.
 
 The app ships as a signed, notarized macOS bundle (arm64 + x64), a Squirrel installer for Windows x64, and `.deb` / `.rpm` packages for Linux x64. Auto-update is wired through Electron's public update service backed by GitHub Releases.
 
@@ -37,6 +37,32 @@ Self-hosted? You'll need a Restream developer app:
 3. Grant scopes: `profile.read channels.read stream.read chat.read channels.write stream.write`
 4. Copy the client ID + secret into Keychain or `.env.local` (see `.env.example`).
 
+## Optional direct Twitch and Kick chat
+
+The Chat sources row lets users connect either provider independently. Direct
+messages enter the same timeline, notification, filter, and TTS pipeline as
+Restream messages. Each connected source also shows its own official live
+viewer count. Messages are read and sent directly for connected Twitch and Kick accounts; other channels continue to send through Restream.
+
+- **Twitch:** register a public Chat Bot app, save its client ID as
+  `TWITCH_CLIENT_ID` or in macOS Keychain under service `api.twitch.tv`, then
+  use Connect in the app. Authorization uses Twitch's Device Code flow; no
+  client secret belongs in the desktop app. Chat++ requests `user:read:chat`
+  and `user:write:chat` so the same connection can both receive and send.
+- **Kick:** register an OAuth app with callback
+  `http://localhost:8766/kick/oauth`, the `channel:read`, `events:subscribe`,
+  and `chat:write` scopes, and a webhook URL pointing to
+  the included `kick-relay/` Worker. Save the app and relay credentials using
+  the names in `.env.example` or the matching macOS Keychain services.
+
+Direct access and refresh tokens are encrypted with Electron `safeStorage` and
+never fall back to plaintext. The Kick relay verifies Kick's signed webhook
+payload before sending it to an authenticated desktop WebSocket. Twitch
+keepalives and Kick relay pongs are monitored independently, so either direct
+source reconnects automatically instead of remaining falsely green after a
+network interruption. The toolbar Reconnect button refreshes all three chat
+sources without revoking the direct-provider logins.
+
 ## Develop
 
 ```bash
@@ -60,6 +86,10 @@ src/
     updater.ts            update-electron-app wrapper + "Check for Updates" menu
     oauth.ts              OAuth code flow + token refresh + electron-store persistence
     ws-client.ts          Restream WebSocket subscriber (heartbeat, exponential-backoff reconnect)
+    twitch-chat-source.ts Direct Twitch Device Code + EventSub source
+    kick-chat-source.ts   Direct Kick PKCE + signed-relay source
+    direct-chat-sources.ts Provider lifecycle and combined state
+    cross-source-deduper.ts Restream/direct duplicate suppression
     normalize.ts          Per-platform payload normaliser → ChatMessage
     credentials.ts        Keychain / env-var credential loader
     store.ts              Typed electron-store wrapper
@@ -78,6 +108,7 @@ build/
 .github/workflows/
   ci.yml                  Lint + typecheck + tests on PR + push
   release.yml             Per-arch build + GitHub Release + pages update
+kick-relay/               Signed Kick webhook to authenticated WebSocket Worker
 ```
 
 ## Status

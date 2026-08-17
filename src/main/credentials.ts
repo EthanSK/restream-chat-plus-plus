@@ -13,6 +13,17 @@ export interface RestreamCreds {
   clientSecret: string;
 }
 
+export interface TwitchCreds {
+  clientId: string;
+}
+
+export interface KickCreds {
+  clientId: string;
+  clientSecret: string;
+  relayUrl: string;
+  relayToken: string;
+}
+
 function keychain(service: string, field: '-w' | '-g'): string | undefined {
   if (process.platform !== 'darwin') return undefined;
   try {
@@ -91,4 +102,23 @@ export function loadRestreamCreds(): RestreamCreds | undefined {
     return { clientId, clientSecret };
   }
   return undefined;
+}
+
+export function loadTwitchCreds(): TwitchCreds | undefined {
+  const clientId = process.env.TWITCH_CLIENT_ID ?? keychainAccount('api.twitch.tv');
+  return clientId ? { clientId } : undefined;
+}
+
+export function loadKickCreds(): KickCreds | undefined {
+  const clientId = process.env.KICK_CLIENT_ID ?? keychainAccount('api.kick.com');
+  const clientSecret = process.env.KICK_CLIENT_SECRET ?? keychain('api.kick.com', '-w');
+  const relayUrl =
+    process.env.RCPP_KICK_RELAY_URL ??
+    keychainAccount('restream-chat-plus-plus.kick-relay');
+  const relayToken =
+    process.env.RCPP_KICK_RELAY_TOKEN ??
+    keychain('restream-chat-plus-plus.kick-relay', '-w');
+  return clientId && clientSecret && relayUrl?.startsWith('wss://') && relayToken
+    ? { clientId, clientSecret, relayUrl, relayToken }
+    : undefined;
 }

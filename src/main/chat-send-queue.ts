@@ -18,7 +18,7 @@ import { appendErrorLog, errorToString } from './structured-log';
  *      between attempts is configurable via `minSpacingMs` (default
  *      1000ms — matches the old per-IPC gate).
  *   3. Broadcasts `ChatSendStatus` lifecycle events (`pending` on
- *      enqueue, `sent` on 2xx, `failed` on any error). Failure of one
+ *      enqueue, `sent` when every target accepts, `failed` on any error). Failure of one
  *      send NEVER blocks subsequent enqueues — the worker logs + moves on.
  *
  * The queue is intentionally agnostic of the actual send implementation:
@@ -33,8 +33,8 @@ export interface QueuedSend {
 
 export interface ChatSendQueueOptions {
   /**
-   * Async function that performs ONE POST and resolves with the result.
-   * Wired to `sendChatText` from `chat-send.ts` in production; tests pass
+   * Async function that performs one delivery attempt and resolves with the result.
+   * Wired to the destination fan-out in production; tests pass
    * a stub.
    */
   runSend: (item: QueuedSend) => Promise<SendTextResult>;
@@ -96,7 +96,10 @@ export interface ChatSendQueueOptions {
    * exercise the backoff ladder). Errors are swallowed — a reconnect that
    * throws must NOT abort the retry loop.
    */
-  reconnectBetweenRetries?: (reason: string) => Promise<{ ok: boolean }>;
+  reconnectBetweenRetries?: (
+    reason: string,
+    result: SendTextResult,
+  ) => Promise<{ ok: boolean }>;
 }
 
 /**
@@ -120,14 +123,12 @@ export interface ChatSendQueueOptions {
  *                            BEFORE returning send-failed for that case.
  *   - error                : fetch threw / network blip / unexpected → retry.
  *
- * CRITICAL SAFETY (no double-POST): we ONLY ever reach this classifier on
- * `ok:false`. `sendChatText` returns `ok:true` ONLY on a confirmed 2xx, so a
- * retryable result NEVER corresponds to a POST that already landed 200 — it is
- * always safe to re-POST. And every re-POST reuses the SAME `clientReplyUuid`
- * (the queue keeps `item.clientId` constant across attempts), so even if a
- * borderline send DID reach Restream, Restream dedupes on the uuid. The
- * "POSTed-200-but-unconfirmed" case is a DIFFERENT path entirely (ok:true →
- * never retried here; resolved by the v0.1.88 echo/reconnect-sweep).
+ * DELIVERY SAFETY: the fan-out remembers every confirmed destination success,
+ * so a later retry never re-sends to that destination. Restream also receives
+ * the same `clientReplyUuid` on every ambiguous retry. Twitch and Kick do not
+ * expose an idempotency key, so a network failure after their server accepted
+ * a request but before the response reached us remains inherently ambiguous;
+ * retrying favours delivery over the small risk of a duplicate.
  *
  * There is currently no non-retryable reason left (every union member is
  * recoverable-or-worth-one-more-try), but the function is explicit so a future
@@ -141,9 +142,12 @@ export function isRetryableSendFailure(reason: string | undefined): boolean {
     case 'not-authenticated':
     case 'no-show-id':
     case 'send-failed':
+    case 'destination-send-failed':
     case 'error':
     case undefined: // defensive: a missing reason is treated as transient
       return true;
+    case 'provider-authorization-required':
+      return false;
     default:
       return false;
   }
@@ -209,13 +213,13 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
     }
   };
 
-  // v0.1.90 — emit `'sent'` (2xx success). Keeps the v0.1.69 belt-and-braces
+  // v0.1.90 — emit `'sent'` after every destination succeeds. Keeps the v0.1.69 belt-and-braces
   // IPC-failure logging (both app-errors.jsonl + chat-send.jsonl) so a lost
   // success status — which would strand the placeholder on "sending" — is
   // still grep-able.
-  const emitSent = (clientId: string): void => {
+  const emitSent = (clientId: string, result: SendTextResult): void => {
     try {
-      opts.emitStatus({ clientId, status: 'sent' });
+      opts.emitStatus({ clientId, status: 'sent', destinations: result.destinations });
     } catch (err) {
       const errorMessage = String((err as Error)?.message ?? err);
       log('queue.emit.threw', { clientId, phase: 'sent', error: errorMessage });
@@ -252,6 +256,7 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
         httpStatus: result.status,
         attempt,
         maxAttempts: maxSendAttempts,
+        destinations: result.destinations,
       });
     } catch (err) {
       const errorMessage = String((err as Error)?.message ?? err);
@@ -297,8 +302,8 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
     }
   };
 
-  // v0.1.90 — run ONE POST attempt, converting an unexpected throw from
-  // `runSend` (== sendChatText, which should catch everything internally) into
+  // v0.1.90 — run one delivery attempt, converting an unexpected throw from
+  // `runSend` (the fan-out, whose adapters should catch network failures) into
   // a `{ ok:false, reason:'error' }` result + structured row. Keeps the
   // v0.1.69 run-send-threw observability.
   const runSendOnce = async (item: QueuedSend): Promise<SendTextResult> => {
@@ -323,10 +328,9 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
     for (let attempt = 1; attempt <= maxSendAttempts; attempt++) {
       const result = await runSendOnce(item);
 
-      // SUCCESS — a confirmed 2xx. Log the terminal `ok` row, emit `'sent'`,
-      // done. (The WS echo — matched by clientReplyUuid → id — is what
-      // actually replaces the placeholder in the feed; `'sent'` just lets the
-      // renderer track the HTTP-200 for the v0.1.88 reconnect sweep.)
+      // SUCCESS — every frozen destination accepted the message. Log the
+      // terminal `ok` row, emit `'sent'`, and let the renderer confirm its
+      // optimistic row without waiting for three different provider echoes.
       if (result.ok) {
         logRetry({
           phase: 'retry-attempt',
@@ -336,7 +340,7 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
           outcome: 'ok',
           decision: 'done',
         });
-        emitSent(item.clientId);
+        emitSent(item.clientId, result);
         return;
       }
 
@@ -389,7 +393,10 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
 
       if (opts.reconnectBetweenRetries) {
         try {
-          await opts.reconnectBetweenRetries(`send-retry:${result.reason ?? 'unknown'}`);
+          await opts.reconnectBetweenRetries(
+            `send-retry:${result.reason ?? 'unknown'}`,
+            result,
+          );
         } catch (err) {
           // A reconnect that throws must NEVER abort the retry loop — that
           // would silently strand the send, the exact failure mode we're
@@ -438,9 +445,8 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
         //   2. runs the managed reconnect/"refresh" (reconnectBetweenRetries)
         //      so cookies + chat-context + connections are fresh;
         //   3. backs off exponentially (~1s,2s,4s,8s,16s capped);
-        //   4. re-POSTs with the SAME clientReplyUuid (Restream dedupes; we
-        //      only ever reach here on ok:false == no confirmed 200, so a
-        //      re-POST can't double-deliver — see isRetryableSendFailure doc).
+        //   4. retries only destinations without a confirmed success; Restream
+        //      also receives the SAME clientReplyUuid for its own dedupe.
         // A confirmed 2xx (ok:true) ends the loop immediately (success). A
         // NON-retryable failure ends it immediately (terminal ⚠). Exhausting
         // all attempts ends it with terminal ⚠. EVERY attempt writes a

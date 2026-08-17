@@ -51,6 +51,10 @@ export interface StoreSchema {
    * bundle identity.
    */
   tokenEnc?: string;
+  /** OS-keyring encrypted direct Twitch authorization. */
+  twitchTokenEnc?: string;
+  /** OS-keyring encrypted direct Kick authorization. */
+  kickTokenEnc?: string;
   settings?: Settings;
   /**
    * @deprecated v0.1.34: persisted Compose-window bounds from v0.1.32-v0.1.33.

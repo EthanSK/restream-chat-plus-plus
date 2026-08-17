@@ -7,6 +7,8 @@ import type {
   ChatSendEnqueuePayload,
   ChatSendStatus,
   ConnectionState,
+  DirectChatConnection,
+  DirectChatProvider,
   NativeVoiceWire,
   SendTextResult,
   SilenceUserResult,
@@ -98,6 +100,17 @@ const api = {
     ipcRenderer.on(IPC.CONNECTIONS, h);
     return () => ipcRenderer.removeListener(IPC.CONNECTIONS, h);
   },
+  getDirectChatConnections: (): Promise<DirectChatConnection[]> =>
+    ipcRenderer.invoke(IPC.DIRECT_CHAT_CONNECTIONS_GET),
+  onDirectChatConnections: (cb: (cs: DirectChatConnection[]) => void): Unsub => {
+    const h = (_: unknown, cs: DirectChatConnection[]) => cb(cs);
+    ipcRenderer.on(IPC.DIRECT_CHAT_CONNECTIONS, h);
+    return () => ipcRenderer.removeListener(IPC.DIRECT_CHAT_CONNECTIONS, h);
+  },
+  connectDirectChat: (provider: DirectChatProvider): Promise<DirectChatConnection[]> =>
+    ipcRenderer.invoke(IPC.DIRECT_CHAT_CONNECT, provider),
+  disconnectDirectChat: (provider: DirectChatProvider): Promise<DirectChatConnection[]> =>
+    ipcRenderer.invoke(IPC.DIRECT_CHAT_DISCONNECT, provider),
   /**
    * v0.1.94 — LIVE VIEWER COUNT. Pull-fetch the latest aggregated
    * `ViewerStatsSnapshot` (total concurrent viewers across online channels +

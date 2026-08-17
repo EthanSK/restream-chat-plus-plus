@@ -100,6 +100,27 @@ export function applyFailedSendStatus(
   return next;
 }
 
+/** A successful fan-out is authoritative, so the local placeholder no longer waits for a provider echo. */
+export function applySentSendStatus(
+  prev: ChatMessage[],
+  status: ChatSendStatus,
+): ChatMessage[] {
+  if (status.status !== 'sent') return prev;
+  const idx = prev.findIndex(
+    (message) =>
+      message.id === status.clientId && message.pendingSend !== undefined,
+  );
+  if (idx === -1) return prev;
+  const next = prev.slice();
+  const resolved = { ...next[idx] };
+  delete resolved.pendingSend;
+  delete resolved.pendingError;
+  delete resolved.sendAttempt;
+  delete resolved.sendMaxAttempts;
+  next[idx] = resolved;
+  return next;
+}
+
 /**
  * v0.1.90 (voice 4512) — flip the matching optimistic placeholder to
  * `pendingSend: 'retrying'` and stash the attempt counters so the feed can
