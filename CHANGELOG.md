@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.103 — aligned source viewer counts (2026-08-17)
+
+### What's fixed
+
+- **Twitch and Kick viewer counts stay beside their source names.** Compact
+  source chips no longer shrink or wrap the separator and count onto a second
+  line when the Chat++ window is narrow.
+
+### Guard
+
+- Added a focused style regression test that pins non-wrapping source chips
+  and viewer-count fragments.
+
 ## v0.1.102 — combined viewer breakdown (2026-08-17)
 
 ### What's new

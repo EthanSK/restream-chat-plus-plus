@@ -478,6 +478,7 @@ body {
 }
 .source-chip {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 5px;
   padding: 3px 7px;
@@ -487,14 +488,17 @@ body {
   color: var(--text-1);
   font: inherit;
   font-size: 11px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .source-chip:hover { background: var(--bg-2); color: var(--text-0); }
 .source-twitch { border-color: rgba(145, 70, 255, 0.45); }
 .source-kick { border-color: rgba(83, 252, 24, 0.38); }
 .source-viewers {
+  flex: 0 0 auto;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .source-status {
   width: 7px;

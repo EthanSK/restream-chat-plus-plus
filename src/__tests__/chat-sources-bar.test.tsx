@@ -1,5 +1,6 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { ChatSourcesBar } from '../renderer/ChatSourcesBar';
 import type { DirectChatConnection } from '../shared/types';
@@ -35,6 +36,21 @@ function buttonText(node: TestRenderer.ReactTestInstance): string {
 }
 
 describe('ChatSourcesBar', () => {
+  it('keeps each source name and live viewer count on one line', () => {
+    const css = readFileSync(
+      new URL('../renderer/styles.css', import.meta.url),
+      'utf8',
+    );
+    const chipRule = css.match(/\.source-chip\s*\{([^}]*)\}/s)?.[1] ?? '';
+    const viewersRule =
+      css.match(/\.source-viewers\s*\{([^}]*)\}/s)?.[1] ?? '';
+
+    expect(chipRule).toMatch(/flex:\s*0 0 auto\s*;/);
+    expect(chipRule).toMatch(/white-space:\s*nowrap\s*;/);
+    expect(viewersRule).toMatch(/flex:\s*0 0 auto\s*;/);
+    expect(viewersRule).toMatch(/white-space:\s*nowrap\s*;/);
+  });
+
   it('keeps Restream, Twitch, and Kick visible in a compact source row', () => {
     const { renderer } = render([
       { provider: 'twitch', status: 'connected', accountName: 'reeethan' },

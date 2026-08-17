@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-17T12:50:00Z
+**Trigger:** Ethan: "what's this clapped alignment"
+**Symptom:** A live Twitch or Kick source chip showed its separator at the top right and wrapped the numeric viewer count onto a second line.
+**Root cause:** The flex row could shrink each source chip, and the viewer fragment `· 1` retained a normal wrapping opportunity at its space. The status dot and source name therefore stayed on the first line while the count dropped below them.
+**Fix:** v0.1.103 makes source chips and their viewer-count fragments non-shrinking and non-wrapping, preserving the existing compact one-row design.
+**Commit:** working-tree implementation
+**Guard:** `chat-sources-bar.test.tsx` pins `flex: 0 0 auto` and `white-space: nowrap` on both relevant style rules. The signed installed v0.1.103 app was manually verified at the existing 460px-wide window with `Twitch · 1` and `Kick · 1` each rendered on one row.
+---
+
+---
 **Date:** 2026-08-17T12:20:00Z
 **Trigger:** Ethan: "messages sent from Twitch don't show up in Restream Chat++ ... same with Kick"
 **Symptom:** Chat++ could send to Twitch and Kick, both direct-source chips stayed green, and both provider viewer counts updated, but messages originating on either platform no longer reached the combined feed.
