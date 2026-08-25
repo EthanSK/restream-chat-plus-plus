@@ -12,6 +12,7 @@ import { TwitchChatSource } from './twitch-chat-source';
 
 interface DirectChatSource {
   getState(): DirectChatConnection;
+  hasStoredAuthorization(): boolean;
   start(): Promise<void>;
   connect(): Promise<void>;
   reconnect(): Promise<void>;
@@ -86,11 +87,8 @@ export class DirectChatSources extends EventEmitter {
   }
 
   async reconnect(): Promise<DirectChatConnection[]> {
-    const activeSources = Object.values(this.sources).filter((source) => {
-      const status = source.getState().status;
-      return status !== 'disconnected' && status !== 'not-configured';
-    });
-    await Promise.allSettled(activeSources.map((source) => source.reconnect()));
+    const retryableSources = Object.values(this.sources).filter(isRetryable);
+    await Promise.allSettled(retryableSources.map((source) => source.reconnect()));
     this.emit('state', this.getConnections());
     return this.getConnections();
   }
@@ -142,4 +140,16 @@ export class DirectChatSources extends EventEmitter {
     if (match !== -1) pending.splice(match, 1);
     this.pendingOwnMessages.set(provider, pending);
   }
+}
+
+/**
+ * The toolbar retry exists precisely for a source that fell over, so `disconnected` must not be
+ * skipped while the provider authorization is still on hand — that state is the failure this button
+ * repairs. Only a source with nothing to retry with (unconfigured, or signed out) is left alone.
+ */
+function isRetryable(source: DirectChatSource): boolean {
+  const status = source.getState().status;
+  if (status === 'not-configured') return false;
+  if (status === 'disconnected') return source.hasStoredAuthorization();
+  return true;
 }

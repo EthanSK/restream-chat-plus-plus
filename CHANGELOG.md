@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.105 — durable Twitch recovery (2026-08-25)
+
+### What's fixed
+
+- **A temporary Twitch or network failure no longer deletes the direct-chat
+  authorization.** RC++ now distinguishes a retryable provider failure from an
+  explicit token rejection and keeps retrying without asking the user to sign
+  in again.
+- **Concurrent Twitch refreshes cannot invalidate each other.** Socket
+  recovery, hourly validation, viewer polling, and sending now share one
+  in-flight refresh while Twitch rotates the token pair.
+- **The toolbar Reconnect action can recover an authorized source after it has
+  reached Disconnected.** Signed-out and unconfigured sources remain untouched.
+
+### Guard
+
+- Added regression coverage for transient refresh and validation failures,
+  automatic recovery, explicit token rejection, concurrent refresh
+  coalescing, and toolbar recovery. All 766 tests pass, TypeScript is clean,
+  and lint has no errors.
+
 ## v0.1.104 — quiet authoritative update checks (2026-08-17)
 
 ### What's fixed

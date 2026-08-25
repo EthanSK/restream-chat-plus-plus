@@ -25,6 +25,9 @@ const VIEWER_POLL_INTERVAL = 30_000;
 const EVENTSUB_STALE_TIMEOUT = 75_000;
 const EVENTSUB_WATCHDOG_INTERVAL = 15_000;
 const TWITCH_SCOPES = ['user:read:chat', 'user:write:chat'];
+/** Refresh this far ahead of expiry so a request never rides a token that dies mid-flight. */
+const TOKEN_REFRESH_MARGIN = 60_000;
+const REAUTHORIZE_DETAIL = 'Connect Twitch again to continue.';
 
 interface TwitchValidation {
   client_id: string;
@@ -33,6 +36,34 @@ interface TwitchValidation {
   user_id: string;
   expires_in: number;
 }
+
+/**
+ * Twitch itself refused the grant, so the stored authorization is worthless and the user must reconnect.
+ * Only Twitch's explicit rejections produce this outcome — see {@link isAuthorizationRejection}.
+ */
+interface AuthorizationRejected {
+  kind: 'invalid';
+  detail: string;
+}
+
+/**
+ * Something temporary failed — DNS, offline Wi-Fi, a Twitch 5xx, a rate limit, a locked keychain.
+ * The stored authorization is still presumed usable, so it must survive and the connect must retry.
+ */
+interface AuthorizationDeferred {
+  kind: 'transient';
+  detail: string;
+}
+
+type TwitchTokenOutcome =
+  | { kind: 'ok'; token: TwitchTokenSet }
+  | AuthorizationRejected
+  | AuthorizationDeferred;
+
+type TwitchValidationOutcome =
+  | { kind: 'ok'; validation: TwitchValidation }
+  | AuthorizationRejected
+  | AuthorizationDeferred;
 
 interface TwitchDeviceCode {
   device_code: string;
@@ -64,6 +95,8 @@ export class TwitchChatSource extends EventEmitter {
   private eventSubWatchdogTimer?: NodeJS.Timeout;
   private dateLastEventSubFrameReceived?: number;
   private reconnectAttempt = 0;
+  /** Twitch rotates the refresh token on every use, so parallel refreshes would invalidate each other. */
+  private refreshInFlight?: Promise<TwitchTokenOutcome>;
 
   constructor(store: Store) {
     super();
@@ -79,6 +112,14 @@ export class TwitchChatSource extends EventEmitter {
 
   getState(): DirectChatConnection {
     return { ...this.state };
+  }
+
+  /**
+   * True while an authorization is still on hand, so retrying is worthwhile even from `disconnected`.
+   * The in-memory token counts because a keyring read can fail temporarily without the grant being gone.
+   */
+  hasStoredAuthorization(): boolean {
+    return this.token !== undefined || this.tokens.read() !== undefined;
   }
 
   async start(): Promise<void> {
@@ -102,7 +143,7 @@ export class TwitchChatSource extends EventEmitter {
       return;
     }
     this.wantsConnection = true;
-    this.token = this.tokens.read();
+    this.token = this.tokens.read() ?? this.token;
     if (this.token) {
       await this.connectWithTokenSafely();
       return;
@@ -118,9 +159,11 @@ export class TwitchChatSource extends EventEmitter {
     this.wantsConnection = true;
     this.clearTimers();
     this.terminateCurrentSocket();
-    this.token = this.tokens.read();
+    // Prefer the persisted grant, but keep the in-memory one when the keyring read fails temporarily.
+    this.token = this.tokens.read() ?? this.token;
     if (!this.token) {
-      this.setState('disconnected', 'Connect Twitch again to continue.');
+      this.wantsConnection = false;
+      this.setState('disconnected', REAUTHORIZE_DETAIL);
       return;
     }
     this.log('manual-reconnect');
@@ -161,12 +204,12 @@ export class TwitchChatSource extends EventEmitter {
   async send(text: string): Promise<DirectChatSendResult> {
     const creds = loadTwitchCreds();
     const token = await this.ensureValidToken();
-    if (!creds || !token || !this.userId || this.state.status !== 'connected') {
+    if (!creds || token.kind !== 'ok' || !this.userId || this.state.status !== 'connected') {
       return { ok: false, error: 'Twitch chat is not connected.' };
     }
     return sendTwitchChatMessage({
       clientId: creds.clientId,
-      accessToken: token.accessToken,
+      accessToken: token.token.accessToken,
       userId: this.userId,
       text,
     });
@@ -249,38 +292,45 @@ export class TwitchChatSource extends EventEmitter {
 
   private async connectWithToken(): Promise<void> {
     if (!this.wantsConnection) return;
-    const token = await this.ensureValidToken();
-    if (!token) {
-      this.tokens.clear();
-      this.token = undefined;
-      this.setState('disconnected', 'Connect Twitch again to continue.');
+    const session = await this.resolveAuthorizedSession();
+    if (session.kind === 'transient') {
+      // A Twitch outage, a sleeping laptop or a locked keyring must never cost the user their grant:
+      // keep the stored token and let the backoff ladder retry until Twitch answers again.
+      this.scheduleReconnect(session.detail);
       return;
     }
-    let validation = await this.validate(token.accessToken);
-    if (!validation) {
-      this.token = { ...token, expiresAt: 0 };
-      const refreshed = await this.ensureValidToken();
-      validation = refreshed ? await this.validate(refreshed.accessToken) : undefined;
-    }
-    if (!validation) {
-      this.tokens.clear();
-      this.token = undefined;
-      this.setState('disconnected', 'Connect Twitch again to continue.');
+    if (session.kind === 'invalid') {
+      this.requireReauthorization(session.detail);
       return;
     }
-    if (!TWITCH_SCOPES.every((scope) => validation.scopes.includes(scope))) {
-      this.tokens.clear();
-      this.token = undefined;
-      this.setState(
-        'disconnected',
-        'Connect Twitch again to approve reading and sending chat.',
-      );
-      return;
-    }
-    this.userId = validation.user_id;
-    this.setState('connecting', 'Connecting to Twitch chat…', undefined, validation.login);
+    // A disconnect, stop or revocation can land while Twitch is still answering; never open a zombie socket.
+    if (!this.wantsConnection) return;
+    this.userId = session.validation.user_id;
+    this.setState('connecting', 'Connecting to Twitch chat…', undefined, session.validation.login);
     this.openEventSub(EVENTSUB_URL, true);
     this.armHourlyValidation();
+  }
+
+  /** Confirms the stored grant still works, refreshing at most once, without discarding it on a blip. */
+  private async resolveAuthorizedSession(): Promise<TwitchValidationOutcome> {
+    const token = await this.ensureValidToken();
+    if (token.kind !== 'ok') return token;
+    let validation = await this.validate(token.token.accessToken);
+    if (validation.kind === 'invalid') {
+      // Twitch rejected this access token, but the refresh token may still mint a working one.
+      const refreshed = await this.ensureValidToken({ force: true });
+      if (refreshed.kind !== 'ok') return refreshed;
+      validation = await this.validate(refreshed.token.accessToken);
+    }
+    if (validation.kind !== 'ok') return validation;
+    const granted = validation.validation.scopes;
+    if (!TWITCH_SCOPES.every((scope) => granted.includes(scope))) {
+      return {
+        kind: 'invalid',
+        detail: 'Connect Twitch again to approve reading and sending chat.',
+      };
+    }
+    return validation;
   }
 
   private async connectWithTokenSafely(): Promise<void> {
@@ -291,48 +341,132 @@ export class TwitchChatSource extends EventEmitter {
     }
   }
 
-  private async ensureValidToken(): Promise<TwitchTokenSet | undefined> {
-    if (!this.token) return undefined;
-    if (this.token.expiresAt - Date.now() > 60_000) return this.token;
+  /**
+   * Returns the usable access token, refreshing when it is near expiry (or when `force` is set after
+   * Twitch rejected the current one). Never clears storage — only the caller decides what a failure means.
+   */
+  private async ensureValidToken(
+    options: { force?: boolean } = {},
+  ): Promise<TwitchTokenOutcome> {
+    const token = this.token;
+    if (!token) return { kind: 'invalid', detail: REAUTHORIZE_DETAIL };
+    if (!options.force && token.expiresAt - Date.now() > TOKEN_REFRESH_MARGIN) {
+      return { kind: 'ok', token };
+    }
+    // Coalesce: a socket reconnect, the hourly validation, a send and the viewer poll can all land
+    // together, and a second refresh would spend the rotated refresh token and revoke the first one.
+    const inFlight = this.refreshInFlight;
+    if (inFlight) return inFlight;
+    const request = this.refreshToken(token).finally(() => {
+      this.refreshInFlight = undefined;
+    });
+    this.refreshInFlight = request;
+    return request;
+  }
+
+  private async refreshToken(expiring: TwitchTokenSet): Promise<TwitchTokenOutcome> {
     const creds = loadTwitchCreds();
-    if (!creds) return undefined;
+    if (!creds) {
+      // The keychain can be locked or briefly unreadable; that says nothing about the grant itself.
+      return { kind: 'transient', detail: 'Twitch app registration is unavailable.' };
+    }
     const body = new URLSearchParams({
       grant_type: 'refresh_token',
-      refresh_token: this.token.refreshToken,
+      refresh_token: expiring.refreshToken,
       client_id: creds.clientId,
     });
-    const response = await fetch(TOKEN_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
+    let response: Response;
+    try {
+      response = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+    } catch (error) {
+      return {
+        kind: 'transient',
+        detail: `Twitch could not refresh authorization (${errorMessage(error)}).`,
+      };
+    }
     const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) {
+      this.log('token-refresh-failed', { status: response.status });
+      return isAuthorizationRejection(response.status)
+        ? { kind: 'invalid', detail: REAUTHORIZE_DETAIL }
+        : {
+            kind: 'transient',
+            detail: `Twitch could not refresh authorization (${response.status}).`,
+          };
+    }
     if (
-      !response.ok ||
       typeof payload.access_token !== 'string' ||
       typeof payload.refresh_token !== 'string'
     ) {
-      return undefined;
+      // A 200 without usable fields is a Twitch-side anomaly, not a revoked grant.
+      return { kind: 'transient', detail: 'Twitch returned an unreadable token response.' };
     }
-    this.token = {
+    const refreshed: TwitchTokenSet = {
       accessToken: payload.access_token,
       refreshToken: payload.refresh_token,
       expiresAt: Date.now() + numberOr(payload.expires_in, 14_400) * 1_000,
       scope: stringArray(payload.scope),
     };
-    this.tokens.write(this.token);
-    return this.token;
+    if (!this.token || this.token.refreshToken !== expiring.refreshToken) {
+      // A disconnect or a fresh authorization replaced this grant mid-flight; never resurrect the old one.
+      return { kind: 'transient', detail: 'Twitch authorization changed during refresh.' };
+    }
+    this.token = refreshed;
+    try {
+      this.tokens.write(refreshed);
+    } catch (error) {
+      // Losing at-rest persistence must not end a working session; the live token still reads chat.
+      this.log('token-persist-failed', { error: errorToString(error) });
+    }
+    return { kind: 'ok', token: refreshed };
   }
 
-  private async validate(accessToken: string): Promise<TwitchValidation | undefined> {
-    const response = await fetch(VALIDATE_URL, {
-      headers: { authorization: `OAuth ${accessToken}` },
-    });
-    if (!response.ok) return undefined;
-    const payload = (await response.json()) as Partial<TwitchValidation>;
-    return typeof payload.user_id === 'string' && typeof payload.login === 'string'
-      ? (payload as TwitchValidation)
-      : undefined;
+  private async validate(accessToken: string): Promise<TwitchValidationOutcome> {
+    let response: Response;
+    try {
+      response = await fetch(VALIDATE_URL, {
+        headers: { authorization: `OAuth ${accessToken}` },
+      });
+    } catch (error) {
+      return {
+        kind: 'transient',
+        detail: `Twitch could not verify authorization (${errorMessage(error)}).`,
+      };
+    }
+    if (!response.ok) {
+      this.log('validation-failed', { status: response.status });
+      return isAuthorizationRejection(response.status)
+        ? { kind: 'invalid', detail: REAUTHORIZE_DETAIL }
+        : {
+            kind: 'transient',
+            detail: `Twitch could not verify authorization (${response.status}).`,
+          };
+    }
+    const payload = (await response.json().catch(() => ({}))) as Partial<TwitchValidation>;
+    if (typeof payload.user_id !== 'string' || typeof payload.login !== 'string') {
+      return { kind: 'transient', detail: 'Twitch returned an unreadable validation response.' };
+    }
+    return { kind: 'ok', validation: payload as TwitchValidation };
+  }
+
+  /** Terminal path: the grant really is unusable, so drop it and ask for a deliberate reconnect. */
+  private requireReauthorization(
+    detail: string,
+    closeReason = 'Twitch authorization expired',
+  ): void {
+    this.wantsConnection = false;
+    this.clearTimers();
+    this.socket?.close(4001, closeReason);
+    this.socket = undefined;
+    this.token = undefined;
+    this.userId = undefined;
+    this.tokens.clear();
+    this.log('authorization-cleared', { detail });
+    this.setState('disconnected', detail);
   }
 
   private openEventSub(url: string, subscribe: boolean): void {
@@ -406,11 +540,11 @@ export class TwitchChatSource extends EventEmitter {
         break;
       }
       case 'revocation': {
-        this.wantsConnection = false;
-        this.tokens.clear();
-        this.token = undefined;
-        socket.close(4001, 'Twitch revoked the chat subscription');
-        this.setState('disconnected', 'Twitch ended direct chat access. Connect Twitch again.');
+        // Twitch itself withdrew the subscription, so this is a real revocation, not a blip.
+        this.requireReauthorization(
+          'Twitch ended direct chat access. Connect Twitch again.',
+          'Twitch revoked the chat subscription',
+        );
         break;
       }
       case 'session_keepalive':
@@ -466,14 +600,27 @@ export class TwitchChatSource extends EventEmitter {
 
   private async validateCurrentSession(): Promise<void> {
     if (!this.wantsConnection || !this.token) return;
-    if (await this.validate(this.token.accessToken)) return;
-    this.token = { ...this.token, expiresAt: 0 };
-    const refreshed = await this.ensureValidToken();
-    if (refreshed && (await this.validate(refreshed.accessToken))) return;
-    this.socket?.close(4001, 'Twitch authorization expired');
-    this.tokens.clear();
-    this.token = undefined;
-    this.setState('disconnected', 'Connect Twitch again to continue.');
+    const validation = await this.validate(this.token.accessToken);
+    if (validation.kind === 'ok') return;
+    if (validation.kind === 'transient') {
+      // The hourly check is a health probe, not a verdict: a failed probe leaves the session alone,
+      // and the EventSub watchdog still owns liveness if the connection is genuinely dead.
+      this.log('hourly-check-deferred', { detail: validation.detail });
+      return;
+    }
+    // Twitch rejected the access token, so one forced refresh separates a rotation from a revocation.
+    const refreshed = await this.ensureValidToken({ force: true });
+    if (refreshed.kind === 'transient') {
+      this.log('hourly-check-deferred', { detail: refreshed.detail });
+      return;
+    }
+    if (
+      refreshed.kind === 'ok' &&
+      (await this.validate(refreshed.token.accessToken)).kind !== 'invalid'
+    ) {
+      return;
+    }
+    this.requireReauthorization(REAUTHORIZE_DETAIL);
   }
 
   private armViewerPolling(): void {
@@ -490,13 +637,13 @@ export class TwitchChatSource extends EventEmitter {
   private async refreshViewerCount(): Promise<void> {
     const creds = loadTwitchCreds();
     const token = await this.ensureValidToken();
-    if (!creds || !token || !this.userId || !this.wantsConnection) return;
+    if (!creds || token.kind !== 'ok' || !this.userId || !this.wantsConnection) return;
     try {
       const url = new URL(STREAMS_URL);
       url.searchParams.set('user_id', this.userId);
       const response = await fetch(url, {
         headers: {
-          authorization: `Bearer ${token.accessToken}`,
+          authorization: `Bearer ${token.token.accessToken}`,
           'client-id': creds.clientId,
         },
       });
@@ -677,6 +824,15 @@ export async function sendTwitchChatMessage({
   } catch (error) {
     return { ok: false, error: `Twitch send failed: ${errorMessage(error)}` };
   }
+}
+
+/**
+ * Only Twitch's explicit authorization refusals may erase a stored grant. `400` is the documented
+ * refresh-token rejection, `401`/`403` cover an invalid or unscoped token. Everything else — `429`,
+ * any `5xx`, a proxy's `502`, an unexpected status — is temporary and must leave the grant intact.
+ */
+function isAuthorizationRejection(status: number): boolean {
+  return status === 400 || status === 401 || status === 403;
 }
 
 function record(value: unknown): Record<string, unknown> {

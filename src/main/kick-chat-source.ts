@@ -77,6 +77,14 @@ export class KickChatSource extends EventEmitter {
     return { ...this.state };
   }
 
+  /**
+   * True while an authorization is still on hand, so retrying is worthwhile even from `disconnected`.
+   * The in-memory token counts because a keyring read can fail temporarily without the grant being gone.
+   */
+  hasStoredAuthorization(): boolean {
+    return this.token !== undefined || this.tokens.read() !== undefined;
+  }
+
   async start(): Promise<void> {
     if (!loadKickCreds()) {
       this.setState('not-configured', 'Kick app or relay registration is not configured.');
@@ -110,8 +118,10 @@ export class KickChatSource extends EventEmitter {
     this.wantsConnection = true;
     this.stopRuntime();
     this.wantsConnection = true;
-    this.token = this.tokens.read();
+    // Prefer the persisted grant, but keep the in-memory one when the keyring read fails temporarily.
+    this.token = this.tokens.read() ?? this.token;
     if (!this.token) {
+      this.wantsConnection = false;
       this.setState('disconnected', 'Connect Kick again to continue.');
       return;
     }

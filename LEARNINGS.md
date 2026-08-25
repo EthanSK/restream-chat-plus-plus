@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-25T12:33:13Z
+**Trigger:** Ethan: "why does rc++ say twitch is offline when its treaming"
+**Symptom:** The direct Twitch row showed `OFFLINE` while the public Twitch channel was live with one viewer. `direct-chat.jsonl` ended with a healthy keepalive, a server close, and one scheduled reconnect; the persisted `twitchTokenEnc` was then absent, so the toolbar Reconnect action repaired Kick but skipped Twitch.
+**Root cause:** `TwitchChatSource` returned `undefined` for temporary network/provider failures and permanent token rejection alike, and `connectWithToken()` responded to either by deleting the stored token and entering `disconnected`. Its socket, hourly validation, send, and viewer paths could also refresh concurrently even though Twitch rotates refresh tokens, allowing one request to invalidate another. The old toolbar retry then excluded every disconnected source. The live log did not record the failed authorization HTTP response, so it cannot distinguish a transient provider failure from the concurrent-refresh race after the fact; both proven code paths had the same destructive outcome.
+**Fix:** v0.1.105 gives Twitch validation and refresh explicit `ok` / `transient` / `invalid` outcomes, serializes token refresh, preserves authorization and backoff-retries transient failures, clears only after an explicit Twitch rejection or revocation, and lets toolbar Reconnect retry a disconnected source that still has authorization.
+**Commit:** working-tree implementation
+**Guard:** `direct-chat-liveness.test.ts` covers transient refresh and validation failures without token loss, recovery after the outage clears, explicit 401/400 rejection, one refresh for concurrent callers, and toolbar recovery from disconnected. All 766 tests pass, typecheck is clean, and lint reports zero errors (pre-existing warnings only). Keep transient provider health failures separate from permanent OAuth rejection; never delete a direct-provider token from an ambiguous failure result.
+---
+
+---
 **Date:** 2026-08-17T15:05:00Z
 **Trigger:** Ethan: "why am I getting this banner all of a sudden; this is the second time"
 **Symptom:** Restream Chat++ automatically showed a red “Update failed — The server sent an invalid response” banner once per hour even though chat remained connected and no newer update existed.

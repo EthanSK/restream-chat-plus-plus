@@ -62,6 +62,7 @@ vi.mock('ws', () => {
 });
 
 import WebSocket from 'ws';
+import { DirectChatSources } from '../main/direct-chat-sources';
 import { KickChatSource } from '../main/kick-chat-source';
 import { TwitchChatSource } from '../main/twitch-chat-source';
 
@@ -171,6 +172,238 @@ describe.sequential('direct chat liveness recovery', () => {
       detail: expect.stringContaining('stopped receiving data'),
     });
     source.stop();
+  });
+
+  it('preserves Twitch authorization when a token refresh fails temporarily', async () => {
+    const stored = encrypted({
+      accessToken: 'expired-access',
+      refreshToken: 'refresh',
+      expiresAt: Date.now(),
+      scope: ['user:read:chat', 'user:write:chat'],
+    });
+    const store = makeStore({ twitchTokenEnc: stored });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input) === 'https://id.twitch.tv/oauth2/token') {
+          return new Response('{}', { status: 503 });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      }),
+    );
+    const source = new TwitchChatSource(store);
+
+    await source.start();
+
+    expect(store.get('twitchTokenEnc')).toBe(stored);
+    expect(source.getState()).toMatchObject({
+      status: 'connecting',
+      detail: expect.stringContaining('Twitch could not refresh authorization'),
+    });
+    source.stop();
+  });
+
+  it('preserves Twitch authorization when validation fails temporarily', async () => {
+    const stored = encrypted({
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      expiresAt: Date.now() + 3_600_000,
+      scope: ['user:read:chat', 'user:write:chat'],
+    });
+    const store = makeStore({ twitchTokenEnc: stored });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input) === 'https://id.twitch.tv/oauth2/validate') {
+          return new Response('{}', { status: 500 });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      }),
+    );
+    const source = new TwitchChatSource(store);
+
+    await source.start();
+
+    expect(store.get('twitchTokenEnc')).toBe(stored);
+    expect(source.getState()).toMatchObject({
+      status: 'connecting',
+      detail: expect.stringContaining('Twitch could not verify authorization'),
+    });
+    source.stop();
+  });
+
+  it('recovers the Twitch session once the outage clears', async () => {
+    const store = makeStore({
+      twitchTokenEnc: encrypted({
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        expiresAt: Date.now() + 3_600_000,
+        scope: ['user:read:chat', 'user:write:chat'],
+      }),
+    });
+    let offline = true;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (offline) throw new TypeError('fetch failed');
+        if (url === 'https://id.twitch.tv/oauth2/validate') {
+          return okJson({
+            client_id: 'twitch-client',
+            login: 'reeethan_yt',
+            scopes: ['user:read:chat', 'user:write:chat'],
+            user_id: '42',
+            expires_in: 3_600,
+          });
+        }
+        if (url === 'https://api.twitch.tv/helix/eventsub/subscriptions') return okJson({ data: [] });
+        if (url.startsWith('https://api.twitch.tv/helix/streams')) {
+          return okJson({ data: [{ viewer_count: 7 }] });
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }),
+    );
+    const source = new TwitchChatSource(store);
+    await source.start();
+    expect(source.getState().status).toBe('connecting');
+    expect(WS.instances).toHaveLength(0);
+
+    offline = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(WS.instances).toHaveLength(1));
+
+    const socket = WS.instances[0];
+    socket.emit('open');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        metadata: { message_type: 'session_welcome' },
+        payload: { session: { id: 'session-1' } },
+      }),
+    );
+    await vi.waitFor(() => expect(source.getState().status).toBe('connected'));
+    source.stop();
+  });
+
+  it('requires a fresh Twitch connect only when Twitch rejects the authorization', async () => {
+    const store = makeStore({
+      twitchTokenEnc: encrypted({
+        accessToken: 'revoked-access',
+        refreshToken: 'revoked-refresh',
+        expiresAt: Date.now() + 3_600_000,
+        scope: ['user:read:chat', 'user:write:chat'],
+      }),
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === 'https://id.twitch.tv/oauth2/validate') {
+          return new Response(JSON.stringify({ message: 'invalid access token' }), { status: 401 });
+        }
+        if (url === 'https://id.twitch.tv/oauth2/token') {
+          return new Response(JSON.stringify({ message: 'Invalid refresh token' }), { status: 400 });
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }),
+    );
+    const source = new TwitchChatSource(store);
+
+    await source.start();
+
+    expect(store.get('twitchTokenEnc')).toBeUndefined();
+    expect(source.getState()).toMatchObject({
+      status: 'disconnected',
+      detail: 'Connect Twitch again to continue.',
+    });
+    source.stop();
+  });
+
+  it('coalesces simultaneous Twitch token refreshes', async () => {
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === 'https://id.twitch.tv/oauth2/token') return refreshResponse;
+      if (url === 'https://id.twitch.tv/oauth2/validate') {
+        return okJson({
+          client_id: 'twitch-client',
+          login: 'reeethan_yt',
+          scopes: ['user:read:chat', 'user:write:chat'],
+          user_id: '42',
+          expires_in: 3_600,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const store = makeStore({
+      twitchTokenEnc: encrypted({
+        accessToken: 'expired-access',
+        refreshToken: 'refresh',
+        expiresAt: Date.now(),
+        scope: ['user:read:chat', 'user:write:chat'],
+      }),
+    });
+    const source = new TwitchChatSource(store);
+
+    const start = source.start();
+    const reconnect = source.reconnect();
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://id.twitch.tv/oauth2/token',
+        expect.any(Object),
+      );
+    });
+    resolveRefresh?.(
+      okJson({
+        access_token: 'new-access',
+        refresh_token: 'new-refresh',
+        expires_in: 14_400,
+        scope: ['user:read:chat', 'user:write:chat'],
+      }),
+    );
+    await Promise.all([start, reconnect]);
+
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input) === 'https://id.twitch.tv/oauth2/token'),
+    ).toHaveLength(1);
+    expect(store.get('twitchTokenEnc')).toBe(
+      encrypted({
+        accessToken: 'new-access',
+        refreshToken: 'new-refresh',
+        expiresAt: Date.now() + 14_400_000,
+        scope: ['user:read:chat', 'user:write:chat'],
+      }),
+    );
+    source.stop();
+  });
+
+  it('retries a disconnected direct source from the toolbar refresh path', async () => {
+    const directChat = new DirectChatSources(
+      makeStore({
+        twitchTokenEnc: encrypted({
+          accessToken: 'access',
+          refreshToken: 'refresh',
+          expiresAt: Date.now() + 3_600_000,
+          scope: ['user:read:chat', 'user:write:chat'],
+        }),
+      }),
+    );
+
+    await directChat.reconnect();
+
+    expect(directChat.getConnections()[0]).toMatchObject({
+      provider: 'twitch',
+      status: 'connecting',
+      accountName: 'reeethan_yt',
+    });
+    // Kick holds no authorization, so the retry leaves it untouched instead of nagging for a connect.
+    expect(directChat.getConnections()[1]).toEqual({ provider: 'kick', status: 'disconnected' });
+    expect(WS.instances).toHaveLength(1);
+    directChat.stop();
   });
 
   it('reconnects Kick when the relay stops answering its application heartbeat', async () => {
