@@ -29,8 +29,8 @@ Each entry looks like:
 **Symptom:** The installed v0.1.105 main process owned a macOS `NoIdleSleepAssertion` named `Electron` for essentially its full uptime, preventing normal idle system sleep whenever Restream Chat++ was open.
 **Root cause:** v0.1.74 added `powerSaveBlocker.start('prevent-app-suspension')` as one layer of a renderer Web-Speech reliability workaround and never stopped it until app quit. Electron maps that blocker to a system idle-sleep assertion; it is not merely an App Nap guard. Since v0.1.81, renderer Web Speech has been removed and incoming chat decisions plus native OS speech run in the main process, so the original browser-TTS motivation is obsolete.
 **Fix:** v0.1.106 removes the `powerSaveBlocker` import and lifetime startup call while leaving `TtsDispatcher`, `NativeTtsEngine`, and chat delivery unchanged. Normal macOS idle system sleep is therefore no longer suppressed by Restream Chat++.
-**Commit:** working-tree implementation
-**Guard:** `system-sleep-policy.test.ts` scans production main-process sources and rejects Electron `powerSaveBlocker` use or `prevent-app-suspension`. Existing native TTS dispatcher/engine tests continue to pin the background speaking path. Do not use a lifetime system-sleep assertion as a substitute for reliable background message handling.
+**Commit:** `cfc9612`
+**Guard:** `system-sleep-policy.test.ts` scans production main-process sources and rejects Electron `powerSaveBlocker` use or `prevent-app-suspension`. Existing native TTS dispatcher/engine tests continue to pin the background speaking path. All 767 tests pass, typecheck is clean, and lint has zero errors. The v0.1.106 release workflow built and published every platform artifact successfully; GitHub's macOS arm64 update endpoint returns HTTP 200 for v0.1.105 and points at the signed v0.1.106 ZIP. Do not use a lifetime system-sleep assertion as a substitute for reliable background message handling. Local installation and physical TTS acceptance remain intentionally unclaimed until Ethan installs the update.
 ---
 
 ---
