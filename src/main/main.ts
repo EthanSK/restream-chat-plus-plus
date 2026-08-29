@@ -5,7 +5,6 @@ import {
   ipcMain,
   Menu,
   Notification,
-  powerSaveBlocker,
   shell,
 } from 'electron';
 import path from 'node:path';
@@ -789,34 +788,6 @@ app.on('ready', async () => {
   const viewerStats = new ViewerStatsClient();
 
   app.setName('Restream Chat++');
-
-  // v0.1.74 (Ethan voice 4407, 2026-05-30) — BACKGROUND-TTS FIX, layer 3.
-  // ----------------------------------------------------------------------
-  // macOS App Nap can suspend a backgrounded app entirely — timers freeze,
-  // the renderer stops doing work, and (critically) the main-process `say`
-  // queue can stall mid-utterance. `powerSaveBlocker.start(
-  // 'prevent-app-suspension')` tells the OS to keep the app fully running
-  // even when it's not frontmost, which is exactly what we need so chat
-  // messages keep being voiced while RC++ sits behind other windows.
-  //
-  // We hold the blocker for the entire app lifetime (started here, never
-  // explicitly stopped — it's released automatically on quit). The blocker
-  // does NOT keep the *display* awake (that would be
-  // 'prevent-display-sleep'); it only prevents *app* suspension, so the
-  // user's screen can still sleep normally.
-  //
-  // Wrapped defensively: if powerSaveBlocker is unavailable for any reason
-  // the app must still boot — a missing nap-guard degrades to "TTS may
-  // stall under heavy App Nap" rather than a crash.
-  try {
-    const blockerId = powerSaveBlocker.start('prevent-app-suspension');
-    console.log('[main] powerSaveBlocker(prevent-app-suspension) started', {
-      blockerId,
-      active: powerSaveBlocker.isStarted(blockerId),
-    });
-  } catch (err) {
-    console.warn('[main] powerSaveBlocker.start failed', err);
-  }
 
   // v0.1.66 attempted to call `app.configureWebAuthn({ touchID: { ... } })`
   // here to surface the macOS passkey sheet during Google sign-in (per

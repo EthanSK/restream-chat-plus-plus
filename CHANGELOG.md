@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.106 — allow normal system sleep (2026-08-29)
+
+### What's fixed
+
+- **Restream Chat++ no longer keeps the Mac awake for its entire lifetime.**
+  The obsolete Electron power-save assertion has been removed, so normal idle
+  system sleep can occur while the app is open.
+- **Background TTS remains main-process native speech.** Incoming chat still
+  reaches `TtsDispatcher` and `NativeTtsEngine` without depending on renderer
+  Web Speech or a lifetime system-sleep assertion.
+
+### Guard
+
+- Added a source-policy regression test that rejects Electron power-save
+  blockers in production main-process code.
+
 ## v0.1.105 — durable Twitch recovery (2026-08-25)
 
 ### What's fixed

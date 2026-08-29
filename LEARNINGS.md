@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-29T11:45:00Z
+**Trigger:** Ethan asked to remove Restream Chat++'s obsolete lifetime system-sleep blocker without weakening background TTS.
+**Symptom:** The installed v0.1.105 main process owned a macOS `NoIdleSleepAssertion` named `Electron` for essentially its full uptime, preventing normal idle system sleep whenever Restream Chat++ was open.
+**Root cause:** v0.1.74 added `powerSaveBlocker.start('prevent-app-suspension')` as one layer of a renderer Web-Speech reliability workaround and never stopped it until app quit. Electron maps that blocker to a system idle-sleep assertion; it is not merely an App Nap guard. Since v0.1.81, renderer Web Speech has been removed and incoming chat decisions plus native OS speech run in the main process, so the original browser-TTS motivation is obsolete.
+**Fix:** v0.1.106 removes the `powerSaveBlocker` import and lifetime startup call while leaving `TtsDispatcher`, `NativeTtsEngine`, and chat delivery unchanged. Normal macOS idle system sleep is therefore no longer suppressed by Restream Chat++.
+**Commit:** working-tree implementation
+**Guard:** `system-sleep-policy.test.ts` scans production main-process sources and rejects Electron `powerSaveBlocker` use or `prevent-app-suspension`. Existing native TTS dispatcher/engine tests continue to pin the background speaking path. Do not use a lifetime system-sleep assertion as a substitute for reliable background message handling.
+---
+
+---
 **Date:** 2026-08-25T12:33:13Z
 **Trigger:** Ethan: "why does rc++ say twitch is offline when its treaming"
 **Symptom:** The direct Twitch row showed `OFFLINE` while the public Twitch channel was live with one viewer. `direct-chat.jsonl` ended with a healthy keepalive, a server close, and one scheduled reconnect; the persisted `twitchTokenEnc` was then absent, so the toolbar Reconnect action repaired Kick but skipped Twitch.
@@ -398,7 +408,7 @@ Each entry looks like:
 **Trigger:** Ethan voice 4407 2026-05-30
 **Symptom:** TTS doesn't speak incoming chat when app backgrounded too long (message renders but no speech)
 **Root cause:** Default TTS engine is renderer-side window.speechSynthesis (DEFAULT_SETTINGS.tts.engine='browser', types.ts:266). Chromium SUSPENDS speechSynthesis while the page is hidden/occluded and throttles backgrounded renderer timers to ~1/min; speak() is silently swallowed (no onstart/onend/onerror). Chat msgs still render because the WS frame is received in MAIN and pushed over IPC (never throttled). BrowserWindow webPreferences (main.ts) had no backgroundThrottling:false; app had no disable-*-backgrounding switches; no powerSaveBlocker (App Nap could suspend app). Native main-process say(1) engine existed (v0.1.42) but wasn't the default and ignores the volume slider.
-**Fix:** v0.1.74 four stacked layers: (1) webPreferences.backgroundThrottling:false + webContents.setBackgroundThrottling(false) on main window. (2) app.commandLine.appendSwitch disable-background-timer-throttling / disable-renderer-backgrounding / disable-backgrounding-occluded-windows before app.ready. (3) powerSaveBlocker.start('prevent-app-suspension') held for app lifetime. (4) LOAD-BEARING: browser TTSEngine.speak() detects isPageHidden() and routes the utterance to the native window.rcpp.ttsNative say bridge instead of speechSynthesis when hidden; foreground keeps Web Speech so the volume slider works. New 'background_native_fallback' TtsLogEvent for forensics.
+**Fix:** v0.1.74 originally used four stacked layers: (1) webPreferences.backgroundThrottling:false + webContents.setBackgroundThrottling(false) on main window. (2) app.commandLine.appendSwitch disable-background-timer-throttling / disable-renderer-backgrounding / disable-backgrounding-occluded-windows before app.ready. (3) a lifetime powerSaveBlocker assertion, removed in v0.1.106 after native main-process TTS made it obsolete and live `pmset` evidence proved it prevented idle system sleep. (4) LOAD-BEARING at the time: browser TTSEngine.speak() detected isPageHidden() and routed the utterance to the native window.rcpp.ttsNative say bridge instead of speechSynthesis when hidden; v0.1.81 later removed renderer Web Speech entirely in favour of native main-process TTS.
 **Commit:** WORKING-TREE-uncommitted
 **Guard:** src/__tests__/tts-background-fallback.test.ts (5 cases). 594/594 tests pass, typecheck clean.
 ---

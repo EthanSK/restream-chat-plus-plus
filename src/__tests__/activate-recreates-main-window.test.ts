@@ -77,7 +77,6 @@ vi.mock('electron', () => {
     Notification: class {
       show = vi.fn();
     },
-    powerSaveBlocker: { start: vi.fn(), stop: vi.fn(), isStarted: vi.fn(() => false) },
     shell: { openExternal: vi.fn() },
   };
 });

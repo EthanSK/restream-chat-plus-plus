@@ -72,7 +72,6 @@ vi.mock('electron', () => {
         // Test fake: notifications are not exercised by this menu suite.
       }
     },
-    powerSaveBlocker: { start: vi.fn(), stop: vi.fn(), isStarted: vi.fn(() => false) },
     shell: { openExternal: vi.fn() },
   };
 });
