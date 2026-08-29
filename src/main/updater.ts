@@ -970,11 +970,11 @@ export type StartDownloadResult =
  * `autoUpdater.checkForUpdates()` instead so the in-app pipeline
  * actually runs.
  *
- * `autoUpdater.checkForUpdates()` is idempotent — calling it while
- * a download is already in flight is a no-op. We guard against a stray
- * call before the feed URL is configured because the native autoUpdater
- * throws synchronously in that case (same root cause as
- * `checkForUpdatesInteractive`).
+ * `autoUpdater.checkForUpdates()` is not re-entrant on macOS — calling it
+ * while a native check or download is already in flight emits Squirrel's
+ * cryptic "The command is disabled and cannot be executed" error. Guard both
+ * the feed configuration and the synchronously-armed in-flight state before
+ * entering the native updater.
  */
 export const UPDATE_RELEASE_PAGE_URL =
   'https://github.com/EthanSK/restream-chat-plus-plus/releases';
@@ -1037,6 +1037,11 @@ export function triggerSquirrelDownload(): StartDownloadResult {
   // the background.
   if (downloadInFlight) {
     log.info('[updater] download requested but already in flight — no-op');
+    // The native operation is already running, but this entry point represents
+    // an explicit user action (banner button or Check for Updates menu). Keep
+    // that intent so `update-not-available` still surfaces the existing manual
+    // fallback instead of quietly swallowing a real feed disagreement.
+    userRequestedSquirrelDownload = true;
     return { ok: true, reason: 'already-downloading', mode: 'squirrel' };
   }
   try {
@@ -1142,9 +1147,22 @@ function checkForUpdatesInBackground(
     return false;
   }
   try {
+    // Arm the guard before entering Electron. Squirrel emits
+    // `checking-for-update` asynchronously, so relying on that event leaves a
+    // race in which the menu path can issue a second check and make the native
+    // updater emit "The command is disabled and cannot be executed" even
+    // though the first download continues successfully.
+    downloadInFlight = true;
+    downloadStartedAt = Date.now();
+    lastErrorMessage = undefined;
+    lastErrorCategory = undefined;
     autoUpdater.checkForUpdates();
     return true;
   } catch (err) {
+    // A synchronous throw means Electron never accepted the check. Release the
+    // guard so an explicit retry can still start a fresh session.
+    downloadInFlight = false;
+    downloadStartedAt = undefined;
     log.warn(`[updater] ${origin} background check threw`, err);
     appendErrorLog({
       subsystem: 'updater',
@@ -1334,16 +1352,17 @@ export async function checkForUpdatesInteractive(
       // is the only thing that can change which action this triggers.
       if (response === OPEN_RELEASE_PAGE) await shell.openExternal(releaseUrl);
 
-      // 3. Kick Squirrel in the background if it can actually run.
-      //    Wrapped in a try/catch because the native autoUpdater
-      //    throws synchronously if anything is misconfigured — we
-      //    don't want that to leak into the menu-click dispatcher.
+      // 3. Reconcile with Squirrel through the guarded download entry point.
+      //    `performGithubUpdateCheck()` already starts the native background
+      //    check when it discovers a newer release. Calling
+      //    `autoUpdater.checkForUpdates()` directly here used to enter
+      //    Squirrel a second time while that first check was still active,
+      //    producing a false red "command is disabled" banner even though the
+      //    first check later staged the update successfully.
       if (app.isPackaged && process.platform !== 'linux' && feedURLReady) {
-        try {
-          log.info('[updater] kicking Squirrel checkForUpdates() from menu');
-          autoUpdater.checkForUpdates();
-        } catch (err) {
-          log.error('[updater] background Squirrel kick threw', err);
+        const start = triggerSquirrelDownload();
+        if (!start.ok) {
+          log.warn('[updater] guarded Squirrel menu kick did not start', start);
         }
       }
     } else if (info.kind === 'up-to-date') {

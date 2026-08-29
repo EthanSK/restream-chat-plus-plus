@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.107 — reliable Check for Updates (2026-08-29)
+
+### What's fixed
+
+- **Check for Updates no longer flashes a false red failure while the update
+  is successfully downloading.** The GitHub release check and the menu action
+  now share one guarded native Squirrel operation instead of issuing two
+  overlapping `checkForUpdates()` commands.
+- **A real failed start remains retryable.** The in-flight guard is armed
+  before entering Electron and released if Electron rejects the command
+  synchronously.
+
+### Guard
+
+- Added regression coverage for the exact event-gap race: a GitHub-discovered
+  background check followed immediately by the menu/download path, before
+  Squirrel emits `checking-for-update`, must produce one native command.
+
 ## v0.1.106 — allow normal system sleep (2026-08-29)
 
 ### What's fixed

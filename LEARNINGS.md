@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-29T12:25:11Z
+**Trigger:** Ethan: "after doing Check for Updates I see the yellow banner for a split second then" a red `Update failed (v0.1.106)` banner saying `The command is disabled and cannot be executed`.
+**Symptom:** The installed v0.1.105 app correctly discovered v0.1.106, briefly showed the available state, then showed a native-updater failure even though v0.1.106 finished downloading and staging 13 seconds later.
+**Root cause:** `performGithubUpdateCheck(true)` called `rememberPendingDownloadVersion`, which started Squirrel's native background check. After the update-available dialog resolved, `checkForUpdatesInteractive` bypassed the existing guard and called `autoUpdater.checkForUpdates()` directly a second time. At 13:15:40 the overlapping command made Squirrel emit `The command is disabled and cannot be executed`; the original operation then emitted `update-downloaded` at 13:15:53. The background path also waited for Squirrel's asynchronous `checking-for-update` event before marking `downloadInFlight`, leaving an unnecessary event-gap race.
+**Fix:** v0.1.107 arms `downloadInFlight` synchronously before every accepted background native check, releases it on a synchronous start failure, and routes the interactive menu reconciliation through `triggerSquirrelDownload()` instead of directly re-entering Electron. Joining an active operation preserves explicit user intent so a genuine native-feed disagreement still shows the existing manual fallback.
+**Commit:** v0.1.107 release
+**Guard:** `update-flow-fixes.test.ts` reproduces the exact ordering—GitHub starts a background check, the menu/download path follows immediately before any Squirrel event—and proves only one native command is issued. It also proves a synchronous background-start failure releases the guard. All 769 tests pass, typecheck is clean, and lint has zero errors (pre-existing warnings only). The local arm64 v0.1.107 bundle passed strict deep Developer ID verification, Gatekeeper assessment, and nested `libffmpeg.dylib` Team-ID verification. Installation and live updater acceptance remain pending because OBS++ was actively recording; do not quit or replace Restream Chat++ across that boundary.
+---
+
+---
 **Date:** 2026-08-29T11:45:00Z
 **Trigger:** Ethan asked to remove Restream Chat++'s obsolete lifetime system-sleep blocker without weakening background TTS.
 **Symptom:** The installed v0.1.105 main process owned a macOS `NoIdleSleepAssertion` named `Electron` for essentially its full uptime, preventing normal idle system sleep whenever Restream Chat++ was open.

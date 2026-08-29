@@ -167,6 +167,45 @@ describe('v0.1.52 update-flow fixes', () => {
       expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
     });
 
+    it('a GitHub-discovered background check blocks an immediate menu/download retry before Squirrel emits checking-for-update', async () => {
+      const updater = await loadUpdater();
+      updater.configureAutoUpdater();
+
+      // GitHub's available result starts the native check before the
+      // interactive menu dialog resolves. Squirrel has not emitted any event
+      // yet, so the JS guard must be armed synchronously at call time.
+      updater.rememberPendingDownloadVersion('v0.1.107');
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+      expect(updater._getUpdaterInternalsForTest().downloadInFlight).toBe(true);
+
+      const menuRetry = updater.triggerSquirrelDownload();
+      expect(menuRetry).toEqual({
+        ok: true,
+        reason: 'already-downloading',
+        mode: 'squirrel',
+      });
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(1);
+    });
+
+    it('a synchronous background-check throw releases the guard for an explicit retry', async () => {
+      const updater = await loadUpdater();
+      updater.configureAutoUpdater();
+      fakeAutoUpdater.checkForUpdates.mockImplementationOnce(() => {
+        throw new Error('background Squirrel start failed');
+      });
+
+      updater.rememberPendingDownloadVersion('v0.1.107');
+      expect(updater._getUpdaterInternalsForTest().downloadInFlight).toBe(false);
+
+      const retry = updater.triggerSquirrelDownload();
+      expect(retry).toEqual({
+        ok: true,
+        reason: 'started',
+        mode: 'squirrel',
+      });
+      expect(fakeAutoUpdater.checkForUpdates).toHaveBeenCalledTimes(2);
+    });
+
     it('triggerSquirrelDownload() after update-downloaded returns reason=already-staged (no throw, no extra check)', async () => {
       const updater = await loadUpdater();
       updater.configureAutoUpdater();
