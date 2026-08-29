@@ -271,11 +271,8 @@ const api = {
   notify: (title: string, body: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.NOTIFY, { title, body }),
   /**
-   * Subscribe to GH-Releases-API update-check broadcasts. The main process
-   * fires this on every poll completion AND on every explicit "Check Now"
-   * — payload describes whether an update is available, the build is up to
-   * date, checks are disabled, or the check errored. Renderer drives the
-   * `UpdateBanner` from this signal.
+   * Subscribe to every transition from the main-process update controller.
+   * The renderer drives the UpdateBanner solely from this signal.
    */
   onUpdateStatus: (cb: (info: UpdateInfo) => void): Unsub => {
     const h = (_: unknown, info: UpdateInfo) => cb(info);
@@ -307,14 +304,10 @@ const api = {
   openExternal: (url: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.OPEN_EXTERNAL, url),
   /**
-   * Kick Squirrel's in-app download from the renderer. Bound to the
-   * `UpdateBanner` "Download" button in the `available` state. Main-
-   * process handler fires `autoUpdater.checkForUpdates()` which drives
-   * the banner through `downloading` → `ready-to-install` via the
-   * existing Squirrel progress forwarders. On failure (unsigned build,
-   * dev mode, Linux, transient error) the handler pops a native info
-   * dialog and returns a failure payload — the renderer doesn't need
-   * to render anything itself, the dialog IS the user-facing message. v0.1.32.
+   * Start the one visible Squirrel download session. Main publishes
+   * `downloading` before entering the native updater, then progress and
+   * staging events drive the remaining states. Unsupported builds fall back
+   * to the release page.
    */
   startUpdateDownload: (): Promise<
     | { ok: true; reason: 'started'; mode: 'squirrel' }
@@ -323,14 +316,19 @@ const api = {
     | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
     | {
         ok: false;
-        reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
+        reason:
+          | 'not-packaged'
+          | 'unsupported-platform'
+          | 'feed-unavailable'
+          | 'not-available'
+          | 'error';
         error?: string;
         releaseUrl: string;
       }
   > => ipcRenderer.invoke(IPC.UPDATE_DOWNLOAD_START),
   /**
    * Trigger Squirrel's `autoUpdater.quitAndInstall()` from the renderer.
-   * Bound to the `UpdateBanner` "Restart" button in the `ready-to-install`
+   * Bound to `Restart & Install` in the `ready-to-install`
    * state. Main-process handler guards on whether an update has actually
    * been downloaded; resolves with `{ ok: false, reason }` otherwise so
    * the renderer can surface a graceful error rather than crashing. v0.1.25.

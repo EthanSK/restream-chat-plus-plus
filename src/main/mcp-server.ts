@@ -32,11 +32,14 @@ import type { Store } from './store';
 import type { ChatClient } from './ws-client';
 import type { OAuthCoordinator } from './oauth';
 // v0.1.64 — wire the updater state machine into the MCP bridge so the
-// four new update-orchestration tools (update_check_now,
-// update_download_status, update_install_now, update_logs_tail) can read
-// + drive auto-update without scraping the renderer broadcast.
-import { getDownloadState, triggerInstallNow } from './updater';
-import { getLastUpdateInfo } from './github-update-check';
+// updater orchestration tools (check, download, status, install, logs) can
+// read and drive the same controller without scraping renderer broadcasts.
+import {
+  getDownloadState,
+  getLastUpdateInfo,
+  triggerInstallNow,
+  triggerSquirrelDownload,
+} from './updater';
 
 export interface McpServerDeps {
   /** Reads + writes the LIVE Settings (the same path the renderer IPC uses). */
@@ -153,9 +156,10 @@ export async function startInProcessMcpServer(
       }
     },
     checkForUpdatesNow: () => deps.checkForUpdatesNow(),
+    triggerUpdateDownload: () => triggerSquirrelDownload(),
     // v0.1.64 — expose Squirrel's coarse download-state machine + the
     // last cached GH-Releases UpdateInfo + the install trigger so the
-    // four new update-orchestration tools can drive a complete update
+    // update-orchestration tools can drive a complete update
     // flow without IPC round-trips through the renderer. See
     // `src/main/updater.ts:getDownloadState` for state semantics.
     getUpdateDownloadState: () => getDownloadState(),

@@ -43,15 +43,13 @@ import {
 import {
   configureAutoUpdater,
   checkForUpdatesInteractive,
+  getLastUpdateInfo,
+  performUpdateCheck,
   quitAndInstallStagedUpdate,
+  startUpdatePoller,
   triggerSquirrelDownload,
   type StartDownloadResult,
 } from './updater';
-import {
-  getLastUpdateInfo,
-  performGithubUpdateCheck,
-  startGithubUpdatePoller,
-} from './github-update-check';
 import { startInProcessMcpServer } from './mcp-server';
 // v0.1.94 — live viewer count (streaming-updates WS client; see
 // src/shared/viewer-stats-core.ts for the data-source contract).
@@ -617,18 +615,10 @@ function buildMenu(onRevealLogs: () => void) {
                 id: 'check-for-updates-now',
                 label: 'Check for Updates Now…',
                 enabled: true,
-                // v0.1.37: `checkForUpdatesInteractive` now uses the
-                // GH-Releases pipeline as the authoritative source for
-                // the user-facing dialog (instead of Squirrel's
-                // `autoUpdater.checkForUpdates()`). Pre-v0.1.37 the
-                // dialog and the banner could disagree — on unsigned
-                // builds Squirrel reported "you're on the latest
-                // version" while GH-Releases said `available`. Voice
-                // 3351 called this out explicitly. The menu click
-                // therefore only needs ONE call now; the function
-                // internally also kicks Squirrel in the background on
-                // signed builds so the in-app pipeline still gets a
-                // chance to run.
+                // One controller owns the dialog, banner, and native state.
+                // Checking discovers metadata only; if a release exists the
+                // dialog offers the same explicit Download Update action as
+                // the banner. No hidden Squirrel operation starts here.
                 //
                 // The click handler MUST NOT throw synchronously —
                 // Electron surfaces a sync throw as the macOS system
@@ -897,13 +887,12 @@ app.on('ready', async () => {
   // the public release do not turn the feed's HTTP 404 into a false error banner.
   configureAutoUpdater();
 
-  // Wire the GH-Releases-API-backed update checker. Unlike the Squirrel-based
-  // path above, this works on unsigned builds and is the source of truth for
-  // whether a newer release exists. A positive result starts the native
-  // background download; otherwise the native feed stays idle.
+  // Poll GitHub for release metadata through the same controller that owns
+  // native download/install state. A positive result only shows the banner;
+  // Squirrel remains idle until the user explicitly chooses Download Update.
   // The poller reads `settings.update.autoCheck` at every tick so toggling
   // the Settings switch takes effect without a restart.
-  startGithubUpdatePoller(() => loadSettings().update.autoCheck);
+  startUpdatePoller(() => loadSettings().update.autoCheck);
 
   // ----- IPC: auth -----
   ipcMain.handle(IPC.AUTH_START, async () => {
@@ -1811,7 +1800,7 @@ app.on('ready', async () => {
   // future explicit-check button in Settings. Always runs regardless of
   // settings.update.autoCheck because it's an explicit user request.
   ipcMain.handle(IPC.UPDATE_CHECK_NOW, async (): Promise<UpdateInfo> => {
-    return performGithubUpdateCheck(true);
+    return performUpdateCheck(true);
   });
 
   // ----- IPC: open arbitrary URL in default browser -----
@@ -1831,10 +1820,10 @@ app.on('ready', async () => {
   ipcMain.handle(IPC.UPDATE_QUIT_AND_INSTALL, () => quitAndInstallStagedUpdate());
 
   // ----- IPC: kick Squirrel's in-app download (v0.1.32, fallback rewired v0.1.37) -----
-  // Bound to the renderer's UpdateBanner "Install Update" button.
-  // v0.1.32: button fires `autoUpdater.checkForUpdates()` so Squirrel's
-  // download events drive the banner state machine through `downloading`
-  // → `ready-to-install` → Restart click → `quitAndInstall()`.
+  // Bound to the renderer's UpdateBanner "Download Update" button.
+  // The controller publishes `downloading` synchronously, then makes exactly
+  // one `autoUpdater.checkForUpdates()` call. Squirrel events drive progress
+  // → `ready-to-install` → Restart & Install → `quitAndInstall()`.
   //
   // v0.1.37: on failure (unsigned build, dev mode, Linux, transient
   // error) we open the GitHub release page DIRECTLY in the user's
@@ -1845,9 +1834,8 @@ app.on('ready', async () => {
   ipcMain.handle(IPC.UPDATE_DOWNLOAD_START, async (): Promise<StartDownloadResult> => {
     const result = triggerSquirrelDownload();
     if (result.ok) {
-      // Signed packaged build: Squirrel pipeline kicked. The renderer
-      // shows a "Starting download…" toast; the existing download-
-      // progress forwarders then drive the banner.
+      // Signed packaged build: the controller already published the visible
+      // downloading state before this IPC response resolves.
       return result;
     }
     // v0.1.37 fallback: on unsigned / dev / Linux / transient errors,
@@ -2518,7 +2506,7 @@ app.on('ready', async () => {
       getMainWindow: () => mainWindow,
       chat,
       oauth,
-      checkForUpdatesNow: () => performGithubUpdateCheck(true),
+      checkForUpdatesNow: () => performUpdateCheck(true),
       store,
     });
     if (started) {

@@ -129,6 +129,8 @@ export interface LiveSettingsBridge {
    * returns the legacy hint payload.
    */
   checkForUpdatesNow?: () => Promise<unknown>;
+  /** Start the same visible native download session as Download Update. */
+  triggerUpdateDownload?: () => unknown;
   /**
    * v0.1.64 — read the current Squirrel download state machine without
    * relying on side-channel renderer broadcasts. Returns the same shape
@@ -141,7 +143,13 @@ export interface LiveSettingsBridge {
    * standard "GUI not introspectable" hint).
    */
   getUpdateDownloadState?: () => {
-    state: 'idle' | 'checking' | 'downloading' | 'ready-to-install' | 'error';
+    state:
+      | 'idle'
+      | 'checking'
+      | 'downloading'
+      | 'ready-to-install'
+      | 'installing'
+      | 'error';
     pendingVersion: string | undefined;
     downloadStartedAt: number | undefined;
     lastErrorMessage: string | undefined;
@@ -874,24 +882,25 @@ const signOut: ToolDefinition = {
 //                                  knows if there's a newer version
 //                                  (kind === 'available') or not
 //                                  (kind === 'up-to-date').
-//   2. `update_download_status`  → coarse-grained download-state machine
+//   2. `update_download_start`   → explicitly enter the native download
+//   3. `update_download_status`  → coarse-grained download-state machine
 //                                  (idle / checking / downloading /
 //                                  ready-to-install / error) + version +
 //                                  elapsed time + last error if any.
 //                                  Poll this while a download is in
 //                                  flight.
-//   3. `update_install_now`      → install + relaunch when the state
+//   4. `update_install_now`      → install + relaunch when the state
 //                                  reaches 'ready-to-install'. Refuses
 //                                  if no bundle is staged. SAFETY: this
 //                                  WILL close the app and restart — any
 //                                  unsaved renderer state is lost.
-//   4. `update_logs_tail`        → return the last N lines of main.log
+//   5. `update_logs_tail`        → return the last N lines of main.log
 //                                  filtered to updater events so the
 //                                  agent can investigate a stuck or
 //                                  failed download without leaving the
 //                                  MCP surface.
 //
-// All four are HTTP-MCP-only — they REQUIRE the in-process bridge
+// All five are HTTP-MCP-only — they REQUIRE the in-process bridge
 // (`ctx.live`). The legacy `--mcp-stdio` path returns the standard
 // `guiNotIntrospectable` hint because file-only access can't reach the
 // running autoUpdater. v0.1.36+ ships with the HTTP MCP enabled by
@@ -932,16 +941,37 @@ const updateCheckNowV2: ToolDefinition = {
   },
 };
 
+const updateDownloadStart: ToolDefinition = {
+  name: 'update_download_start',
+  description:
+    'Start the native download for the release returned by update_check_now. ' +
+    'This does not restart the app. The authoritative controller immediately ' +
+    'enters downloading; poll update_download_status until ready-to-install.',
+  inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  handler: async (_args, ctx) => {
+    if (!ctx.live?.triggerUpdateDownload) {
+      return {
+        ok: false,
+        guiNotIntrospectable: true,
+        hint:
+          'update_download_start requires the in-process HTTP MCP transport. ' +
+          'Open the Restream Chat++ GUI and try again.',
+      };
+    }
+    return ctx.live.triggerUpdateDownload();
+  },
+};
+
 const updateDownloadStatus: ToolDefinition = {
   name: 'update_download_status',
   description:
     "v0.1.64 — Return the current Squirrel auto-update download state " +
-    'machine. States: idle, checking, downloading, ready-to-install, error. ' +
+    'machine. States: idle, checking, downloading, ready-to-install, installing, error. ' +
     'Includes pendingVersion (the tag being downloaded), downloadStartedAt ' +
     '(epoch ms), elapsedSeconds (derived), lastErrorMessage, and ' +
     'lastErrorCategory (signature-mismatch / network / staging / unknown). ' +
-    "Poll this in a loop while you've kicked a download via " +
-    '`update_check_now` until state==="ready-to-install", then call ' +
+    'After update_check_now reports available, call update_download_start. ' +
+    'Poll until state==="ready-to-install", then call ' +
     '`update_install_now`. Stable shape — safe for agent state machines.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   handler: async (_args, ctx) => {
@@ -1066,8 +1096,8 @@ const updateLogsTail: ToolDefinition = {
         triedPaths: candidates,
       };
     }
-    // Filter to updater-relevant lines. We use a coarse OR over the names
-    // updater.ts + github-update-check.ts + Squirrel emit. This is the same
+    // Filter to updater-relevant lines. We use a coarse OR over controller,
+    // adapter, and Squirrel event names. This is the same
     // pattern Ethan used manually when grepping the log (see the diagnosis
     // session 2026-05-23).
     const allLines = raw.split('\n');
@@ -1165,6 +1195,7 @@ export const TOOLS: ToolDefinition[] = [
   // v0.1.64 update-orchestration tools. Listed AFTER the legacy
   // `checkForUpdatesNow` to keep the order stable for snapshot tests.
   updateCheckNowV2,
+  updateDownloadStart,
   updateDownloadStatus,
   updateInstallNow,
   updateLogsTail,

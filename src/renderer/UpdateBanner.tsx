@@ -1,36 +1,16 @@
-// Update banner — v0.1.25, Download button rewired in v0.1.32, button
-// relabelled to "Install Update" + fallback-to-release-page added in v0.1.37,
-// in-banner click feedback (spinner + toast) added in v0.1.39.
+// Visible frontend for the single main-process update controller.
 //
 // Renders a thin strip below the titlebar that surfaces the current
 // state of the auto-update flow. v0.1.24 had a single "Update available"
 // state; v0.1.25 adds three more so the user gets continuous feedback
-// while the background download is happening:
+// while the user-requested download is happening:
 //
 //   `checking`         → small spinner + "Checking for updates…".
 //                        Fired by the GH-Releases poller AND by the
 //                        manual "Check for Updates Now…" path.
-//   `available`        → "Update available {version}" + Install Update +
-//                        Later buttons. v0.1.32: clicking the primary
-//                        button kicks Squirrel's in-app `checkForUpdates()`
-//                        pipeline (via `IPC.UPDATE_DOWNLOAD_START`)
-//                        instead of opening the GitHub release page in
-//                        the user's default browser. The banner state
-//                        machine transitions to `downloading` once
-//                        Squirrel emits its first `download-progress`
-//                        event — no extra renderer wiring needed.
-//                        v0.1.37: button label changed from "Download" to
-//                        "Install Update"; on unsigned / dev / Linux the
-//                        main-process handler opens the release page
-//                        directly so the click is never a no-op.
-//                        v0.1.39: click now shows a spinner + "Installing…"
-//                        on the button (disabled while in flight) plus a
-//                        toast in the top-right of the banner explaining
-//                        what just happened — Squirrel kicked / browser
-//                        opened / error. Voice 3369: "I clicked install
-//                        update and I don't see anything happening." The
-//                        feedback is always visible regardless of which
-//                        backend path actually ran.
+//   `available`        → "Update available {version}" + Download Update +
+//                        Later. The click enters `downloading` synchronously
+//                        in main before Squirrel is called.
 //   `downloading`      → "Downloading update… NN%" + progress bar.
 //                        Driven by Squirrel's `download-progress` event;
 //                        on signed builds only. NO Dismiss button — once
@@ -39,6 +19,7 @@
 //   `ready-to-install` → "Update ready — Restart to install" + Restart
 //                        button. Fired by `update-downloaded`. Restart
 //                        calls `quitAndInstall()` via IPC.
+//   `installing`       → terminal busy state while Squirrel takes over.
 //
 // State machine (pure, tested via `updateBannerState`):
 //   info.kind === 'available'        AND !dismissed → 'available'
@@ -46,6 +27,7 @@
 //   info.kind === 'checking'                       → 'checking'
 //   info.kind === 'downloading'                    → 'downloading'
 //   info.kind === 'ready-to-install'               → 'ready-to-install'
+//   info.kind === 'installing'                      → 'installing'
 //   anything else (up-to-date / disabled / error)  → 'hidden'
 //
 // The `dismissed` flag is intentionally session-only and only applies to
@@ -77,6 +59,7 @@ export type BannerState =
   | 'available'
   | 'downloading'
   | 'ready-to-install'
+  | 'installing'
   | 'error';
 
 export function updateBannerState(
@@ -90,7 +73,7 @@ export function updateBannerState(
     case 'available':
       if (dismissed) return 'hidden';
       // `available` implies latestVersion + releaseUrl are populated per
-      // the main-process contract (`github-update-check.ts`); guard
+      // the main-process controller contract; guard
       // anyway so a malformed payload doesn't render a button with no URL.
       if (!info.latestVersion || !info.releaseUrl) return 'hidden';
       return 'available';
@@ -98,6 +81,8 @@ export function updateBannerState(
       return 'downloading';
     case 'ready-to-install':
       return 'ready-to-install';
+    case 'installing':
+      return 'installing';
     case 'error':
       // v0.1.61 — only show the error pane when the error came from the
       // Squirrel download/install path (i.e. populated by
@@ -218,7 +203,12 @@ export type StartDownloadResult =
     }
   | {
       ok: false;
-      reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
+      reason:
+        | 'not-packaged'
+        | 'unsupported-platform'
+        | 'feed-unavailable'
+        | 'not-available'
+        | 'error';
       error?: string;
       releaseUrl: string;
     };
@@ -250,20 +240,12 @@ export function decideToast(result: StartDownloadResult): ToastSpec {
       if (result.reason === 'already-downloading') {
         return {
           kind: 'info',
-          text: "Update is already being prepared in the background — you'll be prompted to restart when it's ready.",
+          text: 'The update download is already in progress.',
         };
       }
-      // v0.1.89 (voice 4507) — the consolidated flow no longer shows a
-      // foreground top-bar download bar (see SUPPRESS_FOREGROUND_DOWNLOAD_UI
-      // in src/main/updater.ts). The bundle downloads in the BACKGROUND via
-      // Squirrel's hourly poll; the user's only job is to Restart once it's
-      // staged. So the snackbar now tells them exactly that instead of the
-      // old "Downloading update…" which implied a visible progress bar was
-      // coming. The banner will flip to "Restart to install" on its own when
-      // `update-downloaded` fires.
       return {
         kind: 'info',
-        text: "Update downloading in the background — you'll be prompted to restart when it's ready.",
+        text: 'Update download started.',
       };
     }
     return { kind: 'info', text: 'Opening release page in browser…' };
@@ -290,16 +272,11 @@ export function decideToast(result: StartDownloadResult): ToastSpec {
 export const TOAST_AUTO_DISMISS_MS = 3000;
 
 /**
- * Button labels — exported so tests can assert without hard-coding the
- * strings. The `Installing…` label is shown while the click handler is
- * awaiting the IPC round-trip; once the toast renders the button flips
- * back to `Install Update` so a follow-up click is possible (e.g. user
- * dismissed the toast but the browser bounce failed silently — they
- * deserve a retry without having to wait for a banner state transition).
+ * Button labels — exported so tests can pin the exact action contract.
  */
-export const INSTALL_BUTTON_LABEL_IDLE = 'Install Update';
-export const INSTALL_BUTTON_LABEL_INSTALLING = 'Installing…';
-export const RESTART_BUTTON_LABEL_IDLE = 'Restart';
+export const INSTALL_BUTTON_LABEL_IDLE = 'Download Update';
+export const INSTALL_BUTTON_LABEL_INSTALLING = 'Starting…';
+export const RESTART_BUTTON_LABEL_IDLE = 'Restart & Install';
 export const RESTART_BUTTON_LABEL_RESTARTING = 'Restarting…';
 
 interface Props {
@@ -341,7 +318,7 @@ export function UpdateBanner({
   // v0.1.39 state — only used in the `available` branch but hoisted to
   // the top of the component so React's hook count is stable across
   // renders regardless of which branch we return from (Rules of Hooks).
-  const [installing, setInstalling] = React.useState(false);
+  const [startingDownload, setStartingDownload] = React.useState(false);
   const [restarting, setRestarting] = React.useState(false);
   const [toast, setToast] = React.useState<ToastSpec | null>(null);
 
@@ -389,7 +366,7 @@ export function UpdateBanner({
 
   if (state === 'available') {
     const version = info!.latestVersion!;
-    const label = installing
+    const label = startingDownload
       ? INSTALL_BUTTON_LABEL_INSTALLING
       : INSTALL_BUTTON_LABEL_IDLE;
     return (
@@ -400,31 +377,16 @@ export function UpdateBanner({
         <div className="update-banner-actions">
           <button
             className="btn primary"
-            disabled={installing}
-            aria-busy={installing}
+            disabled={startingDownload}
+            aria-busy={startingDownload}
             onClick={() => {
-              // v0.1.37: button label is now "Install Update" — the v0.1.32
-              // wording "Download" was ambiguous (Ethan: "It should just do
-              // the same thing as what check for updates does"). Behaviour:
-              // fire IPC.UPDATE_DOWNLOAD_START in main → if Squirrel feed is
-              // ready (signed packaged build) it kicks the in-app pipeline
-              // and the banner transitions through 'downloading' →
-              // 'ready-to-install' automatically via Squirrel progress
-              // events. On unsigned / dev / Linux the main-process handler
-              // opens the GitHub release page directly (no extra dialog
-              // click) so a click on this button always results in a
-              // visible next step rather than silently failing.
-              //
-              // v0.1.39: await the structured StartDownloadResult and show
-              // a toast describing the outcome. The button flips to
-              // disabled + "Installing…" while the IPC is in flight so the
-              // user sees something happening even on a slow OAuth-blocked
-              // boot path.
-              setInstalling(true);
+              // Main publishes `downloading` before entering Squirrel, so a
+              // successful click replaces this button with visible progress.
+              setStartingDownload(true);
               void (async () => {
                 try {
                   const result = await onStartDownload();
-                  setToast(decideToast(result));
+                  if (result.reason !== 'started') setToast(decideToast(result));
                 } catch (err) {
                   // The IPC layer normalises errors into `ok: false`
                   // results, so this branch is for the truly-pathological
@@ -437,12 +399,12 @@ export function UpdateBanner({
                     )}`,
                   });
                 } finally {
-                  setInstalling(false);
+                  setStartingDownload(false);
                 }
               })();
             }}
           >
-            {installing && (
+            {startingDownload && (
               <span
                 className="update-banner-spinner update-banner-button-spinner"
                 aria-hidden="true"
@@ -450,7 +412,7 @@ export function UpdateBanner({
             )}
             {label}
           </button>
-          <button className="btn ghost" onClick={onDismiss} disabled={installing}>
+          <button className="btn ghost" onClick={onDismiss} disabled={startingDownload}>
             Later
           </button>
         </div>
@@ -505,6 +467,17 @@ export function UpdateBanner({
             Dismiss
           </button>
         </div>
+      </div>
+    );
+  }
+
+  if (state === 'installing') {
+    return (
+      <div className="update-banner update-banner-ready" role="status" aria-live="polite">
+        <span className="update-banner-spinner" aria-hidden="true" />
+        <span className="update-banner-text">
+          Installing update{info!.latestVersion ? ` (${info!.latestVersion})` : ''} — Restream Chat++ will restart…
+        </span>
       </div>
     );
   }
@@ -584,7 +557,7 @@ export function UpdateBanner({
  *   - Percentage (if Squirrel reported one) OR "starting" placeholder.
  *   - Bytes-downloaded / bytes-total (if Squirrel reported them).
  *   - Download speed in KB/s or MB/s.
- *   - Elapsed time since the user clicked Install Update.
+ *   - Elapsed time since the user clicked Download Update.
  *   - After 30s with NO percent reported AND no bytes transferred, a
  *     "Squirrel hasn't reported progress yet — this can take a moment"
  *     hint to reassure the user (the common silent-failure mode on

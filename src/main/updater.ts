@@ -1,447 +1,118 @@
-// Auto-update wiring for Restream Chat++.
-//
-// Uses Electron's native autoUpdater against
-// `https://update.electronjs.org/<owner>/<repo>/<platform>-<arch>/<version>`
-// (Electron's free public service for open-source apps). We configure the
-// feed and let the GitHub Releases checker decide when a native download is
-// needed so a staged update can freeze background checks until installation.
-//
-// Notes:
-// - The service requires the GitHub repo to be PUBLIC. Ours is.
-// - Auto-update only works when the app is signed + notarized on macOS
-//   (Squirrel.Mac refuses unsigned updates). The CI release job handles
-//   that; configureAutoUpdater skips local development builds.
-// - Background checks are deliberately skipped while a download/check is in
-//   flight and after `update-downloaded`; Squirrel.Mac can invalidate its
-//   staged install if `checkForUpdates()` is called again before Restart.
-
 import { app, autoUpdater, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
-import { IPC, UpdateInfo } from '../shared/types';
-import { isNewerVersion } from '../shared/version';
-import { performGithubUpdateCheck } from './github-update-check';
-// v0.1.69 (voice 4015) — structured error log. The updater already writes
-// to electron-log's main.log via `log.error/warn`, but main.log is plain
-// text and isn't grep-friendly across subsystems. Mirror the operational
-// failure paths (Squirrel error event, signature mismatch, sync throw
-// from checkForUpdates, quitAndInstall failures) into app-errors.jsonl
-// so a single structured-log walk covers updater + oauth + WS + send.
+import { IPC, type UpdateInfo } from '../shared/types';
 import { appendErrorLog, errorToString } from './structured-log';
+import {
+  UpdateController,
+  categoriseUpdateError,
+  UPDATE_DOWNLOAD_RETRY_DELAYS_MS,
+  type LatestRelease,
+} from './update-controller';
 
 const REPO = 'EthanSK/restream-chat-plus-plus';
+const RELEASES_API_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
+export const UPDATE_RELEASE_PAGE_URL = `https://github.com/${REPO}/releases`;
 export const AUTO_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+const FIRST_CHECK_DELAY_MS = 3_000;
+const RELEASE_REQUEST_TIMEOUT_MS = 15_000;
 
 let configured = false;
-// True once `autoUpdater.setFeedURL` has succeeded. We must not invoke
-// `autoUpdater.checkForUpdates()` before this — the native autoUpdater throws
-// synchronously without a feed URL, which in turn surfaces the macOS "this
-// command is disabled and cannot be executed" alert when the throw happens
-// inside a menu click handler.
 let feedURLReady = false;
-let backgroundUpdateTimer: NodeJS.Timeout | undefined;
-// Re-entrancy guard: stop the user spam-clicking the menu item while a
-// check is already mid-flight (each click adds a `once` listener; without
-// this guard multiple "you're on the latest version" dialogs would stack).
-let checkInFlight = false;
-// True after Squirrel emits `update-downloaded` — guards `quitAndInstall()`
-// so the renderer's Restart button can't trigger a sync throw if it
-// somehow fires before the download settled. v0.1.25.
-let updateDownloaded = false;
-// True while Squirrel's `autoUpdater` is in the "checking-for-update" or
-// "update-available; downloading" state. Calling `checkForUpdates()` again
-// during this window throws "The command is disabled and cannot be
-// executed" on macOS — Squirrel's state machine refuses re-entry while a
-// session is active. v0.1.52: tracked so the renderer "Install Update"
-// button can short-circuit instead of bouncing the error back to the UI.
-let downloadInFlight = false;
-// v0.1.61 — epoch ms of when the current download session armed. Forwarded
-// to the renderer in every `kind: 'downloading'` payload so the banner can
-// render elapsed time + "this download has been running for >2 min without
-// reported progress" warnings. Reset to undefined on terminal events
-// (`update-downloaded`, `error`).
-let downloadStartedAt: number | undefined;
-// v0.1.61 — most recent `latestVersion` resolved from GH Releases. The
-// Squirrel-side `download-progress` event doesn't carry the new version
-// string, so we cache it from the most recent `available` UpdateInfo
-// broadcast and include it on every `downloading` payload so the banner
-// can show "Downloading Restream Chat++ v0.1.61… 42%" instead of an
-// anonymous percentage.
-let pendingDownloadVersion: string | undefined;
-// v0.1.92 — tracks whether the current Squirrel check was kicked by the
-// renderer's visible "Install Update" button. Background hourly checks are
-// allowed to fail quietly (the GH banner will poll again), but a user-clicked
-// check must never vanish into `update-not-available` silence when the GitHub
-// release poller already proved a newer version exists.
-let userRequestedSquirrelDownload = false;
+let nativeListenersAttached = false;
+let autoCheckEnabled: () => boolean = () => true;
+let firstCheckTimer: ReturnType<typeof setTimeout> | undefined;
+let intervalTimer: ReturnType<typeof setInterval> | undefined;
+let interactiveCheckInFlight = false;
 
-// ---------------------------------------------------------------------------
-// v0.1.85 (voice 7280) — DOWNLOAD-RETRY RESILIENCE.
-//
-// THE BUG WE'RE FIXING:
-//   Ethan reported the update flow is flaky — "you click install update and
-//   then restart, and it quits and opens, and... oh well, now it's working...
-//   it just worked after about three times." i.e. the in-app download (or the
-//   quit→relaunch swap) was failing on the first ~2 attempts and only landed
-//   on the 3rd manual retry. The most likely culprit is a TRANSIENT network
-//   blip mid-download: Squirrel.Mac emits an `error` event, our handler reset
-//   `downloadInFlight=false` and broadcast an error pane, and then NOTHING
-//   retried — the user had to manually click Install again. Each manual click
-//   is one attempt; 3 clicks = the "worked after about three times" symptom.
-//
-// THE FIX:
-//   When Squirrel emits an `error` whose category is `network` (transient —
-//   the exact "fails while downloading" case Ethan called out), automatically
-//   re-arm `autoUpdater.checkForUpdates()` on a bounded exponential backoff
-//   (5s → 15s → 45s, max 3 retries) instead of dead-ending. We deliberately
-//   do NOT auto-retry `signature-mismatch` / `staging` / `unknown` categories
-//   — those won't fix themselves on retry (a bad signature stays bad), so we
-//   leave them surfaced to the user with the manual-fallback link as before.
-//
-// WHY BOUNDED + EXPONENTIAL:
-//   A transient blip (Wi-Fi handoff, DNS hiccup) usually clears within
-//   seconds, so 5s gives a fast first retry. Doubling-ish (5→15→45) avoids
-//   hammering GH releases / update.electronjs.org if the network is genuinely
-//   down. Capping at 3 attempts means a persistently-broken network surfaces
-//   the error to the user within ~65s total rather than retrying forever.
-// ---------------------------------------------------------------------------
-
-/** Backoff schedule (ms) for auto-retrying a transient download failure. */
-export const DOWNLOAD_RETRY_DELAYS_MS = [5_000, 15_000, 45_000];
-/** Max auto-retry attempts before giving up + surfacing the error pane. */
-export const DOWNLOAD_RETRY_MAX = DOWNLOAD_RETRY_DELAYS_MS.length;
-
-// How many transient download retries we've fired for the CURRENT download
-// session. Reset to 0 whenever a fresh user-initiated download starts
-// (`triggerSquirrelDownload`), whenever a download succeeds
-// (`update-downloaded`), and whenever Squirrel reports `update-not-available`
-// (no work to do). Without the reset, a download that recovered after one
-// blip would carry a stale count into the next session and give up early.
-let downloadRetryCount = 0;
-// Outstanding retry timer handle so we can cancel it if the user manually
-// re-clicks Install (avoids a manual click + an auto-retry firing
-// `checkForUpdates()` twice, which would throw "command is disabled").
-let downloadRetryTimer: NodeJS.Timeout | undefined;
-// Injectable timer for tests (Vitest fake timers drive the real globals, but
-// keeping the seam explicit makes the retry path unit-testable in isolation).
-let retrySetTimeout: (fn: () => void, ms: number) => NodeJS.Timeout =
-  ((fn, ms) => setTimeout(fn, ms)) as typeof retrySetTimeout;
-let retryClearTimeout: (h: NodeJS.Timeout) => void = (h) => clearTimeout(h);
-
-/**
- * v0.1.85 — test seam: swap the retry timer primitives. Returns a restore
- * fn. Not part of the runtime API; only used by the Vitest suite so it can
- * assert the backoff schedule deterministically without real-time waits.
- */
-export function _setRetryTimersForTest(
-  set: (fn: () => void, ms: number) => NodeJS.Timeout,
-  clear: (h: NodeJS.Timeout) => void,
-): () => void {
-  const prevSet = retrySetTimeout;
-  const prevClear = retryClearTimeout;
-  retrySetTimeout = set;
-  retryClearTimeout = clear;
-  return () => {
-    retrySetTimeout = prevSet;
-    retryClearTimeout = prevClear;
-  };
-}
-
-/** Cancel any pending auto-retry timer + reset the per-session counter. */
-function resetDownloadRetryState(): void {
-  if (downloadRetryTimer) {
-    retryClearTimeout(downloadRetryTimer);
-    downloadRetryTimer = undefined;
-  }
-  downloadRetryCount = 0;
-}
-
-/**
- * v0.1.85 — schedule an automatic re-attempt of the in-app download after a
- * TRANSIENT (network-category) Squirrel error. Returns `true` if a retry was
- * armed, `false` if we've exhausted the budget (caller should leave the error
- * surfaced). Exported for unit tests; called from the `error` handler.
- *
- * The retry fires `autoUpdater.checkForUpdates()` directly (same entry point
- * `triggerSquirrelDownload` uses) — by the time it runs `downloadInFlight`
- * has already been reset to false by the `error` handler, so the call is
- * safe (won't hit Squirrel's "command is disabled" re-entry guard).
- */
-export function scheduleDownloadRetry(): boolean {
-  if (downloadRetryCount >= DOWNLOAD_RETRY_MAX) {
-    log.warn(
-      `[updater] download-retry budget exhausted (${downloadRetryCount}/${DOWNLOAD_RETRY_MAX}) — leaving error surfaced`,
-    );
-    return false;
-  }
-  // Cancel any previously-armed timer so we never have two outstanding
-  // retries racing (defensive — the error handler resets in-flight first).
-  if (downloadRetryTimer) {
-    retryClearTimeout(downloadRetryTimer);
-    downloadRetryTimer = undefined;
-  }
-  const delay = DOWNLOAD_RETRY_DELAYS_MS[downloadRetryCount];
-  downloadRetryCount += 1;
-  const attempt = downloadRetryCount;
-  log.info(
-    `[updater] arming transient download retry ${attempt}/${DOWNLOAD_RETRY_MAX} in ${delay}ms`,
-  );
-  // Tell the renderer we're going to retry so the banner can show
-  // "Download failed — retrying (1/3)…" instead of a dead error pane. The
-  // banner already renders `kind: 'downloading'` as an indeterminate bar, so
-  // reusing it keeps the UI honest while we wait out the backoff.
-  broadcastSquirrelStatus({
-    kind: 'downloading',
-    currentVersion: app.getVersion(),
-    latestVersion: pendingDownloadVersion,
-    downloadStartedAt,
-    downloadRetryAttempt: attempt,
-    downloadRetryMax: DOWNLOAD_RETRY_MAX,
-    checkedAt: Date.now(),
-  });
-  downloadRetryTimer = retrySetTimeout(() => {
-    downloadRetryTimer = undefined;
-    // Guard: if the user manually recovered (update already staged) or a
-    // fresh check is already in flight, skip — re-entering checkForUpdates()
-    // now would throw Squirrel's "command is disabled".
-    if (updateDownloaded) {
-      log.info('[updater] download-retry: update already staged, skipping retry');
-      return;
-    }
-    if (downloadInFlight) {
-      log.info('[updater] download-retry: a download is already in flight, skipping retry');
-      return;
-    }
-    if (!feedURLReady) {
-      log.warn('[updater] download-retry: feed URL not ready, skipping retry');
-      return;
-    }
-    try {
-      log.info(`[updater] firing transient download retry ${attempt}/${DOWNLOAD_RETRY_MAX}`);
-      downloadInFlight = true;
-      downloadStartedAt = Date.now();
-      broadcastSquirrelStatus({
-        kind: 'downloading',
-        currentVersion: app.getVersion(),
-        latestVersion: pendingDownloadVersion,
-        downloadStartedAt,
-        downloadRetryAttempt: attempt,
-        downloadRetryMax: DOWNLOAD_RETRY_MAX,
-        checkedAt: Date.now(),
-      });
-      autoUpdater.checkForUpdates();
-    } catch (err) {
-      // A synchronous throw on the retry means the check never started; reset
-      // the in-flight flag so the NEXT error-driven retry (or a manual click)
-      // isn't incorrectly blocked.
-      downloadInFlight = false;
-      downloadStartedAt = undefined;
-      log.error('[updater] download-retry: checkForUpdates() threw', err);
-      appendErrorLog({
-        subsystem: 'updater',
-        phase: 'updater.download-retry-threw',
-        errorMessage: errorToString(err),
-        context: { attempt: String(attempt) },
-      });
-    }
-  }, delay);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// v0.1.89 (voice 4507) — CONSOLIDATE ONTO THE RELIABLE UPDATE PATH.
-//
-// THE PROBLEM Ethan reported:
-//   The app has TWO observable update UIs and they have very different
-//   reliability:
-//
-//   (A) THE FLAKY TOP-BAR DOWNLOAD BAR.
-//       When the banner is in `available` state and the user clicks "Install
-//       Update", `triggerSquirrelDownload()` fires a *foreground*
-//       `autoUpdater.checkForUpdates()` AND broadcasts `kind: 'downloading'`,
-//       which flips the banner into the top-bar `DownloadingPane` (percentage
-//       + progress bar). This foreground download is the one that hits
-//       transient "The internet connection appears to be offline" errors
-//       (see main.log 2026-06-08 12:16 — it burned through all 3 retries and
-//       surfaced a red error pane). This is the "worked after about three
-//       times" path.
-//
-//   (B) THE RELIABLE SNACKBAR / RESTART PATH.
-//       `update-electron-app`'s hourly *background* poll already downloads the
-//       new bundle silently (main.log 18:16:51 `checking-for-update` →
-//       18:17:16 `update downloaded, ready to install`, with NO user action
-//       and NO `download requested` line). The banner then shows
-//       `ready-to-install`; the user clicks Restart → `quitAndInstall()` →
-//       instant swap + a quick toast. No foreground re-download, no top-bar
-//       progress bar. This is the path Ethan says "works everywhere".
-//
-// THE FIX — make every update action route through (B), never (A):
-//   We gate EVERY `kind: 'downloading'` renderer broadcast behind
-//   `SUPPRESS_FOREGROUND_DOWNLOAD_UI`. When suppressed (the default), the
-//   renderer NEVER enters the flaky top-bar `DownloadingPane`. The banner
-//   stays in `available` (with the snackbar toast after a click) until the
-//   BACKGROUND Squirrel download completes and fires `update-downloaded` →
-//   `ready-to-install` → Restart → snackbar. Exactly path (B).
-//
-//   Crucially we do NOT rip out any logic: Squirrel's `checkForUpdates()` is
-//   still kicked (idempotent — the logs show it normally no-ops as "already
-//   in flight" because the background poll beat the click), all internal
-//   state bookkeeping (`downloadInFlight`, `updateDownloaded`, the v0.1.85
-//   transient-retry ladder, `lastErrorMessage` for the MCP
-//   `update_download_status` tool) still runs, and the reliable
-//   `ready-to-install` / `error` broadcasts are UNAFFECTED. We only stop the
-//   single thing Ethan dislikes: the top-bar download-progress UI.
-//
-//   `error` is deliberately NOT gated — a genuine signature-mismatch /
-//   staging failure still needs to surface the red error pane with the
-//   manual-fallback link. Only the noisy `downloading` progress UI is hidden.
-//
-// WHY A FLAG RATHER THAN DELETING THE PANE:
-//   `DownloadingPane` + its tests + the v0.1.85 retry resilience are kept
-//   intact so this is a low-risk, fully-reversible consolidation (flip the
-//   const to re-enable the top-bar bar). The pane is simply never reached at
-//   runtime while the flag is true.
-// ---------------------------------------------------------------------------
-
-/**
- * v0.1.89 — when true, NO `kind: 'downloading'` payload is forwarded to the
- * renderer, so the banner never shows the flaky foreground top-bar download
- * progress bar. The reliable background-download → `ready-to-install` →
- * Restart (snackbar) path is used everywhere instead. See the block comment
- * above for the full rationale (voice 4507).
- */
-export const SUPPRESS_FOREGROUND_DOWNLOAD_UI = true;
-
-/**
- * Push an UpdateInfo payload to every live BrowserWindow via the existing
- * `IPC.UPDATE_STATUS` channel — shared with the GH-Releases poller so the
- * renderer's `onUpdateStatus` subscription handles both signal sources
- * uniformly. We deliberately do NOT route through `github-update-check`'s
- * internal `broadcast()` because that helper is gated on a meaningful
- * payload diff (kind/latestVersion/error) — Squirrel emits dozens of
- * `download-progress` events with the same kind, and they all need to
- * reach the renderer for the percentage to animate. v0.1.25.
- *
- * v0.1.89 (voice 4507): every `kind: 'downloading'` payload is DROPPED here
- * when `SUPPRESS_FOREGROUND_DOWNLOAD_UI` is on. This is the single choke
- * point that neutralises the flaky top-bar download UI from ALL of its
- * sources at once — the user-click path (`triggerSquirrelDownload`), the
- * early `checking-for-update` / `update-available` rebroadcasts, the
- * per-chunk `download-progress` events, and the transient-retry rebroadcasts.
- * The background download still happens; the renderer simply doesn't render a
- * progress bar for it and waits for the reliable `ready-to-install` flip.
- */
-function broadcastSquirrelStatus(info: UpdateInfo): void {
-  // v0.1.89 — swallow the flaky top-bar download UI at the source. We let
-  // EVERYTHING ELSE through (`checking` is harmless/brief, `ready-to-install`
-  // is the reliable Restart prompt, `error` is the genuine-failure pane). Only
-  // the noisy `downloading` progress payloads are dropped.
-  if (SUPPRESS_FOREGROUND_DOWNLOAD_UI && info.kind === 'downloading') {
-    return;
-  }
+function publish(info: UpdateInfo): void {
   for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
     try {
       win.webContents.send(IPC.UPDATE_STATUS, info);
-    } catch (err) {
-      log.error('[updater] broadcast failed', err);
+    } catch (error) {
+      log.error('[updater] status broadcast failed', error);
     }
   }
 }
 
-/**
- * Subscribe to Squirrel's autoUpdater events and forward each into the
- * renderer's `UpdateBanner` via `IPC.UPDATE_STATUS` so the user gets live
- * feedback while a background download is in flight. v0.1.25.
- *
- * Events of interest:
- *   - `download-progress` (newer Electron + Squirrel-mac builds) — fires
- *     with `{ percent, bytesPerSecond, total, transferred }`. We forward
- *     `percent` only; the banner's progress bar doesn't need the rest.
- *     NOTE: not every Squirrel.Mac build emits this event; on older
- *     builds the user sees an indeterminate "Downloading…" bar instead.
- *   - `update-downloaded` — fires once the new bundle is staged + ready
- *     to apply. Renderer flips to the `ready-to-install` state.
- *
- * `update-electron-app`'s `notifyUser: true` ALSO listens to
- * `update-downloaded` and shows its own native restart-to-update dialog.
- * That's fine: both UI paths coexist — the user can click either the
- * banner's Restart button or the dialog's button; both call
- * `quitAndInstall()` in the end.
- */
-/**
- * v0.1.61 — categorise the raw Squirrel/ShipIt error message so the
- * renderer can pick the right user-facing wording + recovery action.
- *
- * The most-common silent-failure path on Ethan's MBP is the
- * ad-hoc-signed → Developer-ID-signed transition (the user is running
- * an ad-hoc build because Mini hadn't released signed builds yet; the
- * staged Developer-ID bundle fails Squirrel's `SecCodeCheckValidity`
- * against the running app's designated requirement, which is what
- * surfaces as "Code signature at URL ... did not pass validation: code
- * failed to satisfy specified code requirement(s)"). Without
- * categorisation the renderer would show a raw codesign-API string;
- * with categorisation we show "This update needs a manual reinstall"
- * + a button to open the GitHub releases page.
- */
-export function categoriseUpdaterError(
-  raw: unknown,
-): 'signature-mismatch' | 'network' | 'staging' | 'unknown' {
-  const msg =
-    typeof raw === 'string'
-      ? raw
-      : typeof (raw as Error | undefined)?.message === 'string'
-        ? (raw as Error).message
-        : String(raw ?? '');
-  const lc = msg.toLowerCase();
-  if (
-    lc.includes('code signature') ||
-    lc.includes('code requirement') ||
-    lc.includes('codesign') ||
-    lc.includes('team identifier') ||
-    lc.includes('not pass validation') ||
-    lc.includes('not signed') ||
-    lc.includes('signature is missing')
-  ) {
-    return 'signature-mismatch';
+async function fetchLatestRelease(): Promise<LatestRelease> {
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), RELEASE_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(RELEASES_API_URL, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `restream-chat-plus-plus/${app.getVersion()}`,
+      },
+      signal: abort.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`GitHub API returned HTTP ${response.status}`);
+    }
+    const json: unknown = await response.json();
+    const record =
+      json && typeof json === 'object'
+        ? (json as Record<string, unknown>)
+        : undefined;
+    const tag = typeof record?.tag_name === 'string' ? record.tag_name : '';
+    if (!tag) throw new Error('GitHub API response missing tag_name');
+    return {
+      version: tag.replace(/^v/i, ''),
+      releaseUrl:
+        typeof record?.html_url === 'string'
+          ? record.html_url
+          : UPDATE_RELEASE_PAGE_URL,
+    };
+  } finally {
+    clearTimeout(timeout);
   }
-  if (
-    lc.includes('shipit') ||
-    lc.includes('install failed') ||
-    lc.includes('no such file') ||
-    lc.includes('permission') ||
-    lc.includes('staging') ||
-    lc.includes('eperm') ||
-    lc.includes('enoent')
-  ) {
-    return 'staging';
-  }
-  if (
-    lc.includes('connect') ||
-    lc.includes('network') ||
-    lc.includes('timeout') ||
-    lc.includes('etimedout') ||
-    lc.includes('econnreset') ||
-    lc.includes('econnrefused') ||
-    lc.includes('enotfound') ||
-    lc.includes('socket') ||
-    lc.includes('tls') ||
-    lc.includes('certificate') ||
-    lc.includes('http') ||
-    lc.includes('dns')
-  ) {
-    return 'network';
-  }
-  return 'unknown';
 }
 
-function attachSquirrelProgressForwarders(): void {
-  // `download-progress` isn't in Electron's `autoUpdater` d.ts (Squirrel
-  // emits it internally). Cast through EventEmitter so we can subscribe
-  // without TS complaining about the unknown event name. Runtime contract
-  // from Squirrel: the callback receives a single
-  // `{ percent, bytesPerSecond?, total?, transferred? }` object. v0.1.61
-  // forwards `bytesPerSecond` / `total` / `transferred` too so the banner
-  // can show concrete bytes + KB/s feedback rather than a bare percent
-  // that may stay at 0 for tens of seconds.
+const controller = new UpdateController({
+  currentVersion: () => app.getVersion(),
+  autoCheckEnabled: () => autoCheckEnabled(),
+  nativeUpdaterReady: () =>
+    app.isPackaged && process.platform !== 'linux' && feedURLReady,
+  fetchLatestRelease,
+  startNativeDownload: () => {
+    log.info('[updater] starting one native download session');
+    autoUpdater.checkForUpdates();
+  },
+  installNativeUpdate: () => {
+    log.info('[updater] applying staged update with quitAndInstall');
+    autoUpdater.quitAndInstall();
+  },
+  publish,
+  log: (level, message, detail) => {
+    if (detail === undefined) log[level](message);
+    else log[level](message, detail);
+  },
+  recordError: (phase, error, context) => {
+    appendErrorLog({
+      subsystem: 'updater',
+      phase,
+      errorMessage: errorToString(error),
+      context,
+    });
+  },
+});
+
+function attachNativeListeners(): void {
+  if (nativeListenersAttached) return;
+  nativeListenersAttached = true;
+
+  autoUpdater.on('checking-for-update', () => controller.onNativeChecking());
+  autoUpdater.on('update-available', () => controller.onNativeUpdateAvailable());
+  autoUpdater.on('update-not-available', () => controller.onNativeNotAvailable());
+  autoUpdater.on('error', (error) => controller.onNativeError(error));
+  autoUpdater.on(
+    'update-downloaded',
+    (_event, _releaseNotes, releaseName) =>
+      controller.onNativeDownloaded(
+        typeof releaseName === 'string' ? releaseName : undefined,
+      ),
+  );
   (autoUpdater as unknown as NodeJS.EventEmitter).on(
     'download-progress',
     (progress?: {
@@ -449,747 +120,19 @@ function attachSquirrelProgressForwarders(): void {
       bytesPerSecond?: number;
       total?: number;
       transferred?: number;
-    }) => {
-      try {
-        const raw = progress?.percent;
-        const percent =
-          typeof raw === 'number' && Number.isFinite(raw)
-            ? Math.max(0, Math.min(100, raw))
-            : undefined;
-        const bps =
-          typeof progress?.bytesPerSecond === 'number' &&
-          Number.isFinite(progress.bytesPerSecond) &&
-          progress.bytesPerSecond >= 0
-            ? progress.bytesPerSecond
-            : undefined;
-        const total =
-          typeof progress?.total === 'number' &&
-          Number.isFinite(progress.total) &&
-          progress.total >= 0
-            ? progress.total
-            : undefined;
-        const transferred =
-          typeof progress?.transferred === 'number' &&
-          Number.isFinite(progress.transferred) &&
-          progress.transferred >= 0
-            ? progress.transferred
-            : undefined;
-        broadcastSquirrelStatus({
-          kind: 'downloading',
-          currentVersion: app.getVersion(),
-          latestVersion: pendingDownloadVersion,
-          downloadPercent: percent,
-          downloadBytesPerSecond: bps,
-          downloadBytesTotal: total,
-          downloadBytesTransferred: transferred,
-          downloadStartedAt,
-          checkedAt: Date.now(),
-        });
-      } catch (err) {
-        log.error('[updater] download-progress forward failed', err);
-      }
-    },
-  );
-
-  // v0.1.52: track Squirrel session state so triggerSquirrelDownload() can
-  // short-circuit when re-clicking the Install Update banner. Squirrel
-  // emits these strings via the `checking-for-update` and `update-available`
-  // events; once we see them we know calling checkForUpdates() again would
-  // throw "The command is disabled and cannot be executed".
-  autoUpdater.on('checking-for-update', () => {
-    downloadInFlight = true;
-    // v0.1.64 — clear the cached error so a successful subsequent check
-    // doesn't surface a stale "last update failed" message via the MCP
-    // `update_download_status` tool. Without this reset the agent UI
-    // would keep showing the previous error even after recovery.
-    lastErrorMessage = undefined;
-    lastErrorCategory = undefined;
-    // v0.1.61 — broadcast an early `downloading` payload (indeterminate
-    // bar, 0% known) so the banner transitions out of `available` state
-    // the moment Squirrel acknowledges the click. Without this the user
-    // sees the "Installing…" spinner for ~3s, then the toast auto-
-    // dismisses, then dead air until the (sometimes-omitted) first
-    // `download-progress` event lands — Ethan's exact "I see a snap
-    // about downloading update but then nothing happens" complaint
-    // (Voice 3760, 2026-05-23).
-    broadcastSquirrelStatus({
-      kind: 'downloading',
-      currentVersion: app.getVersion(),
-      latestVersion: pendingDownloadVersion,
-      downloadStartedAt,
-      checkedAt: Date.now(),
-    });
-  });
-  autoUpdater.on('update-available', () => {
-    downloadInFlight = true;
-    // v0.1.61 — same intent as the `checking-for-update` rebroadcast,
-    // but this event fires AFTER Squirrel has confirmed there is in
-    // fact a newer bundle on the feed. The banner uses the second
-    // payload to flip from "indeterminate / waiting for first chunk"
-    // to "indeterminate / Squirrel says it's downloading" — even
-    // though both render identically today the disk log + telemetry
-    // separation makes future debugging easier.
-    broadcastSquirrelStatus({
-      kind: 'downloading',
-      currentVersion: app.getVersion(),
-      latestVersion: pendingDownloadVersion,
-      downloadStartedAt,
-      checkedAt: Date.now(),
-    });
-  });
-  autoUpdater.on('update-not-available', () => {
-    const wasUserRequested = userRequestedSquirrelDownload;
-    userRequestedSquirrelDownload = false;
-    downloadInFlight = false;
-    downloadStartedAt = undefined;
-    // v0.1.85 — nothing to download, so cancel any pending transient retry
-    // and reset the per-session counter. (A retry that was armed by a blip
-    // before Squirrel concluded "no update" would otherwise fire pointlessly.)
-    resetDownloadRetryState();
-    // v0.1.92 — explicit no-silent-no-op guard for Ethan's "Install Update
-    // does nothing" report. The app has two independent signals:
-    //   1. GitHub Releases says a newer version exists (banner available).
-    //   2. Squirrel/update.electronjs.org says "update-not-available".
-    // If (2) happens immediately after a visible user click while (1) is
-    // true, the old code reset internal flags and told the renderer nothing,
-    // leaving the same banner on screen with no explanation. Surface a real
-    // error pane with the manual Releases fallback so the click always has a
-    // visible, diagnosable outcome.
-    if (
-      wasUserRequested &&
-      isNewerVersion(pendingDownloadVersion, app.getVersion())
-    ) {
-      const message =
-        `GitHub says ${pendingDownloadVersion} is available, but the native ` +
-        'update service did not offer an installable bundle yet.';
-      lastErrorMessage = message;
-      lastErrorCategory = 'unknown';
-      appendErrorLog({
-        subsystem: 'updater',
-        phase: 'updater.squirrel-not-available-after-user-click',
-        errorMessage: message,
-        context: {
-          currentVersion: app.getVersion(),
-          pendingVersion: pendingDownloadVersion ?? '',
-        },
-      });
-      broadcastSquirrelStatus({
-        kind: 'error',
-        currentVersion: app.getVersion(),
-        latestVersion: pendingDownloadVersion,
-        error: message,
-        errorCategory: 'unknown',
-        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
-        checkedAt: Date.now(),
-      });
-    }
-  });
-  autoUpdater.on('error', (err) => {
-    // v0.1.61 — broadcast the error to the renderer so the banner can
-    // surface a persistent error pane with the manual-fallback link.
-    // Pre-v0.1.61 this handler only reset `downloadInFlight` and logged;
-    // the renderer never heard about the failure and the banner sat in
-    // `downloading` indeterminate forever (exactly the symptom Ethan
-    // reported on 2026-05-23 — Squirrel's signature-mismatch error
-    // fired after ~22s of "downloading" and the UI showed no signal).
-    log.warn('[updater] autoUpdater error event', err);
-    // v0.1.69 (voice 4015): every Squirrel.Mac error gets a structured row
-    // so the categorisation (signature-mismatch / network / staging /
-    // unknown) survives outside the rendered UpdateBanner state. Pre-
-    // v0.1.69 it only landed in main.log + as a renderer payload.
-    appendErrorLog({
-      subsystem: 'updater',
-      phase: 'updater.squirrel-error-event',
-      errorMessage: errorToString(err),
-      context: { category: categoriseUpdaterError(err) },
-    });
-    downloadInFlight = false;
-    downloadStartedAt = undefined;
-    try {
-      const message = String((err as Error)?.message ?? err ?? 'unknown');
-      const category = categoriseUpdaterError(err);
-      // v0.1.64 — persist error to module state so the MCP `update_download_status`
-      // tool can report WHY a previous download bailed without scraping the
-      // log file. Cleared in `checking-for-update` and `update-downloaded`.
-      lastErrorMessage = message;
-      lastErrorCategory = category;
-      // v0.1.85 (voice 7280) — DOWNLOAD-RETRY: if this is a TRANSIENT
-      // (network-category) failure mid-download, auto-retry on a bounded
-      // backoff instead of dead-ending the user on the error pane. This is
-      // the headline fix for "if it fails while downloading, retry" — the
-      // exact "worked after about three times" symptom Ethan reported was a
-      // network blip that previously needed a manual re-click each time.
-      //
-      // Note the ordering: `downloadInFlight`/`downloadStartedAt` were reset
-      // ABOVE before we get here, so `scheduleDownloadRetry()`'s deferred
-      // `checkForUpdates()` won't trip Squirrel's re-entry guard.
-      //
-      // We only auto-retry `network`. `signature-mismatch` (bad codesign) and
-      // `staging` (ShipIt/permission) won't self-heal on retry — retrying
-      // would just re-fail identically and spam the feed — so those stay
-      // surfaced with the manual-fallback link as before.
-      if (category === 'network' && scheduleDownloadRetry()) {
-        // A retry was armed. `scheduleDownloadRetry` already broadcast a
-        // `downloading` (retrying) payload so the banner shows progress
-        // rather than the error pane. Skip the terminal error broadcast.
-        log.info('[updater] transient download error — retry armed, suppressing error pane');
-      } else {
-        userRequestedSquirrelDownload = false;
-        // Either a non-network category, or we've exhausted the retry budget.
-        // Surface the error pane (with manual-fallback link) as before so the
-        // user can install manually from the GitHub release page.
-        broadcastSquirrelStatus({
-          kind: 'error',
-          currentVersion: app.getVersion(),
-          latestVersion: pendingDownloadVersion,
-          error: message,
-          errorCategory: category,
-          errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
-          checkedAt: Date.now(),
-        });
-      }
-    } catch (broadcastErr) {
-      log.error('[updater] error broadcast failed', broadcastErr);
-    }
-  });
-
-  autoUpdater.on(
-    'update-downloaded',
-    (_evt: Electron.Event, _releaseNotes?: string, releaseName?: string) => {
-      try {
-        updateDownloaded = true;
-        userRequestedSquirrelDownload = false;
-        downloadInFlight = false;
-        downloadStartedAt = undefined;
-        // v0.1.85 — download landed: cancel any pending transient retry timer
-        // and reset the counter so the next update session starts fresh.
-        resetDownloadRetryState();
-        // v0.1.64 — successful download clears the cached error so the
-        // MCP `update_download_status` tool stops flagging a previous
-        // failure. The renderer banner is independent and already handles
-        // this via the `ready-to-install` broadcast.
-        lastErrorMessage = undefined;
-        lastErrorCategory = undefined;
-        broadcastSquirrelStatus({
-          kind: 'ready-to-install',
-          currentVersion: app.getVersion(),
-          // `releaseName` is the version string per Electron's autoUpdater
-          // contract on macOS (Squirrel.Mac sets it to the new bundle's
-          // CFBundleShortVersionString).
-          latestVersion:
-            typeof releaseName === 'string' ? releaseName : pendingDownloadVersion,
-          checkedAt: Date.now(),
-        });
-        log.info('[updater] update downloaded, ready to install', { releaseName });
-      } catch (err) {
-        log.error('[updater] update-downloaded forward failed', err);
-      }
-    },
+    }) => controller.onNativeProgress(progress),
   );
 }
 
-/**
- * v0.1.61 — cache the latest `latestVersion` resolved by the GH-Releases
- * poller so the Squirrel-side progress/ready broadcasts can carry it.
- * Squirrel itself doesn't know the human-readable tag name until
- * `update-downloaded` fires (Squirrel.Mac's `releaseName` field is set
- * during bundle staging), so without this cache the banner has no version
- * string to show in the "Downloading Restream Chat++ v0.1.61…" header.
- *
- * Called from `github-update-check.ts` on every `available` broadcast.
- * Idempotent / no-op when version is undefined (e.g. an `up-to-date`
- * payload).
- */
-export function rememberPendingDownloadVersion(version: string | undefined): void {
-  if (typeof version === 'string' && version.length > 0) {
-    pendingDownloadVersion = version;
-    checkForUpdatesInBackground('release-available'); // A blind native check returns HTTP 404 when this locally installed build is newer than the public release, which Squirrel presents as an alarming invalid-response banner; only start Squirrel after GitHub has proved a newer release exists. (Codex task: 019ff120-ea11-71a3-8b65-c55b45cac2fe)
-  }
-}
-
-/**
- * v0.1.64 — coarse-grained download-state machine, exported so the
- * in-process HTTP MCP can answer `update_download_status` without
- * re-implementing the bookkeeping.
- *
- *   - 'idle'              → no check / download / staged update in flight.
- *                           Default at boot.
- *   - 'checking'          → Squirrel is talking to update.electronjs.org
- *                           but the new-version probe hasn't resolved yet.
- *                           Set by the `checking-for-update` event listener.
- *   - 'downloading'       → Squirrel has confirmed there's a newer bundle
- *                           and the zip is being pulled from GH releases.
- *                           Set by `update-available` / `download-progress`.
- *   - 'ready-to-install'  → Squirrel staged the bundle into ShipIt's
- *                           working dir; calling `quitAndInstall` from
- *                           here will swap the bundle and relaunch.
- *   - 'error'             → Squirrel emitted an `error` event. The last
- *                           error message is preserved on `lastErrorMessage`.
- *
- * This is a derived view of the existing module-level flags
- * (`downloadInFlight`, `updateDownloaded`, etc.) rather than a separate
- * state machine, so there is exactly one source of truth — the existing
- * IPC broadcast path. Reading is O(1).
- */
-export type UpdateDownloadState =
-  | 'idle'
-  | 'checking'
-  | 'downloading'
-  | 'ready-to-install'
-  | 'error';
-
-/**
- * Last error message Squirrel surfaced. Reset to undefined the next time
- * the autoUpdater enters `checking-for-update` (so subsequent successful
- * runs don't keep showing a stale error). The MCP `update_download_status`
- * tool exposes this so an agent can see why a previous download bailed
- * without scraping the log file.
- */
-let lastErrorMessage: string | undefined;
-let lastErrorCategory: 'signature-mismatch' | 'network' | 'staging' | 'unknown' | undefined;
-
-/**
- * v0.1.64 — read the current Squirrel download state. Pure read; never
- * touches any side effect. Designed for the MCP `update_download_status`
- * tool but suitable for any in-process consumer (e.g. an About-window
- * status line, future tray badge).
- */
-export function getDownloadState(): {
-  state: UpdateDownloadState;
-  pendingVersion: string | undefined;
-  downloadStartedAt: number | undefined;
-  lastErrorMessage: string | undefined;
-  lastErrorCategory: typeof lastErrorCategory;
-} {
-  // Resolve to the most specific terminal state first. Order matters:
-  // `updateDownloaded` wins over `downloadInFlight` (Squirrel can briefly
-  // show both true between `update-downloaded` and the next state push,
-  // though our event handlers clear `downloadInFlight` immediately).
-  let state: UpdateDownloadState;
-  if (lastErrorMessage) {
-    state = 'error';
-  } else if (updateDownloaded) {
-    state = 'ready-to-install';
-  } else if (downloadInFlight) {
-    // `downloadInFlight` is set on both `checking-for-update` AND
-    // `update-available` / first `download-progress`. We can't easily
-    // distinguish the two without adding a second flag — for now anything
-    // in-flight surfaces as `downloading` since that's the user-actionable
-    // state (the difference between "Squirrel is talking to GH" and
-    // "Squirrel is pulling bytes" is invisible at the MCP layer). A
-    // future enhancement could split this if the renderer banner needs it.
-    state = 'downloading';
-  } else {
-    state = 'idle';
-  }
-  return {
-    state,
-    pendingVersion: pendingDownloadVersion,
-    downloadStartedAt,
-    lastErrorMessage,
-    lastErrorCategory,
-  };
-}
-
-/**
- * v0.1.64 — exposed for the MCP `update_install_now` tool. Same guard
- * semantics as `quitAndInstallStagedUpdate` (refuses if no update staged)
- * but reachable as a named export from outside the IPC handler.
- *
- * This is just an alias — kept for naming clarity at the MCP boundary
- * (`updateInstallNow()` reads more naturally than reusing the rendererfacing
- * `quitAndInstallStagedUpdate`).
- */
-export function triggerInstallNow(): { ok: boolean; reason?: string } {
-  return quitAndInstallStagedUpdate();
-}
-
-/**
- * v0.1.64 — return a defensive snapshot of internal updater bookkeeping
- * for unit tests. Not part of the MCP surface; exported so the
- * Vitest suite can assert state transitions without spying on module
- * internals.
- */
-export function _getUpdaterInternalsForTest(): {
-  configured: boolean;
-  feedURLReady: boolean;
-  checkInFlight: boolean;
-  updateDownloaded: boolean;
-  downloadInFlight: boolean;
-  downloadStartedAt: number | undefined;
-  pendingDownloadVersion: string | undefined;
-  lastErrorMessage: string | undefined;
-} {
-  return {
-    configured,
-    feedURLReady,
-    checkInFlight,
-    updateDownloaded,
-    downloadInFlight,
-    downloadStartedAt,
-    pendingDownloadVersion,
-    lastErrorMessage,
-  };
-}
-
-/**
- * Renderer-triggered restart. Bound to `IPC.UPDATE_QUIT_AND_INSTALL` in
- * `main.ts`. `autoUpdater.quitAndInstall()` throws synchronously if no
- * update has been staged — guarded with `updateDownloaded` so the
- * Restart button can't accidentally crash the app. v0.1.25.
- */
-export function quitAndInstallStagedUpdate(): { ok: boolean; reason?: string } {
-  if (!updateDownloaded) {
-    log.warn('[updater] quit-and-install requested but no update staged');
-    return { ok: false, reason: 'no-update-downloaded' };
-  }
-  try {
-    log.info('[updater] quit-and-install triggered from renderer');
-    // v0.1.52 fix: schedule the actual restart on the next tick so the IPC
-    // round-trip can complete and we can return a result to the renderer
-    // BEFORE the app starts tearing down. Sparkle's `quitAndInstall()` on
-    // macOS posts an NSAlert to dismiss any open dialogs and then forces a
-    // restart immediately — when called synchronously inside an ipcMain
-    // handler, the renderer's pending Promise can be dropped without ever
-    // resolving, and the user-visible "click Restart, nothing happens"
-    // symptom appears (the Restart button stays clickable, the toast
-    // never fires). Async-scheduling the actual restart lets the IPC
-    // reply land first.
-    //
-    // We also call `app.relaunch()` BEFORE `quitAndInstall()` as a belt-
-    // and-braces safeguard: if Squirrel's `quitAndInstall()` silently
-    // no-ops (e.g. the staged update was already consumed by an earlier
-    // update-electron-app native dialog), the relaunch+quit pair still
-    // produces a visible restart, so the user always sees the action
-    // happen. The Squirrel state machine treats `quit()` after
-    // `quitAndInstall()` as a no-op if Squirrel has already initiated the
-    // bundle swap, so this is safe in the normal path.
-    setImmediate(() => {
-      try {
-        log.info('[updater] firing autoUpdater.quitAndInstall() (deferred)');
-        autoUpdater.quitAndInstall();
-        // Fallback: if Squirrel didn't actually restart (no staged bundle
-        // to install), give it 1.5s and then force-relaunch ourselves. The
-        // user clicked Restart — they need to see SOMETHING happen.
-        setTimeout(() => {
-          log.warn(
-            '[updater] still running after quitAndInstall — forcing relaunch+quit',
-          );
-          try {
-            app.relaunch();
-            app.exit(0);
-          } catch (relaunchErr) {
-            log.error('[updater] forced relaunch failed', relaunchErr);
-          }
-        }, 1500);
-      } catch (err) {
-        log.error('[updater] deferred quit-and-install threw', err);
-        // Last-resort: force a relaunch so the user still sees a restart.
-        try {
-          app.relaunch();
-          app.exit(0);
-        } catch (relaunchErr) {
-          log.error('[updater] last-resort relaunch failed', relaunchErr);
-        }
-      }
-    });
-    return { ok: true };
-  } catch (err) {
-    log.error('[updater] quit-and-install threw', err);
-    // v0.1.69 (voice 4015): the user clicked Restart — if this throws
-    // they see nothing. Structured row so we can see post-install
-    // attempts that didn't make it past the sync entry point. Note
-    // most of the failure modes are in the DEFERRED setImmediate
-    // branch above; this catch is the early-return path.
-    appendErrorLog({
-      subsystem: 'updater',
-      phase: 'updater.quit-and-install-threw',
-      errorMessage: errorToString(err),
-    });
-    return { ok: false, reason: String((err as Error)?.message ?? err) };
-  }
-}
-
-/**
- * Result of triggering Squirrel's in-app download from the renderer's
- * "Download" button. v0.1.32+.
- *
- *   - 'started'              → autoUpdater.checkForUpdates() was kicked.
- *                              Squirrel will emit `download-progress` and
- *                              `update-downloaded` events which the
- *                              progress forwarders broadcast as
- *                              `IPC.UPDATE_STATUS` payloads — the banner
- *                              transitions through 'downloading' →
- *                              'ready-to-install' automatically.
- *   - 'not-packaged'         → dev mode; nothing to do.
- *   - 'unsupported-platform' → Linux; no Squirrel support compiled in.
- *   - 'feed-unavailable'     → `updateElectronApp({...})` never settled
- *                              (unsigned build, network problem at boot,
- *                              etc.). User is told in-app rather than
- *                              being silently bounced to the browser.
- *   - 'error'                → `autoUpdater.checkForUpdates()` threw.
- */
-/**
- * v0.1.39: `mode` discriminator added so the renderer can pick the
- * right user-facing toast. `squirrel` = in-app pipeline kicked
- * (banner will transition through `downloading` automatically);
- * `browser` = main-process fallback successfully bounced the user to
- * the GitHub release page in their default browser. On failure
- * (`ok: false`) the renderer renders an error toast with the
- * release-page URL as a manual-fallback link.
- */
-export type StartDownloadResult =
-  | { ok: true; reason: 'started'; mode: 'squirrel' }
-  | { ok: true; reason: 'already-downloading'; mode: 'squirrel' }
-  | { ok: true; reason: 'already-staged'; mode: 'squirrel' }
-  | { ok: true; reason: 'opened-release-page'; mode: 'browser'; fallbackReason: string }
-  | {
-      ok: false;
-      reason: 'not-packaged' | 'unsupported-platform' | 'feed-unavailable' | 'error';
-      error?: string;
-      /**
-       * Always populated on failure so the renderer can offer a manual
-       * "click here" link as last-resort fallback (e.g. shell.openExternal
-       * threw too — extremely rare but possible on locked-down systems).
-       */
-      releaseUrl: string;
-    };
-
-/**
- * Renderer-triggered in-app download. Bound to
- * `IPC.UPDATE_DOWNLOAD_START` in `main.ts`. Click handler for the
- * `UpdateBanner`'s "Download" button when the banner is in `available`
- * state.
- *
- * Pre-v0.1.32 this button opened the GitHub release page in the user's
- * default browser via `shell.openExternal`. That side-stepped the entire
- * Squirrel pipeline we'd already wired in v0.1.25 (Squirrel emits
- * download-progress → renderer shows progress bar → Squirrel emits
- * update-downloaded → renderer shows Restart button → user clicks →
- * quitAndInstall swaps the bundle). v0.1.32 wires the button to fire
- * `autoUpdater.checkForUpdates()` instead so the in-app pipeline
- * actually runs.
- *
- * `autoUpdater.checkForUpdates()` is not re-entrant on macOS — calling it
- * while a native check or download is already in flight emits Squirrel's
- * cryptic "The command is disabled and cannot be executed" error. Guard both
- * the feed configuration and the synchronously-armed in-flight state before
- * entering the native updater.
- */
-export const UPDATE_RELEASE_PAGE_URL =
-  'https://github.com/EthanSK/restream-chat-plus-plus/releases';
-
-export function triggerSquirrelDownload(): StartDownloadResult {
-  if (!app.isPackaged) {
-    log.info('[updater] download requested in dev/unpackaged build — no-op');
-    return { ok: false, reason: 'not-packaged', releaseUrl: UPDATE_RELEASE_PAGE_URL };
-  }
-  if (process.platform === 'linux') {
-    // Squirrel.Mac handles macOS, Squirrel.Windows handles win32; Linux
-    // updates ship as .deb / .rpm packages outside the Electron auto-
-    // update pipeline. We surface this distinctly so the renderer (or
-    // a main-process dialog) can route the user to the right path.
-    log.info('[updater] download requested on linux — no in-app updater');
-    return {
-      ok: false,
-      reason: 'unsupported-platform',
-      releaseUrl: UPDATE_RELEASE_PAGE_URL,
-    };
-  }
-  if (!feedURLReady) {
-    // `configureAutoUpdater()` never settled — common on unsigned builds
-    // where `updateElectronApp({...})` throws because Squirrel.Mac refuses
-    // an unsigned feed. Without this guard, calling checkForUpdates()
-    // would throw synchronously ("Update feed URL is not set"). v0.1.32.
-    log.warn('[updater] download requested but feed URL not ready');
-    return {
-      ok: false,
-      reason: 'feed-unavailable',
-      releaseUrl: UPDATE_RELEASE_PAGE_URL,
-    };
-  }
-  // v0.1.52: short-circuit when an update has already been downloaded.
-  // Calling `checkForUpdates()` after `update-downloaded` throws "The
-  // command is disabled and cannot be executed" — Squirrel's state
-  // machine refuses to re-enter the check loop while a staged bundle is
-  // pending install. Surface this as a success so the banner shows
-  // "Downloading update…" while the renderer transitions to ready-to-
-  // install on the next UpdateInfo broadcast.
-  if (updateDownloaded) {
-    log.info('[updater] download requested but update already staged — no-op');
-    // v0.1.92 — do not make an "Install Update" click look like a no-op when
-    // Squirrel has already staged the bundle. Re-broadcast ready-to-install so
-    // the renderer is forced onto the Restart banner even if it somehow missed
-    // the original `update-downloaded` event (window reload, listener race, or
-    // stale available-state UI).
-    broadcastSquirrelStatus({
-      kind: 'ready-to-install',
-      currentVersion: app.getVersion(),
-      latestVersion: pendingDownloadVersion,
-      checkedAt: Date.now(),
-    });
-    return { ok: true, reason: 'already-staged', mode: 'squirrel' };
-  }
-  // v0.1.52: same guard against re-clicking while Squirrel is already
-  // mid-download. Without this, the second click triggers the "command
-  // is disabled" throw and the user sees the cryptic "Update could not
-  // start" toast even though the download is in fact progressing in
-  // the background.
-  if (downloadInFlight) {
-    log.info('[updater] download requested but already in flight — no-op');
-    // The native operation is already running, but this entry point represents
-    // an explicit user action (banner button or Check for Updates menu). Keep
-    // that intent so `update-not-available` still surfaces the existing manual
-    // fallback instead of quietly swallowing a real feed disagreement.
-    userRequestedSquirrelDownload = true;
-    return { ok: true, reason: 'already-downloading', mode: 'squirrel' };
-  }
-  try {
-    log.info('[updater] kicking autoUpdater.checkForUpdates() from renderer');
-    // v0.1.85 — a fresh USER-INITIATED download resets the auto-retry budget
-    // (and cancels any pending auto-retry timer from a prior failed session)
-    // so the next transient blip gets a full 3-attempt ladder. Without this,
-    // a user manually re-clicking Install after the auto-retries exhausted
-    // would get no further auto-retries.
-    resetDownloadRetryState();
-    userRequestedSquirrelDownload = true;
-    downloadInFlight = true;
-    downloadStartedAt = Date.now();
-    // v0.1.61 — broadcast a `downloading` payload IMMEDIATELY (before
-    // Squirrel even fires `checking-for-update`) so the banner flips
-    // away from `available` the moment the IPC round-trip resolves.
-    // Without this, on slow Squirrel start-ups the banner stays in
-    // `available` for several seconds while the Installing… toast
-    // auto-dismisses, leaving the user with no feedback at all. The
-    // banner renders an indeterminate progress bar in this state.
-    broadcastSquirrelStatus({
-      kind: 'downloading',
-      currentVersion: app.getVersion(),
-      latestVersion: pendingDownloadVersion,
-      downloadStartedAt,
-      checkedAt: Date.now(),
-    });
-    autoUpdater.checkForUpdates();
-    return { ok: true, reason: 'started', mode: 'squirrel' };
-  } catch (err) {
-    // Reset the flag — the throw means the check never actually started,
-    // so re-entry would otherwise be incorrectly blocked on the next click.
-    downloadInFlight = false;
-    downloadStartedAt = undefined;
-    log.error('[updater] checkForUpdates() threw', err);
-    // v0.1.69 (voice 4015): synchronous throw from autoUpdater is the
-    // less-common cousin of the async `error` event but they happen for
-    // similar reasons (feed URL race, sandbox restrictions). One row
-    // per occurrence makes both paths uniformly discoverable.
-    appendErrorLog({
-      subsystem: 'updater',
-      phase: 'updater.check-for-updates-threw',
-      errorMessage: errorToString(err),
-      context: { category: categoriseUpdaterError(err) },
-    });
-    // v0.1.61 — also broadcast an `error` payload so the renderer can
-    // show a persistent error pane (matching the async error-event
-    // path). Without this the banner would briefly flip to `downloading`
-    // then sit there forever after the synchronous throw.
-    try {
-      const message = String((err as Error)?.message ?? err);
-      // v0.1.64 — persist error to module state for the MCP status tool.
-      lastErrorMessage = message;
-      lastErrorCategory = categoriseUpdaterError(err);
-      broadcastSquirrelStatus({
-        kind: 'error',
-        currentVersion: app.getVersion(),
-        latestVersion: pendingDownloadVersion,
-        error: message,
-        errorCategory: categoriseUpdaterError(err),
-        errorReleaseUrl: UPDATE_RELEASE_PAGE_URL,
-        checkedAt: Date.now(),
-      });
-    } catch (broadcastErr) {
-      log.error('[updater] sync-throw error broadcast failed', broadcastErr);
-    }
-    return {
-      ok: false,
-      reason: 'error',
-      error: String((err as Error)?.message ?? err),
-      releaseUrl: UPDATE_RELEASE_PAGE_URL,
-    };
-  }
-}
-
-/**
- * Run one native background check only when Squirrel has no active or staged
- * work. The second condition is critical on macOS: the 2026-07-14 production
- * logs showed `update-downloaded` at 20:16, followed by hourly checks that
- * emitted `update-available`/`update-not-available`; Restart then failed with
- * "No update available, can't quit and install" even though our JS flag still
- * said the bundle was staged. Calling checkForUpdates again had invalidated
- * Squirrel's native staged-install slot.
- */
-function checkForUpdatesInBackground(
-  origin: 'release-available' | 'startup' | 'interval',
-): boolean {
-  if (
-    !feedURLReady ||
-    !isNewerVersion(pendingDownloadVersion, app.getVersion())
-  ) {
-    log.info(
-      `[updater] skipping ${origin} background check — GitHub has not reported a newer release`,
-    );
-    return false;
-  }
-  if (updateDownloaded) {
-    log.info(`[updater] skipping ${origin} background check — update is staged`);
-    return false;
-  }
-  if (downloadInFlight) {
-    log.info(`[updater] skipping ${origin} background check — check/download in flight`);
-    return false;
-  }
-  try {
-    // Arm the guard before entering Electron. Squirrel emits
-    // `checking-for-update` asynchronously, so relying on that event leaves a
-    // race in which the menu path can issue a second check and make the native
-    // updater emit "The command is disabled and cannot be executed" even
-    // though the first download continues successfully.
-    downloadInFlight = true;
-    downloadStartedAt = Date.now();
-    lastErrorMessage = undefined;
-    lastErrorCategory = undefined;
-    autoUpdater.checkForUpdates();
-    return true;
-  } catch (err) {
-    // A synchronous throw means Electron never accepted the check. Release the
-    // guard so an explicit retry can still start a fresh session.
-    downloadInFlight = false;
-    downloadStartedAt = undefined;
-    log.warn(`[updater] ${origin} background check threw`, err);
-    appendErrorLog({
-      subsystem: 'updater',
-      phase: 'updater.background-check-threw',
-      errorMessage: errorToString(err),
-      context: { origin },
-    });
-    return false;
-  }
-}
-
+/** Configure Squirrel once. This never starts a check or download. */
 export function configureAutoUpdater(): void {
   if (configured) return;
   configured = true;
-
-  // Skip in dev — `update-electron-app` already short-circuits when
-  // `!app.isPackaged`, but this also avoids the misleading log line.
-  if (!app.isPackaged) {
-    log.info('[updater] skipping auto-update (not packaged / dev mode)');
+  if (!app.isPackaged || process.platform === 'linux') {
+    log.info('[updater] native updater unavailable for this build/platform');
     return;
   }
-
   try {
-    // update-electron-app is intentionally not used here. Its internal
-    // setInterval cannot be paused after `update-downloaded`, which let a
-    // later hourly poll invalidate Squirrel.Mac's staged update. Configure
-    // the exact same public feed directly and own the guarded timer below.
     const windowsStoreSegment = process.windowsStore ? '/msix' : '';
     const feedURL =
       `https://update.electronjs.org/${REPO}/` +
@@ -1197,208 +140,271 @@ export function configureAutoUpdater(): void {
     autoUpdater.setFeedURL({
       url: feedURL,
       headers: {
-        'User-Agent': `restream-chat-plus-plus/${app.getVersion()} ` +
+        'User-Agent':
+          `restream-chat-plus-plus/${app.getVersion()} ` +
           `(${process.platform}: ${process.arch})`,
       },
     });
     feedURLReady = true;
-    // Wire Squirrel download-progress + update-downloaded forwarders so
-    // the renderer's `UpdateBanner` can show a progress bar + restart
-    // button respectively. Must be attached AFTER `updateElectronApp`
-    // configures the feed URL — before that, the autoUpdater isn't set
-    // up. v0.1.25.
-    attachSquirrelProgressForwarders();
-    checkForUpdatesInBackground('startup');
-    backgroundUpdateTimer = setInterval(() => {
-      checkForUpdatesInBackground('interval');
-    }, AUTO_UPDATE_INTERVAL_MS);
-    // The updater timer is housekeeping and must not keep an otherwise-quit
-    // Electron main process alive during tests or shutdown.
-    backgroundUpdateTimer.unref?.();
-    log.info('[updater] auto-update configured for', REPO);
-  } catch (err) {
-    log.error('[updater] failed to configure auto-update', err);
-    // v0.1.69 (voice 4015): configure failure is rare but completely
-    // disables the in-app updater for the session — `feedURLReady`
-    // stays false → every download click bails with 'feed-unavailable'.
-    // Worth a row so we can see if this happens repeatedly on a given
-    // user (unsigned build, network blip at boot, etc).
+    attachNativeListeners();
+    log.info('[updater] native updater configured; waiting for explicit download');
+  } catch (error) {
+    feedURLReady = false;
+    log.error('[updater] native updater configuration failed', error);
     appendErrorLog({
       subsystem: 'updater',
       phase: 'updater.configure-failed',
-      errorMessage: errorToString(err),
+      errorMessage: errorToString(error),
     });
   }
 }
 
-/**
- * Resolve a usable parent window for `dialog.showMessageBox`.
- *
- * `dialog.showMessageBox(null, opts)` is NOT a valid Electron overload —
- * the first arg must be a real `BrowserWindow` or omitted entirely.
- * Passing `null` throws `TypeError: Error processing argument at index 0`,
- * which inside a menu-click handler bubbles up to the native menu validator
- * and is surfaced by macOS as "this command is disabled and cannot be
- * executed". Always normalise to either a live window or `undefined`.
- */
-function resolveParent(parent: BrowserWindow | null): BrowserWindow | undefined {
-  if (parent && !parent.isDestroyed()) return parent;
-  const fallback = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
-  return fallback && !fallback.isDestroyed() ? fallback : undefined;
+/** Start metadata-only update discovery. Native Squirrel remains idle. */
+export function startUpdatePoller(getter: () => boolean): void {
+  autoCheckEnabled = getter;
+  if (firstCheckTimer || intervalTimer) return;
+  firstCheckTimer = setTimeout(() => {
+    firstCheckTimer = undefined;
+    void controller.checkForUpdates(false);
+  }, FIRST_CHECK_DELAY_MS);
+  firstCheckTimer.unref?.();
+  intervalTimer = setInterval(() => {
+    void controller.checkForUpdates(false);
+  }, AUTO_UPDATE_INTERVAL_MS);
+  intervalTimer.unref?.();
+  log.info('[updater] metadata poller armed; native download is user-initiated');
 }
 
-/**
- * Show a message box that works whether or not we have a parent window.
- * Electron requires the two-arg form when `parent` is truthy and the
- * one-arg form when it isn't; mixing them up throws synchronously.
- */
+export function stopUpdatePoller(): void {
+  if (firstCheckTimer) clearTimeout(firstCheckTimer);
+  if (intervalTimer) clearInterval(intervalTimer);
+  firstCheckTimer = undefined;
+  intervalTimer = undefined;
+  controller.dispose();
+}
+
+export function performUpdateCheck(force = false): Promise<UpdateInfo> {
+  return controller.checkForUpdates(force);
+}
+
+export function getLastUpdateInfo(): UpdateInfo | undefined {
+  return controller.getStatus();
+}
+
+export type UpdateDownloadState =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'ready-to-install'
+  | 'installing'
+  | 'error';
+
+export function getDownloadState(): {
+  state: UpdateDownloadState;
+  pendingVersion: string | undefined;
+  downloadStartedAt: number | undefined;
+  lastErrorMessage: string | undefined;
+  lastErrorCategory:
+    | 'signature-mismatch'
+    | 'network'
+    | 'staging'
+    | 'unknown'
+    | undefined;
+} {
+  const info = controller.getStatus();
+  const state: UpdateDownloadState =
+    info?.kind === 'checking' ||
+    info?.kind === 'downloading' ||
+    info?.kind === 'ready-to-install' ||
+    info?.kind === 'installing' ||
+    info?.kind === 'error'
+      ? info.kind
+      : 'idle';
+  return {
+    state,
+    pendingVersion: info?.latestVersion,
+    downloadStartedAt: info?.downloadStartedAt,
+    lastErrorMessage: info?.kind === 'error' ? info.error : undefined,
+    lastErrorCategory:
+      info?.kind === 'error' ? info.errorCategory : undefined,
+  };
+}
+
+export type StartDownloadResult =
+  | { ok: true; reason: 'started'; mode: 'squirrel' }
+  | { ok: true; reason: 'already-downloading'; mode: 'squirrel' }
+  | { ok: true; reason: 'already-staged'; mode: 'squirrel' }
+  | {
+      ok: true;
+      reason: 'opened-release-page';
+      mode: 'browser';
+      fallbackReason: string;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'not-packaged'
+        | 'unsupported-platform'
+        | 'feed-unavailable'
+        | 'not-available'
+        | 'error';
+      error?: string;
+      releaseUrl: string;
+    };
+
+export function triggerSquirrelDownload(): StartDownloadResult {
+  if (!app.isPackaged) {
+    return {
+      ok: false,
+      reason: 'not-packaged',
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
+    };
+  }
+  if (process.platform === 'linux') {
+    return {
+      ok: false,
+      reason: 'unsupported-platform',
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
+    };
+  }
+  if (!feedURLReady) {
+    return {
+      ok: false,
+      reason: 'feed-unavailable',
+      releaseUrl: UPDATE_RELEASE_PAGE_URL,
+    };
+  }
+  const result = controller.startDownload();
+  if (result.ok) {
+    if (result.reason === 'already-downloading') {
+      return { ok: true, reason: 'already-downloading', mode: 'squirrel' };
+    }
+    if (result.reason === 'already-staged') {
+      return { ok: true, reason: 'already-staged', mode: 'squirrel' };
+    }
+    return { ok: true, reason: 'started', mode: 'squirrel' };
+  }
+  return {
+    ok: false,
+    reason: result.reason === 'not-available' ? 'not-available' : 'error',
+    error: result.error,
+    releaseUrl: UPDATE_RELEASE_PAGE_URL,
+  };
+}
+
+export function quitAndInstallStagedUpdate(): {
+  ok: boolean;
+  reason?: string;
+} {
+  return controller.install();
+}
+
+export function triggerInstallNow(): { ok: boolean; reason?: string } {
+  return quitAndInstallStagedUpdate();
+}
+
+export const categoriseUpdaterError = categoriseUpdateError;
+export const DOWNLOAD_RETRY_DELAYS_MS = UPDATE_DOWNLOAD_RETRY_DELAYS_MS;
+export const DOWNLOAD_RETRY_MAX = UPDATE_DOWNLOAD_RETRY_DELAYS_MS.length;
+
+function resolveParent(candidate: BrowserWindow | null): BrowserWindow | undefined {
+  if (candidate && !candidate.isDestroyed()) return candidate;
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && !focused.isDestroyed()) return focused;
+  const first = BrowserWindow.getAllWindows()[0];
+  return first && !first.isDestroyed() ? first : undefined;
+}
+
 async function safeMessageBox(
   parent: BrowserWindow | undefined,
-  opts: Electron.MessageBoxOptions,
+  options: Electron.MessageBoxOptions,
 ): Promise<Electron.MessageBoxReturnValue> {
   try {
     return parent
-      ? await dialog.showMessageBox(parent, opts)
-      : await dialog.showMessageBox(opts);
-  } catch (err) {
-    log.error('[updater] showMessageBox failed', err);
-    // v0.1.83 — on a dialog-SHOW FAILURE return a sentinel `response: -1`
-    // (NOT `0`). WHY: button index 0 is a real, actionable choice at some
-    // call sites — for the "Update available" dialog index 0 is "Open
-    // Release Page", and the caller does `if (response === 0) await
-    // shell.openExternal(releaseUrl)`. If a thrown dialog mapped to `0`,
-    // a FAILED dialog would silently open the user's browser to the
-    // release page with no prompt — a confusing, unrequested side effect.
-    // `-1` matches no `response === <n>` check at any call site, so a
-    // dialog failure now correctly maps to "no action taken". The other
-    // call sites ignore the return value entirely, so this is safe for
-    // them too.
+      ? await dialog.showMessageBox(parent, options)
+      : await dialog.showMessageBox(options);
+  } catch (error) {
+    log.error('[updater] message box failed', error);
     return { response: -1, checkboxChecked: false };
   }
 }
 
-/**
- * Triggered by the "Check for Updates Now…" menu item.
- *
- * v0.1.37 rewrite: this is now backed by the **GH-Releases pipeline**
- * (`performGithubUpdateCheck`) so the user-facing dialog ALWAYS agrees
- * with the in-app banner. Pre-v0.1.37 the menu used Squirrel's
- * `autoUpdater.checkForUpdates()`, which on unsigned macOS builds
- * resolves to `update-not-available` and shows "you're on the latest
- * version" — even when GH Releases is reporting a newer release that
- * the banner is already advertising. Voice 3351 flagged this two-
- * sources-of-truth mismatch directly: "Your dialogue says you're on
- * the latest version, but then the top banner says update available
- * 0.1.36. Is it looking at a different source? Maybe that's the
- * problem."
- *
- * After producing the authoritative GH-Releases verdict, this function
- * ALSO kicks Squirrel's `autoUpdater.checkForUpdates()` in the
- * background when the feed is ready (signed packaged builds) so the
- * in-app download → restart-to-install flow still runs without the
- * user needing to click Install on the banner. On unsigned / dev /
- * Linux Squirrel is skipped entirely and the dialog offers an "Open
- * Releases" button that drops the user on the GitHub release page.
- *
- * IMPORTANT: this function must never throw synchronously. The
- * Electron menu-click dispatcher treats a sync throw as a failed
- * action invocation and macOS surfaces it as the cryptic alert "this
- * command is disabled and cannot be executed". All known throw sites
- * are caught and converted into user-visible dialogs.
- */
+/** Manual menu flow backed by the same state machine as the banner and MCP. */
 export async function checkForUpdatesInteractive(
   parent: BrowserWindow | null,
 ): Promise<void> {
-  const owner = resolveParent(parent);
-
-  if (checkInFlight) {
-    log.info('[updater] check already in flight, ignoring duplicate click');
+  if (interactiveCheckInFlight) {
+    log.info('[updater] duplicate interactive check coalesced');
     return;
   }
-  checkInFlight = true;
-
+  interactiveCheckInFlight = true;
   try {
-    // 1. Hit GH Releases — authoritative source. `performGithubUpdateCheck`
-    //    broadcasts `UPDATE_STATUS` so the banner state syncs to the
-    //    dialog automatically (no two-sources-of-truth window).
-    const info = await performGithubUpdateCheck(true);
-
-    // 2. Render dialog based on the GH-Releases verdict.
+    const info = await controller.checkForUpdates(true);
+    const owner = resolveParent(parent);
     if (info.kind === 'available') {
-      const latest = info.latestVersion ?? '(unknown)';
-      const releaseUrl = info.releaseUrl ?? `https://github.com/${REPO}/releases`;
-      const detail =
-        `You're running ${info.currentVersion}. Latest is ${latest}.\n\n` +
-        (app.isPackaged && process.platform !== 'linux' && feedURLReady
-          ? "The update is downloading in the background — you'll be prompted to restart once it's ready."
-          : 'Open the release page to install manually (this build is not connected to the in-app update feed).');
-      const buttons = ['Open Release Page', 'OK'];
-      // Index 0 = "Open Release Page", index 1 = "OK" (default/cancel).
-      const OPEN_RELEASE_PAGE = 0;
       const { response } = await safeMessageBox(owner, {
         type: 'info',
-        message: `Update available (${latest}).`,
-        detail,
-        buttons,
-        defaultId: 1,
+        message: `Update available (${info.latestVersion}).`,
+        detail:
+          `You're running ${info.currentVersion}. Downloading starts only ` +
+          'when you choose Download Update, and progress will stay visible.',
+        buttons: ['Download Update', 'Later', 'Open GitHub Releases'],
+        defaultId: 0,
         cancelId: 1,
       });
-      // v0.1.83 — only open the browser when the dialog ACTUALLY succeeded
-      // AND the user picked "Open Release Page". On a dialog-show failure
-      // `safeMessageBox` now returns the sentinel `-1` (see its catch),
-      // which deliberately does NOT equal `OPEN_RELEASE_PAGE`, so a failed
-      // dialog no longer opens the release page unprompted. The strict
-      // `=== OPEN_RELEASE_PAGE` check also means any future button reorder
-      // is the only thing that can change which action this triggers.
-      if (response === OPEN_RELEASE_PAGE) await shell.openExternal(releaseUrl);
-
-      // 3. Reconcile with Squirrel through the guarded download entry point.
-      //    `performGithubUpdateCheck()` already starts the native background
-      //    check when it discovers a newer release. Calling
-      //    `autoUpdater.checkForUpdates()` directly here used to enter
-      //    Squirrel a second time while that first check was still active,
-      //    producing a false red "command is disabled" banner even though the
-      //    first check later staged the update successfully.
-      if (app.isPackaged && process.platform !== 'linux' && feedURLReady) {
-        const start = triggerSquirrelDownload();
-        if (!start.ok) {
-          log.warn('[updater] guarded Squirrel menu kick did not start', start);
+      if (response === 0) {
+        const result = triggerSquirrelDownload();
+        if (!result.ok) {
+          await shell.openExternal(info.releaseUrl ?? UPDATE_RELEASE_PAGE_URL);
         }
+      } else if (response === 2) {
+        await shell.openExternal(info.releaseUrl ?? UPDATE_RELEASE_PAGE_URL);
       }
-    } else if (info.kind === 'up-to-date') {
+      return;
+    }
+    if (info.kind === 'downloading') {
+      await safeMessageBox(owner, {
+        type: 'info',
+        message: 'The update is downloading.',
+        detail: 'Progress is shown in the main window.',
+        buttons: ['OK'],
+      });
+      return;
+    }
+    if (info.kind === 'ready-to-install' || info.kind === 'installing') {
+      await safeMessageBox(owner, {
+        type: 'info',
+        message:
+          info.kind === 'installing'
+            ? 'The update is being installed.'
+            : 'The update is ready to install.',
+        detail:
+          info.kind === 'ready-to-install'
+            ? 'Use Restart & Install in the main window when you are ready.'
+            : undefined,
+        buttons: ['OK'],
+      });
+      return;
+    }
+    if (info.kind === 'up-to-date') {
       await safeMessageBox(owner, {
         type: 'info',
         message: `You're on the latest version (${info.currentVersion}).`,
         buttons: ['OK'],
       });
-    } else if (info.kind === 'error') {
+      return;
+    }
+    if (info.kind === 'error') {
       await safeMessageBox(owner, {
         type: 'warning',
         message: 'Update check failed.',
         detail: info.error ?? 'Unknown error.',
         buttons: ['OK'],
       });
-    } else if (info.kind === 'disabled') {
-      // Forcing through performGithubUpdateCheck(true) should never
-      // resolve to `disabled` — `force=true` bypasses the autoCheck
-      // gate. Guard defensively anyway.
-      await safeMessageBox(owner, {
-        type: 'info',
-        message: 'Update checks are currently disabled in Settings.',
-        buttons: ['OK'],
-      });
     }
-    // `checking` is transient — `performGithubUpdateCheck` resolves
-    // with a terminal kind, never `checking`, so we don't handle it.
-  } catch (err) {
-    log.error('[updater] interactive check failed', err);
-    await safeMessageBox(owner, {
-      type: 'warning',
-      message: 'Update check failed.',
-      detail: String((err as Error)?.message ?? err),
-      buttons: ['OK'],
-    });
+  } catch (error) {
+    log.error('[updater] interactive check failed', error);
   } finally {
-    checkInFlight = false;
+    interactiveCheckInFlight = false;
   }
 }

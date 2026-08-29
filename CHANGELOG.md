@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.108 — one visible updater flow (2026-08-29)
+
+### What's fixed
+
+- **Download Update now does exactly one thing.** Background checks only
+  discover release metadata. Clicking Download Update immediately replaces the
+  available banner with visible progress and starts one native Squirrel
+  session; repeated clicks and checks join or preserve that state.
+- **The stale yellow banner and misleading blue “already being prepared” toast
+  are gone.** The renderer no longer hides native download progress while a
+  separate module downloads in secret.
+- **Restart & Install has one terminal path.** It is offered only after
+  Squirrel confirms staging, calls `quitAndInstall()` once, and reports a
+  bounded failure instead of force-relaunching the old app.
+- **Metadata, GUI, menu, IPC, and MCP now share one controller.** The obsolete
+  second checker and `update-electron-app` timer dependency were removed.
+
+### Guard
+
+- Added controller transition tests for discovery, duplicate clicks, visible
+  progress, retries, staging, check freezing, and installation, plus a source
+  guard that rejects hidden native checks, suppressed progress, forced
+  relaunches, or multiple native entry points.
+
 ## v0.1.107 — reliable Check for Updates (2026-08-29)
 
 ### What's fixed

@@ -664,8 +664,8 @@ export function App(): React.ReactElement {
     });
     // Live update-check broadcasts — fires when the GH poller completes a
     // check (hourly + once at startup), on every explicit "Check Now",
-    // AND on Squirrel `download-progress` / `update-downloaded` events
-    // (v0.1.25). Reset the per-session dismiss flag in two cases:
+    // and on every transition in the single updater controller. Reset the
+    // per-session dismiss flag when the update progresses beyond discovery:
     //
     //   1. New `available` tag — if the user dismissed v0.1.24 and we now
     //      see v0.1.25 is out, they almost certainly want to know.
@@ -692,11 +692,13 @@ export function App(): React.ReactElement {
           info.latestVersion &&
           info.latestVersion !== prev.latestVersion;
         const stateProgressed =
-          info.kind === 'downloading' || info.kind === 'ready-to-install';
+          info.kind === 'downloading' ||
+          info.kind === 'ready-to-install' ||
+          info.kind === 'installing';
         // v0.1.61 — also reset on Squirrel-side errors that carry an
         // `errorReleaseUrl` (the only kind the banner actually shows for
         // `error`). Without this, a user who dismissed the `available`
-        // banner and then clicked Install Update via the menu would
+        // banner and then started Download Update via the menu would
         // never see the resulting failure surface in the UI.
         const erroredVisibly =
           info.kind === 'error' &&

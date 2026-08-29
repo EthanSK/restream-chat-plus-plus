@@ -346,9 +346,7 @@ body {
   }
 }
 
-/* Spinner that lives inside the Install Update button while the IPC
- * round-trip is in flight. Smaller than the standalone banner spinner so
- * it sits comfortably next to the "Installing…" label. */
+/* Spinner inside Download Update while the IPC start request is in flight. */
 .update-banner-button-spinner {
   width: 10px;
   height: 10px;

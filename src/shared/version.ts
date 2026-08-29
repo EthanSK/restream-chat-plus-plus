@@ -1,16 +1,9 @@
 // Tiny semver-compare helper, shared between main and renderer.
 //
-// We poll GitHub's Releases API ourselves (in parallel with
-// `update-electron-app` / Squirrel) so update detection works even when the
-// app is unsigned — Squirrel.Mac silently refuses unsigned updates, which is
-// why the original auto-update path doesn't fire today. The GH path only
-// needs to ANSWER "is there a newer version?" and "where is it?" — actually
-// installing the update still requires the signed Squirrel feed. v0.1.32:
-// the banner's Download button now triggers Squirrel's in-app
-// `checkForUpdates()` pipeline (progress bar → Restart to install); on
-// builds where Squirrel can't run, a native dialog explains the situation
-// with an explicit "Reveal Release Page" escape hatch — the silent
-// browser bounce we used pre-v0.1.32 is gone.
+// The authoritative update controller uses this for metadata discovery before
+// it allows a native Squirrel download. Discovery and installation share one
+// state machine, but remain separate operations: a background check never
+// starts the native updater.
 //
 // We deliberately don't pull in a full semver library (`semver` is 50 KB +
 // dependencies) — Restream Chat++ versions are always strict

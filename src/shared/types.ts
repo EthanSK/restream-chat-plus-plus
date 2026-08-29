@@ -368,9 +368,10 @@ export interface Settings {
    */
   hiddenUsers: string[];
   /**
-   * Update-checker preferences. The GH-Releases-API-backed poller in
-   * `src/main/github-update-check.ts` reads `update.autoCheck` at every
-   * tick — toggling the setting takes effect on the next interval without
+   * Update-checker preferences. The authoritative update controller reads
+   * `update.autoCheck` at every metadata-poll tick; it never starts a native
+   * download from that background path.
+   * Toggling the setting takes effect on the next interval without
    * needing an app restart. The "Check for Updates Now…" menu item always
    * fires regardless of this flag (it's the explicit user request path).
    *
@@ -675,11 +676,9 @@ export const IPC = {
   NOTIFY: 'notify',
   REVEAL_LOGS: 'logs:reveal',
   /**
-   * Push channel — main → renderer — fires whenever the GH-Releases poller
-   * (`src/main/github-update-check.ts`) finishes a check. Payload is an
-   * `UpdateInfo` describing whether an update is available, the app is up
-   * to date, the check is disabled, or the check failed. The renderer's
-   * UpdateBanner subscribes to this to decide whether to show its strip.
+   * Push channel — main → renderer — fires for every transition from the
+   * authoritative update controller: discovery, visible download progress,
+   * staged install, installation, or failure.
    */
   UPDATE_STATUS: 'update:status',
   /**
@@ -981,6 +980,7 @@ export interface UpdateInfo {
     | 'available'
     | 'downloading'
     | 'ready-to-install'
+    | 'installing'
     | 'up-to-date'
     | 'disabled'
     | 'error';

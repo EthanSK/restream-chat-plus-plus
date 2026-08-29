@@ -67,15 +67,10 @@ describe('Settings migration', () => {
   });
 
   // -------------------------------------------------------------------------
-  // v0.1.24 — `update.autoCheck` toggle for the GH-Releases poller.
+  // `update.autoCheck` controls metadata-only release discovery.
   //
-  // The GH-API-backed update checker (`src/main/github-update-check.ts`) is
-  // the primary "is there a new version?" signal for unsigned macOS builds,
-  // because Squirrel.Mac silently rejects unsigned auto-updates and leaves
-  // users stranded on whatever version they first installed. The setting is
-  // opt-out: defaulting to ON means a fresh install with no persisted
-  // settings starts polling immediately. Defaulting to OFF would re-create
-  // the "I never know there's an update" problem we're trying to fix.
+  // It is opt-out so a fresh install discovers releases, but discovery never
+  // starts Squirrel or downloads a bundle.
   //
   // These tests pin that contract so a future refactor can't silently flip
   // the default to false without us noticing.

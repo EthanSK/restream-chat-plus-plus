@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-29T13:52:00Z
+**Trigger:** Ethan: “install update is so shit ... redo the install update system from scratch”; screenshot showed v0.1.107 available while v0.1.106 displayed “Update is already being prepared in the background”.
+**Symptom:** Clicking Install Update left the yellow available banner in place and showed a transient blue toast claiming a hidden background operation was already running. The action looked stale and contradictory even though Squirrel later staged the update.
+**Root cause:** Update state had two owners. `github-update-check.ts` discovered a release and silently started native Squirrel, while `updater.ts` separately tracked native flags and deliberately dropped every `kind:'downloading'` payload behind `SUPPRESS_FOREGROUND_DOWNLOAD_UI`. The renderer therefore kept presenting an actionable available button for an operation that had already started elsewhere. Layered guards, timers, retries, and a forced `app.relaunch()` fallback accumulated around that split state instead of making the transition contract explicit.
+**Fix:** v0.1.108 replaces both owners with one `UpdateController`. Background polling is metadata-only. Download Update synchronously publishes `downloading` before the sole native `checkForUpdates()` entry point; native events drive visible progress and `ready-to-install`; Restart & Install calls `quitAndInstall()` once and reports a bounded no-restart failure rather than launching the old bundle. GUI, menu, IPC, and MCP read the same state. The unused `update-electron-app` dependency and its independent timer are removed.
+**Commit:** v0.1.108 release
+**Guard:** `update-controller.test.ts` pins discovery-without-download, immediate visible transition, duplicate coalescing, monotonic progress, bounded network retries, non-retryable signature/staging failures, staged-state check freezing, and one deferred install call. `updater-architecture-guard.test.ts` rejects multiple native entry points, hidden download suppression, background native checks, and forced relaunch/exit fallbacks. `update-banner-visible-flow.test.tsx` pins Download Update → visible progress → Restart & Install → installing. All 719 tests pass, typecheck is clean, and lint has no errors (pre-existing warnings only). The local v0.1.108 arm64 package contains the new controller, omits the obsolete updater path, and passes strict deep Developer ID verification plus outer/nested `libffmpeg.dylib` Team ID `T34G959ZG8`; Gatekeeper accepts it as Developer ID. Public release and live installed acceptance are recorded when verified. OBS++ was actively recording during implementation, so do not quit or replace the installed app until that boundary is safe.
+---
+
+---
 **Date:** 2026-08-29T12:25:11Z
 **Trigger:** Ethan: "after doing Check for Updates I see the yellow banner for a split second then" a red `Update failed (v0.1.106)` banner saying `The command is disabled and cannot be executed`.
 **Symptom:** The installed v0.1.105 app correctly discovered v0.1.106, briefly showed the available state, then showed a native-updater failure even though v0.1.106 finished downloading and staging 13 seconds later.

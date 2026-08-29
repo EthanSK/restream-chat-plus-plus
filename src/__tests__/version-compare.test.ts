@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { isNewerVersion, parseVersion } from '../shared/version';
 
 /**
- * The GH-Releases-API update poller (`src/main/github-update-check.ts`) decides
- * whether to surface the "Update available" banner based on `isNewerVersion`.
+ * The update controller decides whether to surface the "Update available"
+ * banner based on `isNewerVersion`.
  * If this helper says yes when it shouldn't, the user gets a phantom banner
  * pointing at a release they already have installed (or worse, a downgrade).
  * If it says no when it should, the user misses real updates and stays

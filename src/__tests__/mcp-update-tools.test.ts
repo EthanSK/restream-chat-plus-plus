@@ -145,6 +145,38 @@ describe('mcp tools v0.1.64: update_check_now', () => {
 });
 
 // ---------------------------------------------------------------------------
+// update_download_start
+// ---------------------------------------------------------------------------
+
+describe('mcp tools: update_download_start', () => {
+  it('starts the authoritative download through the live bridge', async () => {
+    seedStore();
+    const start = vi.fn(() => ({
+      ok: true as const,
+      reason: 'started' as const,
+      mode: 'squirrel' as const,
+    }));
+    const bridge = buildBridge({ triggerUpdateDownload: start });
+    const result = (await call('update_download_start', {}, bridge)) as {
+      ok: boolean;
+      reason: string;
+    };
+    expect(result).toMatchObject({ ok: true, reason: 'started' });
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it('returns guiNotIntrospectable without the live bridge', async () => {
+    seedStore();
+    const result = (await call('update_download_start', {})) as {
+      ok: boolean;
+      guiNotIntrospectable?: boolean;
+    };
+    expect(result.ok).toBe(false);
+    expect(result.guiNotIntrospectable).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // update_download_status
 // ---------------------------------------------------------------------------
 
