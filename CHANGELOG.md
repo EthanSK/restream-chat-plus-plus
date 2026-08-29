@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.109 — updater acceptance release (2026-08-29)
+
+### What's included
+
+- **A deliberately minimal release for testing the new updater flow.** There
+  are no behavior changes from v0.1.108; the newer version exists so a running
+  v0.1.108 installation can exercise Download Update, visible progress, and
+  Restart & Install against a real signed and notarized GitHub release.
+
 ## v0.1.108 — one visible updater flow (2026-08-29)
 
 ### What's fixed
