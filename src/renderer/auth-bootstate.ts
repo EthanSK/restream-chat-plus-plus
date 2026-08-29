@@ -23,7 +23,10 @@
  * the existing `AuthStatus`. Initial value is `'checking'`. The very
  * first AUTH_STATUS we observe (either from the initial
  * `await rcpp.authStatus()` invoke OR from the `onAuthStatus` push)
- * transitions to `'signed_in'` / `'signed_out'`. A 5s timer escalates
+ * transitions to `'signed_in'` / `'signed_out'`. Main gates both paths on
+ * completion of startup token restoration, so a still-running refresh keeps
+ * this state on the loading overlay instead of resolving it as signed out.
+ * A 5s timer escalates
  * `'checking'` → `'checking-slow'` so the user gets a "Still checking…"
  * subtitle instead of staring at a silent spinner. A 15s timer escalates
  * to `'verify_failed'` so we don't hang forever — the user gets a

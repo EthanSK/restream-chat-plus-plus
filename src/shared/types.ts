@@ -1082,6 +1082,9 @@ export interface UpdateInfo {
  * AUTH_STATUS we observe — whether from the initial `await rcpp.authStatus()`
  * pull OR the deferred `onAuthStatus` push — transitions us to
  * `'signed_in'` or `'signed_out'` and the spinner disappears.
+ * Both main-process paths wait for the same startup-auth completion promise,
+ * so neither can publish a false signed-out snapshot while token refresh is
+ * still in progress.
  *
  * State values:
  *   - `'checking'`           — initial; main process hasn't told us yet.

@@ -22,6 +22,7 @@ import {
 import { createChatSendQueue, type ChatSendQueue } from './chat-send-queue';
 import { createChatSendFanout } from './chat-send-fanout';
 import { resumeAuthWithCookieRepair } from './startup-auth-resume';
+import { readStartupAuthStatus } from './startup-auth-status';
 // v0.1.70 (sign-out diagnosis 2026-05-25) — transient-refresh-retry
 // watchdog. Factored out of main.ts so the exponential-backoff state
 // machine can be pinned with unit tests (Vitest fake timers) without
@@ -978,17 +979,12 @@ app.on('ready', async () => {
   });
 
   ipcMain.handle(IPC.AUTH_STATUS, async () => {
-    // v0.1.38: await `getTokenAsync` so a renderer that pulls AUTH_STATUS
-    // before the deferred decrypt has settled gets the correct truth
-    // rather than a transient `authenticated: false`. After the first
-    // launch tick this resolves from the in-memory cache instantly.
-    const t = await oauth.getTokenAsync();
-    const status: AuthStatus = {
-      authenticated: await oauth.isAuthenticatedAsync(),
-      scope: t?.scope,
-      expiresAt: t?.expiresAt,
-    };
-    return status;
+    // v0.1.110: the renderer pulls immediately on mount, so this path must
+    // wait for the same startup refresh boundary as the did-finish-load push.
+    // Otherwise an expired access token is reported as signed out while its
+    // saved refresh token is still restoring the session, flashing Sign in
+    // before the app finishes loading.
+    return readStartupAuthStatus({ startupAuthDone, oauth });
   });
 
   // ----- IPC: connection state (pull-fetch on renderer mount) -----

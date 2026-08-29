@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-08-29T15:27:23Z
+**Trigger:** Ethan: “when i first start the app it always shows sign in instead of loading if its loading”.
+**Symptom:** A signed-in user could briefly see the actionable Sign in to Restream button during cold start before the saved session finished restoring, then the normal connected UI replaced it.
+**Root cause:** Startup auth had one completion latch but only the `did-finish-load` AUTH_STATUS push waited for it. The renderer also performed an immediate AUTH_STATUS pull; that handler awaited Keychain decrypt but did not await the refresh-token leg. With an expired access token, the pull could therefore return `authenticated:false` while `resumeAuthWithCookieRepair()` was still refreshing the saved session. The renderer correctly treated that first answer as final and removed its loading overlay.
+**Fix:** v0.1.110 routes the AUTH_STATUS pull through `readStartupAuthStatus()`, which waits for the same `startupAuthDone` promise as the push before reading OAuth truth. The existing Checking sign-in overlay now remains authoritative throughout decrypt/refresh and Sign in appears only after startup resolves genuinely signed out. Later status reads remain immediate because the promise is already settled.
+**Commit:** v0.1.110 release
+**Guard:** `startup-auth-status.test.ts` keeps the startup promise unresolved and proves neither OAuth read runs nor a status settles until restoration finishes, then pins both restored signed-in and conclusively signed-out results. Existing `auth-bootstate.test.ts` continues to pin the renderer loading-overlay transitions. All 64 test files / 721 tests pass; typecheck is clean; lint has 0 errors (186 pre-existing warnings); and the arm64 package reports exact version 0.1.110.
+---
+
+---
 **Date:** 2026-08-29T13:52:00Z
 **Trigger:** Ethan: “install update is so shit ... redo the install update system from scratch”; screenshot showed v0.1.107 available while v0.1.106 displayed “Update is already being prepared in the background”.
 **Symptom:** Clicking Install Update left the yellow available banner in place and showed a transient blue toast claiming a hidden background operation was already running. The action looked stale and contradictory even though Squirrel later staged the update.

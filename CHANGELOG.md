@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.110 — honest startup loading state (2026-08-29)
+
+### What's fixed
+
+- **Startup no longer flashes Sign in while restoring the saved session.**
+  The renderer's initial auth-status pull now waits for the same token decrypt
+  and refresh boundary as the main-process push. While that work is pending,
+  the existing Checking sign-in loading overlay remains visible; Sign in is
+  shown only after startup conclusively resolves as signed out.
+
+### Guard
+
+- Added a startup-auth status test that holds restoration unresolved and proves
+  OAuth truth is not read or published until that boundary completes, while a
+  genuinely signed-out result still resolves normally afterward.
+
 ## v0.1.109 — updater acceptance release (2026-08-29)
 
 ### What's included
