@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-03T12:33:00Z
+**Trigger:** Ethan: “getting so many messages from X ages later ... why isn't it smart enough to know it's from me ... even for Twitch sometimes and YT”.
+**Symptom:** Messages sent through RC++ appeared immediately as the normal optimistic/`reply_created` self row, then separate `REEEthan X` rows leaked into the combined feed roughly 31–37 minutes later. They were silenced only because Ethan's username regex happened to match, not because RC++ identified them as self. Direct Twitch/Kick self events could leak through the same way after 30 seconds.
+**Root cause:** Restream/X accepted each send immediately, then its connector delivered the platform copy much later as an ordinary `event` with a new message ID. RC++ marked only `reply_created` as self and never compared an ordinary event's stable `eventPayload.author.id` with the authenticated owner ID already present in the matching `connection_info`. The direct-provider aggregator also required a same-text pending send within 30 seconds before suppressing a message that Twitch/Kick had already marked `self:true`.
+**Fix:** v0.1.111 caches each Restream connection owner's stable platform ID and suppresses an ordinary platform event only when its author ID exactly matches that owner. It deliberately does not guess from username or display name. Direct Twitch/Kick now treat their authenticated `self:true` identity as authoritative at every age; the pending text/time match remains diagnostic correlation only.
+**Commit:** `fc1639b` (`fix(chat): suppress delayed platform self echoes (v0.1.111)`)
+**Guard:** `ws-self-platform-echo.test.ts` covers exact X, YouTube, and Twitch owner-ID suppression, same-display-name/different-ID forwarding, and missing-owner-ID fail-open behavior. `direct-chat-liveness.test.ts` proves a direct Twitch self event with no pending-send correlation is suppressed while a viewer event still forwards. All 65 test files / 727 tests pass; typecheck is clean; lint has 0 errors (186 pre-existing warnings); and the local arm64 package reports exact version 0.1.111. Main CI run `33754964988` and tagged release run `33754977861` passed. The published arm64 ZIP matches its release checksum, reports exact version 0.1.111, passes strict deep verification, is accepted as `Notarized Developer ID`, has a valid stapled ticket, and gives the app Team ID `T34G959ZG8`. GitHub latest release and public `version.json` both point to v0.1.111. The exact published build is installed and connected from `/Applications/Restream Chat Plus Plus.app`; its installed `app.asar` contains both new suppression paths. OBS++ streaming and recording PIDs remained alive across the brief RC++ restart, and signed v0.1.110 is preserved in the app's Install Backups folder.
+---
+
+---
 **Date:** 2026-08-29T15:27:23Z
 **Trigger:** Ethan: “when i first start the app it always shows sign in instead of loading if its loading”.
 **Symptom:** A signed-in user could briefly see the actionable Sign in to Restream button during cold start before the saved session finished restoring, then the normal connected UI replaced it.
