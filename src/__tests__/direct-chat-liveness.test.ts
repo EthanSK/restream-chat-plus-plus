@@ -406,6 +406,69 @@ describe.sequential('direct chat liveness recovery', () => {
     directChat.stop();
   });
 
+  it('suppresses every direct-provider self event even after pending-send correlation is absent', async () => {
+    const directChat = new DirectChatSources(
+      makeStore({
+        twitchTokenEnc: encrypted({
+          accessToken: 'access',
+          refreshToken: 'refresh',
+          expiresAt: Date.now() + 3_600_000,
+          scope: ['user:read:chat', 'user:write:chat'],
+        }),
+      }),
+    );
+    const forwarded = vi.fn();
+    directChat.on('message', forwarded);
+    await directChat.start();
+    const socket = WS.instances[0];
+    socket.emit('open');
+    socket.emit(
+      'message',
+      JSON.stringify({
+        metadata: { message_type: 'session_welcome' },
+        payload: { session: { id: 'session-1' } },
+      }),
+    );
+    await vi.waitFor(() => expect(directChat.getConnections()[0].status).toBe('connected'));
+
+    socket.emit(
+      'message',
+      JSON.stringify({
+        metadata: { message_type: 'notification' },
+        payload: {
+          event: {
+            message_id: 'late-own-echo',
+            chatter_user_id: '42',
+            chatter_user_name: 'reeethan_yt',
+            message: { text: 'late self echo' },
+          },
+        },
+      }),
+    );
+    await Promise.resolve();
+    expect(forwarded).not.toHaveBeenCalled();
+
+    socket.emit(
+      'message',
+      JSON.stringify({
+        metadata: { message_type: 'notification' },
+        payload: {
+          event: {
+            message_id: 'viewer-message',
+            chatter_user_id: 'viewer-1',
+            chatter_user_name: 'viewer',
+            message: { text: 'hello' },
+          },
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(forwarded).toHaveBeenCalledOnce());
+    expect(forwarded).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'viewer-message', self: false }),
+    );
+    directChat.stop();
+  });
+
   it('reconnects Kick when the relay stops answering its application heartbeat', async () => {
     const source = new KickChatSource(
       makeStore({

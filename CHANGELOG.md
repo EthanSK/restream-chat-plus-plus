@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.111 — stable self-message identity (2026-09-03)
+
+### What's fixed
+
+- **Delayed copies of your own X, YouTube, and Twitch messages no longer leak
+  into the feed.** RC++ now compares the event author's stable platform account
+  ID with the authenticated owner ID from Restream's matching connection,
+  instead of relying on the immediate `reply_created` acknowledgement alone.
+- **Direct Twitch and Kick self-echoes no longer become viewer messages after
+  30 seconds.** Their authenticated provider identity is now authoritative;
+  the short text-and-time match remains correlation evidence only.
+
+### Guard
+
+- Added X, YouTube, and Twitch regression cases for exact owner-ID suppression,
+  including proof that a different account with the same display name still
+  passes through. The direct Twitch flow also proves a self event is suppressed
+  without pending-send correlation while an ordinary viewer still arrives.
+
 ## v0.1.110 — honest startup loading state (2026-08-29)
 
 ### What's fixed

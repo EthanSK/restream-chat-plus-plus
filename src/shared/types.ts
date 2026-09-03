@@ -59,7 +59,7 @@ export interface ChatMessage {
   raw?: unknown;
   /**
    * True when the message was originated by the local user — produced by
-   * normalising a `reply_created` frame from Restream's WebSocket.
+   * Restream's `reply_created` frame or a direct provider's authenticated identity.
    *
    * Restream's Chat API is RECEIVE-ONLY for third-party clients: the
    * official Restream Chat webchat (or any other first-party flow) is what

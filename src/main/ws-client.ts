@@ -380,6 +380,8 @@ export class ChatClient extends EventEmitter {
    * stale entries from a previous session.
    */
   private connections = new Map<string, ChatConnection>();
+  /** Stable platform-owner ids from the matching Restream connection_info frame. */
+  private connectionOwnerIds = new Map<string, string>();
 
   // ------------------------------------------------------------------
   // v0.1.86 (voice 4491) — subscription-loss recovery state. See the
@@ -631,6 +633,7 @@ export class ChatClient extends EventEmitter {
       this.connections.clear();
       this.emit('connections', this.getConnections());
     }
+    this.connectionOwnerIds.clear();
     // Drop any cached chat context — a reconnect may be onto a different
     // account / event / show. We'll re-sniff it from the first event /
     // reply frame we see. v0.1.34.
@@ -758,7 +761,17 @@ export class ChatClient extends EventEmitter {
         this.normalizeLogSink,
       );
       if (result.message) {
-        this.emit('message', result.message);
+        const ownPlatformEvent = this.getOwnPlatformEventIdentity(parsed);
+        if (ownPlatformEvent) {
+          // Restream can replay an outgoing X/YouTube/Twitch post as a separate platform event over 30 minutes later; match the authenticated account id so that delayed copy never leaks into the feed. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
+          this.appendRawLog({
+            kind: 'self-platform-message-suppressed',
+            connectionIdentifier: ownPlatformEvent.connectionIdentifier,
+            messageId: result.message.id,
+          });
+        } else {
+          this.emit('message', result.message);
+        }
       } else if (result.drop) {
         // Surface silent drops so we can see why a real event isn't reaching
         // the UI. Heartbeats and connection_info will fall through as
@@ -1164,6 +1177,12 @@ export class ChatClient extends EventEmitter {
     const p = payload as Record<string, any>;
     const connectionIdentifier = p.connectionIdentifier;
     if (typeof connectionIdentifier !== 'string') return;
+    const ownerId = p.target?.owner?.id;
+    if (typeof ownerId === 'string' || typeof ownerId === 'number') {
+      this.connectionOwnerIds.set(connectionIdentifier, String(ownerId));
+    } else {
+      this.connectionOwnerIds.delete(connectionIdentifier);
+    }
     const next: ChatConnection = {
       connectionIdentifier,
       connectionUuid: String(p.connectionUuid ?? ''),
@@ -1216,6 +1235,7 @@ export class ChatClient extends EventEmitter {
     for (const [key, entry] of this.connections) {
       if (entry.connectionUuid === uuid) {
         this.connections.delete(key);
+        this.connectionOwnerIds.delete(key);
         changed = true;
         break;
       }
@@ -1232,6 +1252,34 @@ export class ChatClient extends EventEmitter {
         this.handleAllConnectionsDrained(typeof p.reason === 'string' ? p.reason : 'unknown');
       }
     }
+  }
+
+  /** Return the exact Restream connection when an ordinary platform event came from its owner. */
+  private getOwnPlatformEventIdentity(raw: unknown):
+    | { connectionIdentifier: string }
+    | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const envelope = raw as Record<string, unknown>;
+    if (envelope.action !== 'event') return undefined;
+    const payload = envelope.payload;
+    if (!payload || typeof payload !== 'object') return undefined;
+    const event = payload as Record<string, unknown>;
+    const connectionIdentifier = event.connectionIdentifier;
+    if (typeof connectionIdentifier !== 'string') return undefined;
+    const ownerId = this.connectionOwnerIds.get(connectionIdentifier);
+    if (!ownerId) return undefined;
+    const eventPayload = event.eventPayload;
+    if (!eventPayload || typeof eventPayload !== 'object') return undefined;
+    const author = (eventPayload as Record<string, unknown>).author;
+    if (!author || typeof author !== 'object') return undefined;
+    const authorId = (author as Record<string, unknown>).id;
+    if (
+      (typeof authorId !== 'string' && typeof authorId !== 'number') ||
+      String(authorId) !== ownerId
+    ) {
+      return undefined;
+    }
+    return { connectionIdentifier };
   }
 
   /**

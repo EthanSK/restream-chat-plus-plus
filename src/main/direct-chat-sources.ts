@@ -45,11 +45,14 @@ export class DirectChatSources extends EventEmitter {
     for (const source of Object.values(this.sources)) {
       source.on('state', () => this.emit('state', this.getConnections()));
       source.on('message', (message) => {
-        if (message.self && this.consumePendingOwnMessage(message)) {
+        if (message.self === true) {
+          const matchedPendingSend = this.consumePendingOwnMessage(message);
+          // Direct Twitch/Kick echoes could arrive after the 30-second pending-send match expired and leak into the feed; provider-authenticated identity is authoritative, while the text match is only correlation evidence. (Codex task: 01a01b14-9ef1-7082-99e7-1885d5d90235)
           appendJsonl('direct-chat.jsonl', {
             provider: message.platform,
             event: 'outgoing-self-echo-suppressed',
             messageId: message.id,
+            matchedPendingSend,
           });
           return;
         }
@@ -57,7 +60,7 @@ export class DirectChatSources extends EventEmitter {
           provider: message.platform,
           event: 'message-forwarded',
           messageId: message.id,
-          self: message.self === true,
+          self: false,
         });
         this.emit('message', message);
       });
