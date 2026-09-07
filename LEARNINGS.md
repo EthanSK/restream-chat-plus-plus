@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-07T17:05:00Z
+**Trigger:** Ethan: “fix it if its right ... whats the login cutoff ... worse UX”.
+**Symptom:** The sending-login window closed during Google/passkey verification, while missing website cookies were reduced to a generic partial-delivery failure or falsely described as an expired session requiring sign-out.
+**Root cause:** `provisionCookiesInteractive` imposed a 60-second deadline. Startup and fresh OAuth sign-in waited for that separate website handshake; fan-out and intermediate retry statuses discarded the underlying Restream failure evidence.
+**Fix:** v0.1.113 removes the interactive deadline while retaining the eight-second headless budget and cancellation/parent-close cleanup. Receiving auth is published independently; partial failures retain their cause, and “Sign in to send” repairs only website cookies without replacing OAuth or resending successful destinations. Timeout text now describes unconfirmed delivery, not a proven connection or authentication failure. Initial source commit `5e4ebf4`; this follow-up carries the same cause through retry statuses.
+**Guard:** Three new regression cases failed before the fix; 745 tests now pass, including a simulated two-minute login, cancellation, parent close, shared login windows, actual auth-IPC ordering, and the renderer repair button through success/cancellation without sign-out or automatic resend. Typecheck and lint have no errors. Real provider expiry remains outside the app's control; these tests do not prove that website cookies never expire. Signed installation is verified separately; the viewer feed's repeated-401 recovery issue is not changed by this fix.
+---
+
+---
 **Date:** 2026-09-07T12:50:09Z
 **Trigger:** Ethan: “getting send timeouts ... retry those that failed”, then “ok i logged in now”.
 **Symptom:** Receiving chat remained connected, but two replies failed only on Restream after succeeding on direct Twitch and Kick. The generic timeout and partial-delivery error did not identify the missing sending login.

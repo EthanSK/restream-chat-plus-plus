@@ -114,6 +114,7 @@ describe('chat-send retry loop (v0.1.90)', () => {
     ]);
     expect(statuses.some((s) => s.status === 'sent')).toBe(true);
     expect(statuses.some((s) => s.status === 'failed')).toBe(false);
+    expect(statuses.filter((s) => s.status === 'retrying').every((s) => s.reason === 'no-session-cookies')).toBe(true);
   });
 
   it('(c) all attempts exhausted ends in a single terminal `failed` carrying the last reason', async () => {

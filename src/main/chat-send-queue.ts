@@ -285,11 +285,14 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
   // retrying status is cosmetic (the placeholder just shows the previous
   // "(retry N-1/5)" until the next attempt) and must NEVER abort the loop, so
   // we swallow IPC failures here without the heavyweight mirroring above.
-  const emitRetrying = (clientId: string, attempt: number): void => {
+  const emitRetrying = (clientId: string, attempt: number, result: SendTextResult): void => {
     try {
       opts.emitStatus({
         clientId,
         status: 'retrying',
+        reason: result.reason,
+        error: result.error,
+        destinations: result.destinations, // Missing website login needs user action before the retry loop ends, not a generic timeout afterward.
         attempt,
         maxAttempts: maxSendAttempts,
       });
@@ -389,7 +392,7 @@ export function createChatSendQueue(opts: ChatSendQueueOptions): ChatSendQueue {
 
       // Flip the placeholder to "(retry N/5)" where N == the attempt we're
       // ABOUT to make — so the user sees progress toward delivery.
-      emitRetrying(item.clientId, nextAttempt);
+      emitRetrying(item.clientId, nextAttempt, result);
 
       if (opts.reconnectBetweenRetries) {
         try {
