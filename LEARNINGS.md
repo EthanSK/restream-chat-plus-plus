@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-07T11:34:00Z
+**Trigger:** Ethan: “make sure it never expires again ... what's the issue”.
+**Symptom:** RC++ stayed signed out after macOS Keychain access recovered; the saved encrypted Restream token remained present and an app restart restored the receiving connection without fresh OAuth authorization.
+**Root cause:** `refreshInner()` classified unavailable client credentials as `none`, just like a missing refresh token. Startup and reconnect only arm the existing recovery timer for `transient`, so a temporary credential-read denial never started that recovery.
+**Fix:** v0.1.112 preserves the token and classifies this credential failure as transient, with a secret-free diagnostic row. It reuses the existing backoff and does not change provider revocation handling or the separate Restream website login used for sending.
+**Commit:** `c8e373a` (`fix(auth): retry unavailable Keychain credentials (v0.1.112)`)
+**Guard:** Two regression tests failed before the fix and passed afterward; encrypted-token preservation, genuinely signed-out sessions, and startup-to-timer recovery after credentials return are covered. All 730 tests pass, typecheck is clean, and lint has zero errors (186 existing warnings); CI `34117331802` and signed build `34117331826` passed. The main-branch arm64 artifact passes its checksum, strict deep signature, Gatekeeper (`Notarized Developer ID`), and stapled-ticket checks, with outer app and nested `libffmpeg.dylib` Team ID `T34G959ZG8`. The exact artifact is installed at `/Applications/Restream Chat Plus Plus.app`; live MCP reports 0.1.112, preserved auth, and connected, while OBS and its recording process remained running and the recording file grew. Version 0.1.111 is preserved in Install Backups. The separate Restream website session still needs interactive login; no public message was sent to test it, and no real Keychain outage was forced on the live app.
+---
+
+---
 **Date:** 2026-09-03T12:33:00Z
 **Trigger:** Ethan: “getting so many messages from X ages later ... why isn't it smart enough to know it's from me ... even for Twitch sometimes and YT”.
 **Symptom:** Messages sent through RC++ appeared immediately as the normal optimistic/`reply_created` self row, then separate `REEEthan X` rows leaked into the combined feed roughly 31–37 minutes later. They were silenced only because Ethan's username regex happened to match, not because RC++ identified them as self. Direct Twitch/Kick self events could leak through the same way after 30 seconds.
