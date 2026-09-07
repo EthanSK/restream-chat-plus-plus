@@ -48,6 +48,23 @@ describe('intendedTargets', () => {
 });
 
 describe('createChatSendFanout', () => {
+  it('preserves missing sending-login evidence through partial delivery and retry', async () => {
+    const sendRestream = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: 'no-session-cookies' })
+      .mockResolvedValueOnce({ ok: true });
+    const sendDirect = vi.fn(async () => ({ ok: true }));
+    const fanout = createChatSendFanout({
+      getRestreamConnections: () => [restream('youtube')],
+      getDirectConnections: () => [direct('twitch'), direct('kick')],
+      sendRestream, sendDirect,
+    });
+    const item = { clientId: 'missing-login', text: 'hello' };
+    const result = await fanout.send(item);
+    expect(result.destinations?.[0]).toMatchObject({ reason: 'no-session-cookies' });
+    expect(result.error).toContain('Sent to Twitch, Kick.');
+    expect(await fanout.send(item)).toMatchObject({ ok: true });
+    expect(sendDirect).toHaveBeenCalledTimes(2);
+  });
   it('retries only failed destinations and never duplicates successful sends', async () => {
     const sendRestream = vi.fn(async () => ({ ok: true as const }));
     const twitch = vi.fn(async (text: string) => {

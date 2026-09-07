@@ -62,8 +62,8 @@ export interface StartupAuthResumeDeps {
  *
  *   1. Restore a still-valid token OR refresh an expired token.
  *   2. Feed that access token into the WebSocket client and start it.
- *   3. Repair the chat.restream.io cookie jar for REST sends.
- *   4. Always broadcast the final auth state and unblock startup listeners.
+ *   3. Start repairing the chat.restream.io cookie jar for REST sends.
+ *   4. Broadcast auth state and unblock startup without waiting for website login.
  *
  * The bug fixed here was that v0.1.62 only repaired cookies after a fresh
  * `AUTH_START` sign-in. Users coming through the in-app updater kept their
@@ -85,7 +85,7 @@ export async function resumeAuthWithCookieRepair(
       if (token) {
         deps.chat.setToken(token.accessToken);
         deps.chat.start();
-        await repairStartupChatCookies(deps, warn, error);
+        void repairStartupChatCookies(deps, warn, error); // Interactive sending login can stay open indefinitely; receiving OAuth is already restored.
       }
     } else {
       // Second leg: the access token was expired or unavailable, but a stored
@@ -96,7 +96,7 @@ export async function resumeAuthWithCookieRepair(
       if (refreshed) {
         deps.chat.setToken(refreshed.accessToken);
         deps.chat.start();
-        await repairStartupChatCookies(deps, warn, error);
+        void repairStartupChatCookies(deps, warn, error); // Do not hold the startup latch while the user completes Google/passkey verification.
       } else if (
         // v0.1.70 (sign-out diagnosis 2026-05-25): boot-time transient
         // refresh failure. Pre-v0.1.70 this dropped the user straight to

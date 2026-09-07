@@ -23,6 +23,7 @@ import type { ViewerStatsSnapshot } from './shared/viewer-stats-core';
 type Unsub = () => void;
 
 const api = {
+  signInToSend: (): Promise<boolean> => ipcRenderer.invoke(IPC.CHAT_SIGN_IN),
   authStart: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_START),
   authStatus: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_STATUS),
   authLogout: (): Promise<AuthStatus> => ipcRenderer.invoke(IPC.AUTH_LOGOUT),

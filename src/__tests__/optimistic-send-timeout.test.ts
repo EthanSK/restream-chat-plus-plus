@@ -67,7 +67,7 @@ describe('optimistic-send timeout guard (v0.1.63)', () => {
     vi.advanceTimersByTime(1);
     expect(messages[0].pendingSend).toBe('failed');
     expect(messages[0].pendingError).toBe(
-      'Send timed out — check your connection or sign in again.',
+      'Send not confirmed. Check your chat before retrying.',
     );
   });
 

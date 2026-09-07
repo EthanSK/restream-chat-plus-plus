@@ -233,7 +233,7 @@ async function provisionCookiesHeadless(
  * `performSend()` log-emitter.
  *
  * The window auto-closes once the cookie jar contains an `accessXsrfToken`,
- * OR after `timeoutMs`, OR when the user closes it.
+ * or when the user closes it. Google/passkey sign-in has no app-side deadline.
  *
  * Implementation notes:
  *   - Title + size chosen so a user who minimised the main window still
@@ -250,8 +250,12 @@ async function provisionCookiesHeadless(
 async function provisionCookiesInteractive(
   sess: Session,
   parent: BrowserWindow | null,
-  timeoutMs: number,
 ): Promise<{ cookieHeader: string; xsrf?: string; raw: Cookie[] } | undefined> {
+  const pending = interactiveLogins.get(sess); // Startup repair and the send-warning action can overlap; share the same login window.
+  if (pending) {
+    pending.window.focus();
+    return pending.result;
+  }
   const electron = getElectron();
   if (!electron) return undefined;
   const win = new electron.BrowserWindow({
@@ -276,23 +280,37 @@ async function provisionCookiesInteractive(
   } catch {
     // ignore
   }
-  try {
-    void win.loadURL('https://chat.restream.io');
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && !userClosed) {
-      await new Promise((r) => setTimeout(r, COLD_START_POLL_MS));
-      const next = await readRestreamCookies(sess);
-      if (next && next.xsrf) return next;
-    }
-    return await readRestreamCookies(sess);
-  } finally {
+  const result = (async () => {
     try {
-      if (!userClosed && !win.isDestroyed()) win.destroy();
-    } catch {
-      // ignore
+      void win.loadURL('https://chat.restream.io').catch((error: unknown) => { // A failed navigation must not become an unhandled rejection or close a user's retryable login page.
+        appendErrorLog({
+          subsystem: 'main',
+          phase: 'chat-send.login-load-failed',
+          errorMessage: errorToString(error),
+        });
+      });
+      while (!userClosed && !win.isDestroyed() && !parent?.isDestroyed()) {
+        await new Promise((r) => setTimeout(r, COLD_START_POLL_MS));
+        const next = await readRestreamCookies(sess);
+        if (next && next.xsrf) return next;
+      }
+      return await readRestreamCookies(sess);
+    } finally {
+      try {
+        if (!userClosed && !win.isDestroyed()) win.destroy();
+      } catch {
+        // ignore
+      }
     }
-  }
+  })().finally(() => interactiveLogins.delete(sess));
+  interactiveLogins.set(sess, { window: win, result });
+  return result;
 }
+
+const interactiveLogins = new Map<Session, {
+  window: BrowserWindow;
+  result: ReturnType<typeof provisionCookiesInteractive>;
+}>();
 
 /**
  * v0.1.62 — ensure the `persist:restream-oauth` Electron partition has a
@@ -333,14 +351,6 @@ export interface EnsureRestreamChatCookiesOptions {
    * give up after the hidden attempt and report `still-no-cookies`.
    */
   interactiveFallback?: boolean;
-  /**
-   * Total budget (ms) for the interactive fallback window to wait for an
-   * XSRF cookie before destroying itself. Default 60_000 (60s) — long
-   * enough for a user to click through a single Restream sign-in
-   * affordance but short enough that a forgotten window doesn't sit open
-   * forever.
-   */
-  interactiveTimeoutMs?: number;
   /** Injected for unit tests. */
   getSession?: () => Session;
 }
@@ -413,7 +423,6 @@ export async function ensureRestreamChatCookies(
     const interactive = await provisionCookiesInteractive(
       sess,
       opts.parentWindow ?? null,
-      opts.interactiveTimeoutMs ?? 60_000,
     );
     if (interactive && interactive.xsrf) {
       return {

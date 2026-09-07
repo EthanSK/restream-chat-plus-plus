@@ -896,9 +896,25 @@ app.on('ready', async () => {
   startUpdatePoller(() => loadSettings().update.autoCheck);
 
   // ----- IPC: auth -----
+  ipcMain.handle(IPC.CHAT_SIGN_IN, async () => {
+    const result = await ensureRestreamChatCookies({ parentWindow: mainWindow, interactiveFallback: true });
+    return result.ok; // Sending cookies are separate from receiving OAuth; never sign out or replay messages to repair them.
+  });
   ipcMain.handle(IPC.AUTH_START, async () => {
     try {
       const tok = await oauth.authenticate();
+      chat.setToken(tok.accessToken);
+      chat.start();
+      // v0.1.94 — hand the fresh sign-in token to the viewer-stats socket
+      // too (it uses the same OAuth bearer; see viewer-stats-core.ts).
+      viewerStats.setToken(tok.accessToken);
+      viewerStats.start();
+      const status: AuthStatus = {
+        authenticated: true,
+        scope: tok.scope,
+        expiresAt: tok.expiresAt,
+      };
+      mainWindow?.webContents.send(IPC.AUTH_STATUS, status); // Receiving is ready now; an unfinished website login must not hide incoming chat.
       // v0.1.62 — guarantee chat-partition cookies are present before
       // declaring the app send-ready. The v0.1.59 ad-hoc → v0.1.61 signed
       // Developer ID transition split the app's auth state: OAuth token
@@ -958,18 +974,6 @@ app.on('ready', async () => {
           errorMessage: errorToString(cookieErr),
         });
       }
-      chat.setToken(tok.accessToken);
-      chat.start();
-      // v0.1.94 — hand the fresh sign-in token to the viewer-stats socket
-      // too (it uses the same OAuth bearer; see viewer-stats-core.ts).
-      viewerStats.setToken(tok.accessToken);
-      viewerStats.start();
-      const status: AuthStatus = {
-        authenticated: true,
-        scope: tok.scope,
-        expiresAt: tok.expiresAt,
-      };
-      mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
       return status;
     } catch (e: any) {
       const status: AuthStatus = { authenticated: false };

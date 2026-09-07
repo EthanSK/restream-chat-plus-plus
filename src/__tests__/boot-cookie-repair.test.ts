@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resumeAuthWithCookieRepair } from '../main/startup-auth-resume';
 import type { TokenSet } from '../main/oauth';
+import type { EnsureRestreamChatCookiesResult } from '../main/chat-send';
 
 /**
  * v0.1.63 — startup cookie repair regression coverage.
@@ -23,6 +24,29 @@ function token(accessToken: string): TokenSet {
 }
 
 describe('startup auth resume cookie repair (v0.1.63)', () => {
+  it('unblocks receiving chat while interactive sending login is still open', async () => {
+    const resolveStartupAuth = vi.fn();
+    const pushAuthStatus = vi.fn();
+    let finishRepair!: (result: EnsureRestreamChatCookiesResult) => void;
+    const repair = new Promise<EnsureRestreamChatCookiesResult>((resolve) => { finishRepair = resolve; });
+    const resumed = resumeAuthWithCookieRepair({
+      oauth: {
+        isAuthenticatedAsync: async () => true,
+        getTokenAsync: async () => token('stored'),
+        refresh: async () => undefined,
+      },
+      chat: { setToken: vi.fn(), start: vi.fn() },
+      ensureRestreamChatCookies: () => repair,
+      parentWindow: null,
+      pushAuthStatus,
+      resolveStartupAuth,
+      logWarn: vi.fn(),
+    });
+    await vi.waitFor(() => expect(resolveStartupAuth).toHaveBeenCalledOnce());
+    expect(pushAuthStatus).toHaveBeenCalledOnce();
+    finishRepair({ ok: false, reason: 'still-no-cookies', cookieCount: 0, hasXsrf: false });
+    await resumed;
+  });
   it('repairs chat cookies after chat.start when a stored token is restored', async () => {
     const order: string[] = [];
     const stored = token('stored-access-token');

@@ -72,13 +72,14 @@ import {
   optimisticSendTimeoutStatus,
   OPTIMISTIC_SEND_TIMEOUT_MS,
 } from './optimistic-send-timeout';
-import { sendFailureNoticeText } from './send-failure-copy';
+import { needsRestreamSendLogin, sendFailureNoticeText } from './send-failure-copy';
 
 const MAX_MESSAGES = 1000;
 
 interface SendNotice {
   id: number;
   text: string;
+  needsLogin: boolean;
 }
 
 export function App(): React.ReactElement {
@@ -124,6 +125,7 @@ export function App(): React.ReactElement {
   const [reconnecting, setReconnecting] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [sendNotice, setSendNotice] = useState<SendNotice | null>(null);
+  const [sendingLoginPending, setSendingLoginPending] = useState(false);
   const [silenceError, setSilenceError] = useState<string | null>(null);
   // Banner-dismiss is session-only by design (see UpdateBanner.tsx docstring) —
   // we want a soft nag, not a sticky one. The next launch re-checks and
@@ -231,12 +233,12 @@ export function App(): React.ReactElement {
     hiddenUsersSetRef.current = hiddenUsersSet;
   }, [hiddenUsersSet]);
 
-  const showSendNotice = (text: string): void => {
+  const showSendNotice = (text: string, needsLogin = false): void => {
     // The id makes repeated identical failures visible as fresh state changes.
     // Without it, two consecutive `no-session-cookies` bails would set the
     // same string twice and React could preserve the previous dismissed banner.
     sendNoticeSeqRef.current += 1;
-    setSendNotice({ id: sendNoticeSeqRef.current, text });
+    setSendNotice({ id: sendNoticeSeqRef.current, text, needsLogin });
   };
 
   const clearOptimisticSendTimeout = (
@@ -580,6 +582,10 @@ export function App(): React.ReactElement {
       // touches neither the timeout nor the httpOkSends set.
       if (status.status === 'retrying') {
         setMessages((prev) => applyRetryingSendStatus(prev, status));
+        if (needsRestreamSendLogin(status)) {
+          const notice = sendFailureNoticeText(status);
+          if (notice) showSendNotice(notice, true); // Reconnecting OAuth cannot complete a missing website login; expose repair while bounded retries continue.
+        }
         return;
       }
       if (status.status !== 'failed') return;
@@ -596,7 +602,7 @@ export function App(): React.ReactElement {
       httpOkSendsRef.current.delete(status.clientId);
       setMessages((prev) => applyFailedSendStatus(prev, status));
       const notice = sendFailureNoticeText(status);
-      if (notice) showSendNotice(notice);
+      if (notice) showSendNotice(notice, needsRestreamSendLogin(status));
     });
     // v0.1.88 (voice 4504): RECONNECT-SUCCESS SWEEP.
     //
@@ -960,6 +966,21 @@ export function App(): React.ReactElement {
     await rcpp.setSettings(next);
   };
 
+  const onSignInToSend = async () => {
+    setSendingLoginPending(true);
+    try {
+      const ok = await rcpp.signInToSend();
+      showSendNotice(ok
+        ? 'Signed in to send. Retry any messages still marked as failed.'
+        : 'Restream sign in was not completed.', !ok);
+    } catch (error) {
+      console.error(error);
+      showSendNotice('Restream sign in failed. Try again.', true);
+    } finally {
+      setSendingLoginPending(false);
+    }
+  };
+
   const onSignIn = async () => {
     try {
       const s = await rcpp.authStart();
@@ -1104,6 +1125,16 @@ export function App(): React.ReactElement {
           aria-live="assertive"
         >
           <span className="send-notice-text">{sendNotice.text}</span>
+          {sendNotice.needsLogin && (
+            <button
+              className="send-notice-dismiss"
+              type="button"
+              disabled={sendingLoginPending}
+              onClick={() => void onSignInToSend()}
+            >
+              {sendingLoginPending ? 'Waiting for sign in...' : 'Sign in to send'}
+            </button>
+          )}
           <button
             className="send-notice-dismiss"
             type="button"

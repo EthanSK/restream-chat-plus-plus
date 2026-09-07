@@ -25,6 +25,8 @@ export interface DirectChatSendResult {
 
 export interface ChatSendDestinationResult extends DirectChatSendResult {
   destination: ChatSendDestination;
+  /** Preserve Restream preflight evidence instead of reducing every failure to a generic destination error. */
+  reason?: SendTextResult['reason'];
 }
 
 export type DirectChatConnectionStatus =
@@ -575,6 +577,8 @@ export const IPC = {
    * showId | eventId | instant body-shape union.
    */
   CHAT_SEND_TEXT: 'chat:send-text',
+  /** Repair only Restream's website sending login; receiving OAuth is not cleared or replaced. */
+  CHAT_SIGN_IN: 'chat:sign-in',
   /**
    * v0.1.43: fire-and-forget enqueue channel for the non-blocking inline
    * chat input. The renderer pushes `{ clientId, text }` and IMMEDIATELY
