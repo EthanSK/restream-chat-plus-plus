@@ -974,7 +974,7 @@ app.on('ready', async () => {
           errorMessage: errorToString(cookieErr),
         });
       }
-      return status;
+      return readStartupAuthStatus({ startupAuthDone, oauth }); // The user may sign out while the separate website login stays open; never return the old signed-in snapshot.
     } catch (e: any) {
       const status: AuthStatus = { authenticated: false };
       mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
