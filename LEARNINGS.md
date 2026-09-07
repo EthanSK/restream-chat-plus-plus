@@ -24,13 +24,22 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-07T12:50:09Z
+**Trigger:** Ethan: “getting send timeouts ... retry those that failed”, then “ok i logged in now”.
+**Symptom:** Receiving chat remained connected, but two replies failed only on Restream after succeeding on direct Twitch and Kick. The generic timeout and partial-delivery error did not identify the missing sending login.
+**Root cause:** The separate website-login popup had timed out without saving a sending session; every failed Restream attempt stopped at `no-session-cookies` before making a POST. The fan-out retains successful destinations but drops the underlying Restream failure reason, so “Connected” receiving status and a generic send error do not prove that website authentication is ready.
+**Fix:** Ethan completed the website login; fresh session-cookie metadata and successful replies confirmed recovery. Retrying the two original client IDs through `enqueueChatSend` in the same running process skipped cached Twitch/Kick successes and received Restream HTTP 200 `success:true`, matching WebSocket echoes, and terminal queue success for both messages.
+**Guard:** `chat-send-fanout.test.ts` covers retry isolation; never recreate client IDs or restart the process before retrying partially delivered messages, because successful-destination evidence is held in memory. This was session recovery, not a source fix for the misleading status/error or a guarantee against provider session expiry; no OBS, recording, or streaming action was needed.
+---
+
+---
 **Date:** 2026-09-07T11:34:00Z
 **Trigger:** Ethan: “make sure it never expires again ... what's the issue”.
 **Symptom:** RC++ stayed signed out after macOS Keychain access recovered; the saved encrypted Restream token remained present and an app restart restored the receiving connection without fresh OAuth authorization.
 **Root cause:** `refreshInner()` classified unavailable client credentials as `none`, just like a missing refresh token. Startup and reconnect only arm the existing recovery timer for `transient`, so a temporary credential-read denial never started that recovery.
 **Fix:** v0.1.112 preserves the token and classifies this credential failure as transient, with a secret-free diagnostic row. It reuses the existing backoff and does not change provider revocation handling or the separate Restream website login used for sending.
 **Commit:** `c8e373a` (`fix(auth): retry unavailable Keychain credentials (v0.1.112)`)
-**Guard:** Two regression tests failed before the fix and passed afterward; encrypted-token preservation, genuinely signed-out sessions, and startup-to-timer recovery after credentials return are covered. All 730 tests pass, typecheck is clean, and lint has zero errors (186 existing warnings); CI `34117331802` and signed build `34117331826` passed. The main-branch arm64 artifact passes its checksum, strict deep signature, Gatekeeper (`Notarized Developer ID`), and stapled-ticket checks, with outer app and nested `libffmpeg.dylib` Team ID `T34G959ZG8`. The exact artifact is installed at `/Applications/Restream Chat Plus Plus.app`; live MCP reports 0.1.112, preserved auth, and connected, while OBS and its recording process remained running and the recording file grew. Version 0.1.111 is preserved in Install Backups. The separate Restream website session still needs interactive login; no public message was sent to test it, and no real Keychain outage was forced on the live app.
+**Guard:** Two regression tests failed before the fix and passed afterward; encrypted-token preservation, genuinely signed-out sessions, and startup-to-timer recovery after credentials return are covered. All 730 tests pass, typecheck is clean, and lint has zero errors (186 existing warnings); CI `34117331802` and signed build `34117331826` passed. The main-branch arm64 artifact passes its checksum, strict deep signature, Gatekeeper (`Notarized Developer ID`), and stapled-ticket checks, with outer app and nested `libffmpeg.dylib` Team ID `T34G959ZG8`. The exact artifact is installed at `/Applications/Restream Chat Plus Plus.app`; live MCP reports 0.1.112, preserved auth, and connected, while OBS and its recording process remained running and the recording file grew. Version 0.1.111 is preserved in Install Backups. The separate Restream website session initially still needed interactive login; it was subsequently completed and verified by real sends, as recorded above. No real Keychain outage was forced on the live app.
 ---
 
 ---
