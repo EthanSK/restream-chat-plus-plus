@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.112 — retry temporarily unavailable credentials (2026-09-07)
+
+- Keep the saved Restream token and use the existing automatic refresh retry
+  when client credentials are temporarily unavailable from macOS Keychain.
+  Previously this path was mistaken for a signed-out session and never armed
+  recovery, even after credential access returned.
+- Regression tests cover encrypted-token preservation, genuinely signed-out
+  sessions, and startup recovery after credentials return without restarting.
+- A separate Restream website login can still expire or be revoked; this fix
+  does not remove provider authentication requirements.
+
 ## v0.1.111 — stable self-message identity (2026-09-03)
 
 ### What's fixed

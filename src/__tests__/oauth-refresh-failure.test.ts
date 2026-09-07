@@ -37,13 +37,16 @@ vi.mock('electron', () => ({
 
 // The OAuth coordinator pulls creds from this helper; stub it deterministic.
 vi.mock('../main/credentials', () => ({
-  loadRestreamCreds: () => ({
+  loadRestreamCreds: vi.fn(() => ({
     clientId: 'test-client',
     clientSecret: 'test-secret',
-  }),
+  })),
 }));
 
 import { OAuthCoordinator } from '../main/oauth';
+import { loadRestreamCreds } from '../main/credentials';
+import { resumeAuthWithCookieRepair } from '../main/startup-auth-resume';
+import { TransientRefreshRetryController, TRANSIENT_RETRY_BASE_MS } from '../main/transient-refresh-retry';
 
 function makeStore(): { store: Store; data: Partial<StoreSchema> } {
   const data: Partial<StoreSchema> = {};
@@ -74,10 +77,102 @@ describe('OAuthCoordinator.refresh — v0.1.52 failure handling', () => {
   let originalFetch: typeof fetch;
   beforeEach(() => {
     originalFetch = globalThis.fetch;
+    vi.mocked(loadRestreamCreds).mockReset().mockReturnValue({
+      clientId: 'test-client',
+      clientSecret: 'test-secret',
+    });
   });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('preserves encrypted tokens and classifies unavailable client credentials as transient', async () => {
+    const { store, data } = makeStore();
+    data.tokenEnc = fakeSafeStorage.encryptString(JSON.stringify(SAMPLE_TOKEN)).toString('base64');
+    const encryptedBefore = data.tokenEnc;
+    const fetchSpy = vi.fn<typeof fetch>();
+    globalThis.fetch = fetchSpy;
+    vi.mocked(loadRestreamCreds).mockReturnValue(undefined);
+
+    const oauth = new OAuthCoordinator(store);
+    expect(await oauth.refresh()).toBeUndefined();
+    expect(oauth.getLastRefreshFailure()).toBe('transient');
+    expect(data.tokenEnc).toBe(encryptedBefore);
+    expect(await oauth.getTokenAsync()).toEqual(SAMPLE_TOKEN);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not classify a genuinely signed-out user as a credential outage', async () => {
+    const { store } = makeStore();
+    vi.mocked(loadRestreamCreds).mockReturnValue(undefined);
+    const oauth = new OAuthCoordinator(store);
+
+    expect(await oauth.refresh()).toBeUndefined();
+    expect(oauth.getLastRefreshFailure()).toBe('none');
+    expect(loadRestreamCreds).not.toHaveBeenCalled();
+  });
+
+  it('startup arms the existing retry and recovers when credentials return without restarting', async () => {
+    const { store, data } = makeStore();
+    data.tokenEnc = fakeSafeStorage.encryptString(JSON.stringify(SAMPLE_TOKEN)).toString('base64');
+    const oauth = new OAuthCoordinator(store);
+    await oauth.getTokenAsync(); // Hydrate with real timers before advancing only the retry clock.
+    vi.useFakeTimers();
+    vi.mocked(loadRestreamCreds).mockReturnValue(undefined);
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'recovered-access',
+      refresh_token: 'rotated-refresh',
+      expires_in: 3600,
+    }), { status: 200 }));
+    globalThis.fetch = fetchSpy;
+    const onSuccess = vi.fn();
+    const onFatal = vi.fn();
+    const retry = new TransientRefreshRetryController({
+      refresh: async () => {
+        if (await oauth.refresh()) return 'success';
+        return oauth.getLastRefreshFailure() === 'fatal' ? 'fatal' : 'transient';
+      },
+      onSuccess,
+      onFatal,
+    });
+    const cookies = vi.fn();
+    const chat = { setToken: vi.fn(), start: vi.fn() };
+    const resolveStartupAuth = vi.fn();
+    try {
+      await resumeAuthWithCookieRepair({
+        oauth,
+        chat,
+        ensureRestreamChatCookies: cookies,
+        parentWindow: null,
+        pushAuthStatus: vi.fn(),
+        resolveStartupAuth,
+        armTransientRefreshRetry: () => retry.arm('startup'),
+      });
+      expect(resolveStartupAuth).toHaveBeenCalledOnce();
+      expect(retry.isArmed()).toBe(true);
+      expect(chat.start).not.toHaveBeenCalled();
+      expect(cookies).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(TRANSIENT_RETRY_BASE_MS);
+      expect(retry.isArmed()).toBe(true);
+      expect(retry.getDelayMs()).toBe(TRANSIENT_RETRY_BASE_MS * 2);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(onFatal).not.toHaveBeenCalled();
+
+      vi.mocked(loadRestreamCreds).mockReturnValue({ clientId: 'test-client', clientSecret: 'test-secret' });
+      await vi.advanceTimersByTimeAsync(TRANSIENT_RETRY_BASE_MS * 2);
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(oauth.getLastRefreshFailure()).toBe('none');
+      expect(oauth.getToken()?.refreshToken).toBe('rotated-refresh');
+      expect(onSuccess).toHaveBeenCalledOnce();
+      expect(onFatal).not.toHaveBeenCalled();
+      expect(retry.isArmed()).toBe(false);
+      expect(data.tokenEnc).toBe(fakeSafeStorage.encryptString(JSON.stringify(oauth.getToken())).toString('base64'));
+    } finally {
+      retry.cancel();
+    }
   });
 
   it('coalesces concurrent refresh() calls onto a single fetch', async () => {

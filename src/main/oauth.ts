@@ -674,16 +674,24 @@ export class OAuthCoordinator {
 
   private async refreshInner(): Promise<TokenSet | undefined> {
     // v0.1.70: clear the prior-attempt classification BEFORE the work so
-    // the "no refresh token on disk" / "no creds" early-returns don't
+    // the "no refresh token on disk" early-return doesn't
     // leave a stale 'transient'/'fatal' lying around for the next
-    // getLastRefreshFailure() reader. Those early returns are NOT errors
-    // — they mean "user is signed out, there's nothing to refresh" — so
+    // getLastRefreshFailure() reader. That early return is NOT an error
+    // — it means "user is signed out, there's nothing to refresh" — so
     // 'none' is the correct classification.
     this.lastRefreshFailure = 'none';
     const existing = await this.getTokenAsync();
     if (!existing?.refreshToken) return undefined;
     const creds = loadRestreamCreds();
-    if (!creds) return undefined;
+    if (!creds) { // Keychain can temporarily deny client-credential reads while the saved refresh token remains valid; 'none' stranded users signed out without arming the existing retry.
+      this.lastRefreshFailure = 'transient';
+      appendErrorLog({
+        subsystem: 'oauth',
+        phase: 'oauth.refresh-credentials-unavailable',
+        errorMessage: 'Client credentials unavailable; refresh deferred and saved token preserved',
+      });
+      return undefined;
+    }
 
     const body = new URLSearchParams({
       grant_type: 'refresh_token',
