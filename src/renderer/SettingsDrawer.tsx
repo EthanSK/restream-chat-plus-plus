@@ -459,12 +459,12 @@ export function SettingsDrawer({
               for the contract.
 
               Empty by default; users opt in by typing one regex per line.
-              The hover-row "Hide user" affordance writes EXACT usernames
+              The old hover-row "Hide user" affordance wrote EXACT usernames
               into the separate `settings.hiddenUsers` list (Hidden Users
-              section below) — NOT into these regex textareas — because
-              hide-from-hover is an exact-match one-click action, whereas
-              these textareas exist for pattern-matching ("anyone whose
-              name starts with 'bot_'").
+              section below). Since v0.1.91, "Silence user" writes escaped,
+              anchored usernames into both regex textareas and leaves rows
+              visible. These textareas also support broader patterns ("anyone
+              whose name starts with 'bot_'").
             */}
             <p className="section-hint" style={{ marginTop: 18 }}>
               Username regexes — one per line. Matched case-insensitively
@@ -531,8 +531,8 @@ export function SettingsDrawer({
 
           {/*
             v0.1.72 (voice 4352, 2026-05-28) — Hidden Users section.
-            Populated by the per-row hover "Hide user" affordance in
-            ChatFeed; each entry can be Unhidden one-at-a-time here.
+            Previously populated by the per-row hover "Hide user" affordance
+            in ChatFeed; each saved entry can still be Unhidden here.
 
             Hidden users are filtered from the visible feed entirely AND
             their messages don't wake TTS / notifications either. This is
@@ -540,15 +540,15 @@ export function SettingsDrawer({
             side effect — the message still renders with a "regex-ignored"
             badge). "Hide" means "as if they never spoke".
 
-            Empty-state copy explains where entries come from so a user
-            who hasn't clicked Hide on any row understands what this is.
+            Keep the saved list recoverable, but do not direct users to the
+            removed Hide action; Silence user intentionally keeps rows visible.
           */}
           <section className="section">
             <h3>Hidden Users</h3>
             <p className="section-hint">
-              Click <strong>Hide user</strong> on any chat row to add them
-              here. Their messages disappear from the feed and never trigger
-              TTS or notifications. Case-insensitive exact-match.
+              Users hidden earlier stay listed here. Their messages disappear
+              from the feed and never trigger TTS or notifications.
+              Case-insensitive exact-match. Unhide to bring a user back.
             </p>
             {(settings.hiddenUsers ?? []).length === 0 ? (
               <p className="hidden-users-empty">No hidden users yet.</p>

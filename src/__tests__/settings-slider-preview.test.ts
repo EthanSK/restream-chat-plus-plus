@@ -48,6 +48,14 @@ describe('SettingsDrawer — slider preview wiring (v0.1.27)', () => {
     .map((l) => l.replace(/\/\/.*$/, '')) // // line comments
     .join('\n');
 
+  it('keeps saved hidden users recoverable without directing users to the removed Hide action', () => {
+    const hiddenSection = code.slice(code.indexOf('<h3>Hidden Users</h3>'));
+    expect(hiddenSection).not.toContain('<strong>Hide user</strong>');
+    expect(hiddenSection).toContain('Users hidden earlier stay listed here.');
+    expect(hiddenSection).toContain('Unhide to bring a user back.');
+    expect(hiddenSection).toContain('onClick={() => unhideUser(u)}');
+  });
+
   // Helper — given a slider <label>NAME</label> followed by an <input>,
   // return the slice of source from the label through the closing `/>` of
   // the input so we can inspect its attributes.
