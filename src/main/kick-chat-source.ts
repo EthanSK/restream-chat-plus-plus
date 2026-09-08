@@ -507,12 +507,12 @@ export class KickChatSource extends EventEmitter {
     const identity = this.identity;
     let token = this.token;
     if (!identity || !token || !this.wantsConnection) return;
-    if (token.expiresAt - Date.now() <= 60_000) {
-      const creds = loadKickCreds();
-      token = creds ? await this.ensureValidToken(creds) : undefined;
-    }
-    if (!token) return;
     try {
+      if (token.expiresAt - Date.now() <= 60_000) {
+        const creds = loadKickCreds();
+        token = creds ? await this.ensureValidToken(creds) : undefined; // A transient token probe belongs inside the polling catch, not an unhandled timer rejection.
+      }
+      if (!token) return;
       const url = new URL(LIVESTREAMS_URL);
       url.searchParams.set('user_id', String(identity.userId));
       const response = await fetch(url, {

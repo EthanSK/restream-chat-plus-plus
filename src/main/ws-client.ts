@@ -509,6 +509,7 @@ export class ChatClient extends EventEmitter {
     this.resetSubscriptionRecoveryState();
     this.clearTimers();
     this.ws?.removeAllListeners();
+    this.ws?.on('error', () => undefined); // Closing during the handshake emits a late error; the retired socket must not reach the global exception handler.
     try {
       this.ws?.close();
     } catch {
@@ -534,6 +535,7 @@ export class ChatClient extends EventEmitter {
     if (this.ws) {
       try {
         this.ws.removeAllListeners();
+        this.ws.on('error', () => undefined); // A replaced handshake can emit an asynchronous close error after its normal handlers have been removed.
       } catch {
         // ignore
       }
@@ -1069,6 +1071,7 @@ export class ChatClient extends EventEmitter {
           this.ws = undefined;
           try {
             staleWs?.removeAllListeners();
+            staleWs?.on('error', () => undefined); // Terminating a retired socket can emit a late transport error after cleanup.
           } catch {
             // ignore
           }

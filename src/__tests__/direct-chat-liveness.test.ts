@@ -527,6 +527,27 @@ describe.sequential('direct chat liveness recovery', () => {
     source.stop();
   });
 
+  it('keeps a temporary Kick token-probe failure inside viewer polling', async () => {
+    const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 90_000,
+      scope: 'channel:read events:subscribe chat:write' }) });
+    const source = new KickChatSource(store);
+    await source.start();
+    const socket = WS.instances[0];
+    socket.emit('open');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.getState()).toMatchObject({ status: 'connected', viewerCount: 1 });
+    const fetchMock = vi.mocked(fetch);
+    const original = fetchMock.getMockImplementation();
+    if (!original) throw new Error('Expected the shared fetch fixture');
+    fetchMock.mockImplementation(async (input, init) => String(input).includes('/token/introspect')
+      ? new Response('{}', { status: 503 }) : original(input, init));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/token/introspect'))).toHaveLength(2);
+    expect(source.getState()).toMatchObject({ status: 'connected', viewerCount: 1 });
+    expect(store.get('kickTokenEnc')).toBeDefined();
+    source.stop();
+  });
+
   it('coalesces Kick token checks when reconnect and sending overlap', async () => {
     const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: 0,
       scope: 'channel:read events:subscribe chat:write' }) });

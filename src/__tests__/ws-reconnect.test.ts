@@ -126,4 +126,16 @@ describe('ChatClient reconnect', () => {
     expect(client.getState().status).toBe('connecting');
     client.stop();
   });
+
+  it.each(['stop', 'reconnect'] as const)('%s absorbs a late error from the deliberately closed handshake', (action) => {
+    const client = new ChatClient();
+    client.setToken('abc');
+    client.start();
+    const previous = WS.instances[0];
+    client[action]();
+    expect(() => previous.emit('error', new Error('WebSocket was closed before the connection was established'))).not.toThrow();
+    expect(client.getState().status).toBe(action === 'stop' ? 'disconnected' : 'connecting');
+    expect(WS.instances).toHaveLength(action === 'stop' ? 1 : 2);
+    client.stop();
+  });
 });
