@@ -496,6 +496,81 @@ describe.sequential('direct chat liveness recovery', () => {
     source.stop();
   });
 
+  it.each([429, 500, 503])('preserves Kick authorization on temporary refresh HTTP %s', async (status) => {
+    const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: 0,
+      scope: 'channel:read events:subscribe chat:write' }) });
+    const fetchMock = vi.mocked(fetch);
+    const original = fetchMock.getMockImplementation();
+    if (!original) throw new Error('Expected the shared fetch fixture');
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes('/token/introspect')) return okJson({ data: { active: false } });
+      if (String(input) === 'https://id.kick.com/oauth/token') return new Response('{}', { status });
+      return original(input, init);
+    });
+    const source = new KickChatSource(store);
+    await source.start();
+    expect(store.get('kickTokenEnc')).toBeDefined();
+    expect(source.getState().status).toBe('connecting');
+    expect(source.hasStoredAuthorization()).toBe(true);
+    source.stop();
+  });
+
+  it('clears Kick authorization only on an explicit invalid refresh response', async () => {
+    const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: 0,
+      scope: 'channel:read events:subscribe chat:write' }) });
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).includes('/token/introspect')
+      ? okJson({ data: { active: false } }) : new Response('{}', { status: 400 }));
+    const source = new KickChatSource(store);
+    await source.start();
+    expect(store.get('kickTokenEnc')).toBeUndefined();
+    expect(source.getState().status).toBe('disconnected');
+    source.stop();
+  });
+
+  it('coalesces Kick token checks when reconnect and sending overlap', async () => {
+    const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: 0,
+      scope: 'channel:read events:subscribe chat:write' }) });
+    const fetchMock = vi.mocked(fetch);
+    const original = fetchMock.getMockImplementation();
+    if (!original) throw new Error('Expected the shared fetch fixture');
+    let resolve!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes('/token/introspect')) return okJson({ data: { active: false } });
+      if (String(input) === 'https://id.kick.com/oauth/token') return new Promise<Response>((done) => { resolve = done; });
+      return original(input, init);
+    });
+    const source = new KickChatSource(store);
+    const starting = source.start();
+    await vi.waitFor(() => expect(resolve).toBeDefined());
+    const sending = source.send('test');
+    resolve(okJson({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600, scope: 'channel:read events:subscribe chat:write' }));
+    await Promise.all([starting, sending]);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === 'https://id.kick.com/oauth/token')).toHaveLength(1);
+    expect(store.get('kickTokenEnc')).toBeDefined();
+    source.stop();
+  });
+
+  it('does not restore Kick authorization if a pending refresh finishes after disconnect', async () => {
+    const store = makeStore({ kickTokenEnc: encrypted({ accessToken: 'access', refreshToken: 'refresh', expiresAt: 0,
+      scope: 'channel:read events:subscribe chat:write' }) });
+    let resolve!: (value: Response) => void;
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).includes('/token/introspect')) return okJson({ data: { active: false } });
+      if (String(input) === 'https://id.kick.com/oauth/token') return new Promise<Response>((done) => { resolve = done; });
+      return okJson({});
+    });
+    const source = new KickChatSource(store);
+    const starting = source.start();
+    await vi.waitFor(() => expect(resolve).toBeDefined());
+    await source.disconnect();
+    resolve(okJson({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600, scope: 'channel:read events:subscribe chat:write' }));
+    await starting;
+    expect(store.get('kickTokenEnc')).toBeUndefined();
+    expect(source.getState().status).toBe('disconnected');
+    expect(WS.instances).toHaveLength(0);
+    source.stop();
+  });
+
   it('keeps Kick connected while the relay answers pong', async () => {
     const source = new KickChatSource(
       makeStore({

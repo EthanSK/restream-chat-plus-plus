@@ -25,13 +25,14 @@ import { appendJsonl, errorToString } from './structured-log';
  * DESIGN PRINCIPLES (deliberately different from ws-client.ts):
  *
  *  - This feed is a NICE-TO-HAVE overlay. Chat must never suffer for it, so
- *    there is NO shared state with ChatClient, NO reconnectProvider hook into
- *    the OAuth-refresh machinery, and every failure path degrades to "the
+ *    there is NO shared socket state with ChatClient. Reconnects obtain a
+ *    current token from the existing serialized OAuth coordinator, without
+ *    reconnecting chat, and every failure path degrades to "the
  *    toolbar shows the idle placeholder" — never a user-facing error.
  *  - Quiet reconnect: exponential backoff 5s → 5min cap. When the token is
- *    stale the server closes/refuses; we DON'T hammer refresh ourselves —
- *    main.ts hands us the fresh token whenever the chat stack gets one
- *    (same call sites as chat.setToken), and setToken() resets the backoff.
+ *    stale the server closes/refuses; the normal backoff obtains a fresh
+ *    token instead of retrying the same expired bearer indefinitely.
+ *    Main also hands us the token whenever the chat stack gets one.
  *  - Keepalive: the server pushes nothing while no stream is live, so we
  *    can't use inbound-staleness to detect a dead socket (that's the same
  *    trap the chat WS hit in v0.1.86 — heartbeats keeping a zombie looking
@@ -77,6 +78,8 @@ export class ViewerStatsClient extends EventEmitter {
   private pingTimer?: ReturnType<typeof setInterval>;
   private sweepTimer?: ReturnType<typeof setInterval>;
   private missedPongs = 0;
+  private rejectedToken?: string;
+  private connectionGeneration = 0;
   /** Per-channel latest status — the ONLY mutable domain state. */
   private readonly stats: ViewerStatsMap = new Map();
   /** Last snapshot handed out, so pull-fetchers (IPC GET) get instant truth. */
@@ -87,6 +90,10 @@ export class ViewerStatsClient extends EventEmitter {
     computedAtMs: 0,
   };
 
+  constructor(private readonly getAccessToken?: (rejectedToken?: string) => Promise<string | undefined>) {
+    super();
+  }
+
   /**
    * Store/replace the bearer token. Called from the SAME main.ts sites that
    * call chat.setToken (startup resume, sign-in, reconnect, transient-refresh
@@ -96,6 +103,7 @@ export class ViewerStatsClient extends EventEmitter {
    */
   setToken(token: string): void {
     this.accessToken = token;
+    this.rejectedToken = undefined;
     this.backoffMs = BASE_BACKOFF_MS;
   }
 
@@ -141,7 +149,7 @@ export class ViewerStatsClient extends EventEmitter {
 
   /**
    * Force a fresh connection with the CURRENT token (called next to
-   * chat.reconnect() after a token refresh). Safe no-op when stop()ed.
+   * chat.reconnect() after a token refresh). Starts the feed if stopped.
    */
   reconnect(): void {
     if (this.stopped) {
@@ -237,6 +245,12 @@ export class ViewerStatsClient extends EventEmitter {
       // an unhandled 'error' event would crash the main process.
       this.log({ kind: 'error', event: 'ws-error', error: errorToString(err) });
     });
+    ws.on('unexpected-response', (_request, response) => {
+      if (response.statusCode === 401) this.rejectedToken = this.accessToken;
+      this.log({ kind: 'error', event: 'handshake-rejected', status: response.statusCode });
+      response.resume();
+      ws.terminate(); // Handling unexpected-response disables ws's default close; terminate so the existing backoff owns the retry.
+    });
   }
 
   /**
@@ -284,10 +298,29 @@ export class ViewerStatsClient extends EventEmitter {
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      this.connect();
+      void this.refreshAndConnect();
     }, delay);
     this.reconnectTimer.unref?.();
     this.log({ kind: 'lifecycle', event: 'reconnect-scheduled', delayMs: delay });
+  }
+
+  private async refreshAndConnect(): Promise<void> {
+    const generation = this.connectionGeneration;
+    try {
+      const token = this.getAccessToken ? await this.getAccessToken(this.rejectedToken) : this.accessToken;
+      if (this.stopped || generation !== this.connectionGeneration) return; // A sign-out or newer reconnect while OAuth was pending must invalidate this attempt.
+      if (!token) {
+        this.scheduleReconnect();
+        return;
+      }
+      this.accessToken = token;
+      this.rejectedToken = undefined;
+      this.connect();
+    } catch (error) {
+      if (this.stopped || generation !== this.connectionGeneration) return;
+      this.log({ kind: 'error', event: 'token-refresh-failed', error: errorToString(error) });
+      this.scheduleReconnect();
+    }
   }
 
   private clearReconnectTimer(): void {
@@ -298,6 +331,7 @@ export class ViewerStatsClient extends EventEmitter {
   }
 
   private teardownSocket(): void {
+    this.connectionGeneration += 1;
     this.disarmPing();
     const ws = this.ws;
     this.ws = undefined;

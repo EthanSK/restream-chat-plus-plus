@@ -48,6 +48,15 @@ describe('intendedTargets', () => {
 });
 
 describe('createChatSendFanout', () => {
+  it('retains the provider rejection code in the aggregate failure', async () => {
+    const fanout = createChatSendFanout({ getRestreamConnections: () => [], getDirectConnections: () => [direct('twitch')],
+      sendRestream: async () => ({ ok: true }),
+      sendDirect: async () => ({ ok: false, errorCode: 'automod_held', error: 'Held for review (automod_held)' }),
+    });
+    const result = await fanout.send({ clientId: 'held-message', text: 'hello' });
+    expect(result.destinations?.[0].errorCode).toBe('automod_held');
+    expect(result.error).toContain('automod_held');
+  });
   it('preserves missing sending-login evidence through partial delivery and retry', async () => {
     const sendRestream = vi.fn()
       .mockResolvedValueOnce({ ok: false, reason: 'no-session-cookies' })

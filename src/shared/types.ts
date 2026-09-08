@@ -19,6 +19,8 @@ export interface DirectChatSendResult {
   ok: boolean;
   status?: number;
   error?: string;
+  /** Provider's exact rejection code, retained for send diagnostics. */
+  errorCode?: string;
   messageId?: string;
   authorizationRequired?: boolean;
 }
@@ -979,6 +981,10 @@ export type NotificationDecisionReason =
  *                          "Check Now" menu item's dialog.
  */
 export interface UpdateInfo {
+  /** Background discovery stays quiet; only a user-requested check shows a spinner. */
+  checkIsBackground?: boolean;
+  /** Earliest permitted metadata request, in epoch ms, when the server asked us to wait. */
+  checkRetryAt?: number;
   kind:
     | 'checking'
     | 'available'

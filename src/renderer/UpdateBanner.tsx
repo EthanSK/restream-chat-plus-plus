@@ -6,8 +6,8 @@
 // while the user-requested download is happening:
 //
 //   `checking`         → small spinner + "Checking for updates…".
-//                        Fired by the GH-Releases poller AND by the
-//                        manual "Check for Updates Now…" path.
+//                        Only for the manual "Check for Updates Now…"
+//                        path; background discovery stays quiet.
 //   `available`        → "Update available {version}" + Download Update +
 //                        Later. The click enters `downloading` synchronously
 //                        in main before Squirrel is called.
@@ -69,7 +69,7 @@ export function updateBannerState(
   if (!info) return 'hidden';
   switch (info.kind) {
     case 'checking':
-      return 'checking';
+      return info.checkIsBackground ? 'hidden' : 'checking';
     case 'available':
       if (dismissed) return 'hidden';
       // `available` implies latestVersion + releaseUrl are populated per

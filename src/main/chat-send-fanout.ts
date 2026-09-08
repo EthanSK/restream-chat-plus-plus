@@ -70,6 +70,7 @@ export function createChatSendFanout({
           ok: result.ok,
           status: result.status,
           error: result.error,
+          errorCode: 'errorCode' in result ? result.errorCode : undefined,
           reason: 'reason' in result ? result.reason : undefined,
           messageId:
             'messageId' in result && typeof result.messageId === 'string'

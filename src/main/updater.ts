@@ -4,6 +4,7 @@ import { IPC, type UpdateInfo } from '../shared/types';
 import { appendErrorLog, errorToString } from './structured-log';
 import {
   UpdateController,
+  ReleaseCheckHttpError,
   categoriseUpdateError,
   UPDATE_DOWNLOAD_RETRY_DELAYS_MS,
   type LatestRelease,
@@ -48,7 +49,7 @@ async function fetchLatestRelease(): Promise<LatestRelease> {
       signal: abort.signal,
     });
     if (!response.ok) {
-      throw new Error(`GitHub API returned HTTP ${response.status}`);
+      throw new ReleaseCheckHttpError(response);
     }
     const json: unknown = await response.json();
     const record =

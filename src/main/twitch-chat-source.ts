@@ -804,16 +804,18 @@ export async function sendTwitchChatMessage({
       return {
         ok: false,
         status: response.status,
-        authorizationRequired: response.status === 401 || response.status === 403,
+        authorizationRequired: response.status === 401, // Helix chat 403 means the sender is not permitted in this room, not that their login expired.
         error: stringOr(payload.message, `Twitch rejected the message (${response.status}).`),
       };
     }
     if (result.is_sent !== true) {
       const dropReason = record(result.drop_reason);
+      const errorCode = typeof dropReason.code === 'string' ? dropReason.code : undefined;
       return {
         ok: false,
         status: response.status,
-        error: stringOr(dropReason.message, 'Twitch did not send the message.'),
+        errorCode,
+        error: stringOr(dropReason.message, 'Twitch did not send the message.') + (errorCode ? ` (${errorCode})` : ''),
       };
     }
     return {

@@ -776,7 +776,13 @@ app.on('ready', async () => {
   // chat.setToken call site below also hands the token to this client so the
   // two sockets never drift onto different credentials. Failure of this
   // socket only blanks the toolbar count; chat is unaffected.
-  const viewerStats = new ViewerStatsClient();
+  const viewerStats = new ViewerStatsClient(async (rejectedToken) => {
+    let token = await oauth.getTokenAsync();
+    if (token && (token.expiresAt - Date.now() < 60_000 || token.accessToken === rejectedToken)) {
+      token = await oauth.refresh(); // Reuse serialized refresh; a viewer-feed 401 must recover without interrupting the healthy chat socket.
+    }
+    return token?.accessToken;
+  });
 
   app.setName('Restream Chat++');
 

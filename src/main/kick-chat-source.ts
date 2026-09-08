@@ -50,6 +50,7 @@ export class KickChatSource extends EventEmitter {
     status: 'disconnected',
   };
   private token?: KickTokenSet;
+  private tokenCheckInFlight?: Promise<KickTokenSet | undefined>;
   private socket?: WebSocket;
   private callbackServer?: http.Server;
   private callbackTimer?: NodeJS.Timeout;
@@ -239,13 +240,24 @@ export class KickChatSource extends EventEmitter {
   }
 
   private async ensureValidToken(creds: KickCreds): Promise<KickTokenSet | undefined> {
-    if (!this.token) return undefined;
+    if (this.tokenCheckInFlight) return this.tokenCheckInFlight; // Send, viewer polling and reconnect can overlap; do not spend a rotated refresh token twice.
+    this.tokenCheckInFlight = this.checkToken(creds).finally(() => { this.tokenCheckInFlight = undefined; });
+    return this.tokenCheckInFlight;
+  }
+
+  private async checkToken(creds: KickCreds): Promise<KickTokenSet | undefined> {
+    const token = this.token;
+    if (!token) return undefined;
     const introspection = await fetch(INTROSPECT_URL, {
       method: 'POST',
-      headers: { authorization: `Bearer ${this.token.accessToken}` },
+      headers: { authorization: `Bearer ${token.accessToken}` },
     });
+    if (!introspection.ok && introspection.status !== 401 && introspection.status !== 403) {
+      throw new Error(`Kick authorization check failed (${introspection.status}).`); // A temporary provider failure must take the existing reconnect path, not erase the saved grant.
+    }
     if (introspection.ok) {
       const payload = record(await introspection.json());
+      if (this.token?.refreshToken !== token.refreshToken) throw new Error('Kick authorization changed during refresh.');
       const data = record(payload.data);
       if (data.active === true && numberOr(data.exp, 0) * 1_000 - Date.now() > 60_000) {
         if (typeof data.scope === 'string' && data.scope !== this.token.scope) {
@@ -257,7 +269,7 @@ export class KickChatSource extends EventEmitter {
     }
     const body = new URLSearchParams({
       grant_type: 'refresh_token',
-      refresh_token: this.token.refreshToken,
+      refresh_token: token.refreshToken,
       client_id: creds.clientId,
       client_secret: creds.clientSecret,
     });
@@ -267,12 +279,16 @@ export class KickChatSource extends EventEmitter {
       body: body.toString(),
     });
     const payload = record(await response.json().catch(() => ({})));
+    if (this.token?.refreshToken !== token.refreshToken) throw new Error('Kick authorization changed during refresh.'); // A completed refresh must not restore an account that was disconnected in the meantime.
+    if (!response.ok) {
+      if ([400, 401, 403].includes(response.status)) return undefined;
+      throw new Error(`Kick token exchange failed (${response.status}).`);
+    }
     if (
-      !response.ok ||
       typeof payload.access_token !== 'string' ||
       typeof payload.refresh_token !== 'string'
     ) {
-      return undefined;
+      throw new Error('Kick returned an unreadable token response.'); // A malformed success is not proof that the user's grant was revoked.
     }
     this.token = kickToken(payload);
     this.tokens.write(this.token);

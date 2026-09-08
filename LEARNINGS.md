@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-08T14:05:00Z
+**Trigger:** Update-check rate limiting and a requested RC++ reliability pass.
+**Symptom:** Hourly background checks displayed a long checking spinner, retried GitHub rate limits after 10/30 seconds, and lost the server reset time. Separate defects let the viewer feed retry an expired bearer indefinitely, let temporary Kick refresh failures erase authorization, discarded Twitch rejection codes, and positioned Connected Channels beyond a narrow window's right edge.
+**Root cause:** Generic HTTP errors dropped response headers; the viewer reconnect bypassed OAuth; Kick collapsed provider outages and explicit token rejection into one undefined result; fan-out retained only human error text; the connected-channel panel anchored its left edge to the rightmost chip.
+**Fix:** v0.1.114 respects Retry-After and GitHub reset headers, blocks even manual checks during that cooldown, and keeps automatic discovery quiet. Viewer reconnects reuse the existing serialized OAuth refresh without reconnecting chat. Kick coalesces token checks, preserves grants on transient/malformed responses, and discards stale refresh results after disconnect. Twitch preserves its exact drop code and no longer calls room-level 403 refusals expired authorization. The channel popover anchors to the full bar and narrow layouts hide optional help text.
+**Guard:** Regression coverage includes provider cooldowns, no quick retries, expired-viewer-token recovery, sign-out during async recovery, Kick transient rejection and concurrent refresh, exact Twitch drop-code fan-out and narrow panel CSS. Typecheck passes; lint has no errors. Manual tests use the real renderer and updater controller with a fake provider/OS bridge: repeated cooldown checks keep the request count at one, the update download/staging/install states work, send-login repair and retry work, and the 460px panel is visibly inside the window. Live account expiry, native installation and public send verification are distinct from these simulated checks; see the task's installed-runtime evidence before claiming deployment.
+---
+
+---
 **Date:** 2026-09-07T17:05:00Z
 **Trigger:** Ethan: “fix it if its right ... whats the login cutoff ... worse UX”.
 **Symptom:** The sending-login window closed during Google/passkey verification, while missing website cookies were reduced to a generic partial-delivery failure or falsely described as an expired session requiring sign-out.

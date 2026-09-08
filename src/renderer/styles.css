@@ -515,6 +515,9 @@ body {
   color: var(--text-3);
   font-size: 10.5px;
 }
+@media (max-width: 600px) {
+  .chat-sources-help { display: none; } /* Keep optional help text from forcing the channel controls outside the narrow app window. */
+}
 .chat-sources-popover {
   position: absolute;
   top: calc(100% + 6px);
@@ -895,7 +898,7 @@ body {
 /* ------------------------------ Channels panel --------------------------- */
 
 .channels-panel {
-  position: relative;
+  position: static; /* Use the full source bar as the anchor; the rightmost chip left the panel and Close button outside a 460px window. */
   -webkit-app-region: no-drag;
 }
 
@@ -942,7 +945,7 @@ body {
 .channels-popover {
   position: absolute;
   top: calc(100% + 6px);
-  left: 0;
+  right: 12px;
   width: min(320px, calc(100vw - 24px));
   max-height: 60vh;
   background: var(--bg-1);

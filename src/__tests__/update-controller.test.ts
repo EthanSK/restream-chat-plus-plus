@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   UpdateController,
+  ReleaseCheckHttpError,
   UPDATE_CHECK_RETRY_DELAYS_MS,
   UPDATE_DOWNLOAD_RETRY_DELAYS_MS,
   UPDATE_INSTALL_RESTART_TIMEOUT_MS,
@@ -61,6 +62,7 @@ function harness(overrides: {
       const entry = scheduled[index];
       if (!entry.cancelled) entry.fn();
     },
+    setNow(value: number) { now = value; },
   };
 }
 
@@ -298,6 +300,51 @@ describe('UpdateController: one visible updater state machine', () => {
     const h = harness({ autoCheckEnabled: false });
     expect((await h.controller.checkForUpdates(false)).kind).toBe('disabled');
     expect(h.fetchLatestRelease).not.toHaveBeenCalled();
+  });
+
+  it('honours GitHub reset across automatic and manual checks without quick retries', async () => {
+    const fetchLatestRelease = vi.fn<() => Promise<LatestRelease>>()
+      .mockRejectedValueOnce(new ReleaseCheckHttpError({ status: 403, headers: new Headers({
+        'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '3600',
+      }) }, 1000))
+      .mockResolvedValue({ version: '0.1.108', releaseUrl: 'https://example.invalid/release' });
+    const h = harness({ fetchLatestRelease });
+    const result = await h.controller.checkForUpdates(false);
+    expect(result).toMatchObject({ kind: 'error', checkRetryAt: 3600000 });
+    expect(h.waits).toEqual([]);
+    expect(await h.controller.checkForUpdates(true)).toEqual(result);
+    expect(await h.controller.checkForUpdates(false)).toEqual(result);
+    expect(fetchLatestRelease).toHaveBeenCalledTimes(1);
+    expect(h.published).toHaveLength(2);
+    h.setNow(3600001);
+    expect((await h.controller.checkForUpdates(true)).kind).toBe('available');
+    expect(fetchLatestRelease).toHaveBeenCalledTimes(2);
+    expect(h.startNativeDownload).not.toHaveBeenCalled();
+  });
+
+  it('does not quick-retry permanent HTTP failures', async () => {
+    const fetchLatestRelease = vi.fn(async () => {
+      throw new ReleaseCheckHttpError({ status: 404, headers: new Headers() }, 1000);
+    });
+    const h = harness({ fetchLatestRelease });
+    expect((await h.controller.checkForUpdates(false)).kind).toBe('error');
+    expect(fetchLatestRelease).toHaveBeenCalledTimes(1);
+    expect(h.waits).toEqual([]);
+  });
+});
+
+describe('release check HTTP backoff', () => {
+  it.each([
+    [429, { 'retry-after': '120' }, 121000],
+    [429, { 'retry-after': 'Thu, 01 Jan 1970 00:02:00 GMT' }, 120000],
+    [403, { 'retry-after': '120', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '3600' }, 3600000],
+    [429, {}, 61000],
+    [429, { 'retry-after': 'invalid', 'x-ratelimit-reset': 'invalid' }, 61000],
+    [503, { 'retry-after': '120' }, 121000],
+  ])('preserves provider delay for HTTP %s with %j', (status, headers, retryAt) => {
+    const error = new ReleaseCheckHttpError({ status, headers: new Headers(headers) }, 1000);
+    expect(error.retryAt).toBe(retryAt);
+    expect(error.retryable).toBe(false);
   });
 });
 

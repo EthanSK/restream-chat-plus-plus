@@ -44,6 +44,29 @@ export const UPDATE_CHECK_RETRY_DELAYS_MS = [10_000, 30_000] as const;
 export const UPDATE_DOWNLOAD_RETRY_DELAYS_MS = [5_000, 15_000, 45_000] as const;
 export const UPDATE_INSTALL_RESTART_TIMEOUT_MS = 10_000;
 
+/** Keep the server's backoff instruction instead of retrying every HTTP error. */
+export class ReleaseCheckHttpError extends Error {
+  readonly retryAt: number | undefined;
+  readonly retryable: boolean;
+
+  constructor(response: Pick<Response, 'status' | 'headers'>, now = Date.now()) {
+    const retryAfter = response.headers.get('retry-after');
+    const retryAfterMs = retryAfter === null ? NaN
+      : /^\d+$/.test(retryAfter) ? now + Number(retryAfter) * 1000 : Date.parse(retryAfter);
+    const exhausted = response.headers.get('x-ratelimit-remaining') === '0';
+    const resetMs = exhausted ? Number(response.headers.get('x-ratelimit-reset')) * 1000 : NaN;
+    const rateLimited = response.status === 429 || (response.status === 403 && (exhausted || retryAfter !== null));
+    const deadlines = [retryAfterMs, resetMs].filter((value) => Number.isFinite(value) && value > now);
+    const retryAt = deadlines.length > 0 ? Math.max(...deadlines)
+      : rateLimited ? now + 60_000 : undefined; // GitHub secondary limits can omit headers; its documented minimum wait is one minute.
+    super(retryAt === undefined ? `GitHub API returned HTTP ${response.status}`
+      : `${rateLimited ? 'Update server rate limit reached.' : 'Update server is busy.'} Checking is paused until ${new Date(retryAt).toLocaleTimeString()}.`);
+    this.name = 'ReleaseCheckHttpError';
+    this.retryAt = retryAt;
+    this.retryable = retryAt === undefined && (response.status >= 500 || response.status === 408);
+  }
+}
+
 export function categoriseUpdateError(raw: unknown): UpdateErrorCategory {
   const message =
     typeof raw === 'string'
@@ -121,6 +144,7 @@ export class UpdateController {
 
   private lastInfo: UpdateInfo | undefined;
   private checkPromise: Promise<UpdateInfo> | undefined;
+  private checkCooldown: UpdateInfo | undefined;
   private retryHandle: ReturnType<typeof setTimeout> | undefined;
   private downloadRetryAttempt = 0;
   private installRequested = false;
@@ -160,6 +184,11 @@ export class UpdateController {
       });
     }
 
+    if (this.checkCooldown?.checkRetryAt && this.now() < this.checkCooldown.checkRetryAt) {
+      return { ...this.checkCooldown }; // Manual checks must not bypass GitHub's limit, including after toggling automatic checks.
+    }
+    this.checkCooldown = undefined;
+
     this.checkPromise = this.runCheck(force).finally(() => {
       this.checkPromise = undefined;
     });
@@ -168,7 +197,7 @@ export class UpdateController {
 
   private async runCheck(force: boolean): Promise<UpdateInfo> {
     const currentVersion = this.deps.currentVersion();
-    this.setStatus({ kind: 'checking', currentVersion, checkedAt: this.now() });
+    this.setStatus({ kind: 'checking', currentVersion, checkIsBackground: !force, checkedAt: this.now() });
     const retryDelays = force ? [] : [...UPDATE_CHECK_RETRY_DELAYS_MS];
 
     for (let attempt = 0; ; attempt += 1) {
@@ -189,7 +218,8 @@ export class UpdateController {
           checkedAt: this.now(),
         });
       } catch (error) {
-        const retryDelay = retryDelays[attempt];
+        const retryDelay = error instanceof ReleaseCheckHttpError && !error.retryable
+          ? undefined : retryDelays[attempt];
         if (retryDelay !== undefined) {
           this.deps.log(
             'warn',
@@ -200,12 +230,15 @@ export class UpdateController {
           continue;
         }
         this.deps.recordError('updater.release-check-failed', error);
-        return this.setStatus({
+        const failure = this.setStatus({
           kind: 'error',
           currentVersion,
           error: errorMessage(error),
+          checkRetryAt: error instanceof ReleaseCheckHttpError ? error.retryAt : undefined,
           checkedAt: this.now(),
         });
+        if (failure.checkRetryAt !== undefined) this.checkCooldown = failure;
+        return failure;
       }
     }
   }

@@ -42,6 +42,9 @@ describe('updateBannerState — hidden cases', () => {
 });
 
 describe('updateBannerState — checking', () => {
+  it('does not show an hourly background check as an update in progress', () => {
+    expect(updateBannerState(info({ kind: 'checking', checkIsBackground: true }), false)).toBe('hidden');
+  });
   it('shows the checking spinner regardless of dismissed flag', () => {
     expect(updateBannerState(info({ kind: 'checking' }), false)).toBe('checking');
     // `dismissed` only applies to `available` — checking always shows so

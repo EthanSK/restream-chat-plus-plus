@@ -36,6 +36,13 @@ function buttonText(node: TestRenderer.ReactTestInstance): string {
 }
 
 describe('ChatSourcesBar', () => {
+  it('anchors the connected-channel panel inside the source bar at narrow widths', () => {
+    const css = readFileSync(new URL('../renderer/styles.css', import.meta.url), 'utf8');
+    expect(css.match(/\.channels-panel\s*\{([^}]*)\}/s)?.[1]).toContain('position: static');
+    const popover = css.match(/\.channels-popover\s*\{([^}]*)\}/s)?.[1];
+    expect(popover).toContain('right: 12px');
+    expect(popover).not.toContain('left: 0');
+  });
   it('keeps each source name and live viewer count on one line', () => {
     const css = readFileSync(
       new URL('../renderer/styles.css', import.meta.url),
