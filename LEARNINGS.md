@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-09T12:05:00Z
+**Trigger:** Ethan: "signed out again ... after a day and reopening my computer", then "patch and restart it".
+**Symptom:** RC++ 0.1.114 showed Reconnecting and Not signed in, hiding the composer and Restream viewer counts, even though the saved grant and receiving connection had recovered after sleep/network failures.
+**Root cause:** The viewer retry introduced in `321a11c` could refresh OAuth first without publishing auth status. `performFullReconnect` then reused that fresh token, skipped its refresh-only auth publication and cancelled the transient timer, leaving the renderer indefinitely signed out. Live logs, native UI and MCP confirmed the mismatch; executing the actual main-process closures reproduced it without touching the account.
+**Fix:** v0.1.115 publishes the existing canonical `pushAuthStatus()` after successful viewer refresh and on the shared valid-token reconnect path before the retry timer is cancelled. Viewer recovery does not restart receiving chat; failed refresh, expiry and deliberate logout remain authoritative.
+**Guard:** `auth-recovery-wiring.test.ts` executes the actual main.ts closures, not copied recovery logic. Two regressions failed before the patch and pass afterward; additional cases preserve transient hints, healthy-token behavior, logout truth and definitively rejected grants. Separate viewer/auth component tests and a connected post-install smoke check do not prove combined wake recovery; always exercise the cross-path sequence. Signed installation and live runtime acceptance are separate checks.
+---
+
+---
 **Date:** 2026-09-08T14:05:00Z
 **Trigger:** Update-check rate limiting and a requested RC++ reliability pass.
 **Symptom:** Hourly background checks displayed a long checking spinner, retried GitHub rate limits after 10/30 seconds, and lost the server reset time. Separate defects let the viewer feed retry an expired bearer indefinitely, let temporary Kick refresh failures erase authorization, discarded Twitch rejection codes, and positioned Connected Channels beyond a narrow window's right edge.

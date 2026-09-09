@@ -780,6 +780,7 @@ app.on('ready', async () => {
     let token = await oauth.getTokenAsync();
     if (token && (token.expiresAt - Date.now() < 60_000 || token.accessToken === rejectedToken)) {
       token = await oauth.refresh(); // Reuse serialized refresh; a viewer-feed 401 must recover without interrupting the healthy chat socket.
+      if (token) pushAuthStatus(); // Viewer recovery can renew the grant first after wake; clear the renderer's transient signed-out state without restarting chat.
     }
     return token?.accessToken;
   });
@@ -1340,11 +1341,6 @@ app.on('ready', async () => {
         const refreshed = await oauth.refresh();
         if (refreshed) {
           token = refreshed;
-          mainWindow?.webContents.send(IPC.AUTH_STATUS, {
-            authenticated: true,
-            scope: refreshed.scope,
-            expiresAt: refreshed.expiresAt,
-          } satisfies AuthStatus);
         } else {
           // v0.1.70 (sign-out diagnosis 2026-05-25): discriminate
           // transient vs fatal so a single network blip doesn't
@@ -1393,6 +1389,7 @@ app.on('ready', async () => {
       if (!token) {
         return { ok: false, reason: 'not-authenticated' };
       }
+      pushAuthStatus(); // A grant renewed by the viewer path must also clear stale signed-out UI before we cancel the recovery timer.
       chat.setToken(token.accessToken);
       chat.reconnect();
       // v0.1.94 — every managed reconnect refreshes the viewer-stats socket
