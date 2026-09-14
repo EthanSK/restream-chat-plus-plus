@@ -24,6 +24,13 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-14T14:49:00Z
+**Trigger:** Ethan asked for complete bot blocking from message hover.
+**Symptom:** Silence user suppressed speech/notifications but intentionally kept bot messages visible; the existing hiddenUsers filter had no hover entry point.
+**Fix:** Restore Hide user as a separate action, not a replacement for Silence user. Send only the username to main, merge into current persisted hiddenUsers, then cancel that author's current/queued native speech. Reuse existing feed and side-effect filters and Settings Unhide. Matching stays case-insensitive exact username across platforms inside RC++; it is not a platform ban or account-ID block.
+**Guard:** hide-user-button.test.tsx executes the actual main/renderer closures, covers failed-save rollback, preserves unrelated settings and silence rules, and checks already-silenced rows remain hideable. Existing hide-user and native speech tests cover matching and selective cancellation. All 789 tests and typecheck passed; lint has no errors. Manual isolated actual-App tests at 460 px passed hover, keyboard activation, old/new/cross-platform filtering, reload persistence and Settings undo. Live installation is verified separately.
+
+---
 **Date:** 2026-09-09T12:05:00Z
 **Trigger:** Ethan: "signed out again ... after a day and reopening my computer", then "patch and restart it".
 **Symptom:** RC++ 0.1.114 showed Reconnecting and Not signed in, hiding the composer and Restream viewer counts, even though the saved grant and receiving connection had recovered after sleep/network failures.

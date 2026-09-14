@@ -48,10 +48,11 @@ describe('SettingsDrawer — slider preview wiring (v0.1.27)', () => {
     .map((l) => l.replace(/\/\/.*$/, '')) // // line comments
     .join('\n');
 
-  it('keeps saved hidden users recoverable without directing users to the removed Hide action', () => {
+  it('explains local username matching and keeps hidden users recoverable', () => {
     const hiddenSection = code.slice(code.indexOf('<h3>Hidden Users</h3>'));
     expect(hiddenSection).not.toContain('<strong>Hide user</strong>');
-    expect(hiddenSection).toContain('Users hidden earlier stay listed here.');
+    expect(hiddenSection).toContain('Hidden usernames are matched exactly, ignoring case, across all');
+    expect(hiddenSection).toContain('platforms in RC++');
     expect(hiddenSection).toContain('Unhide to bring a user back.');
     expect(hiddenSection).toContain('onClick={() => unhideUser(u)}');
   });

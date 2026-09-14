@@ -73,7 +73,7 @@ import { TtsDispatcher } from './tts-dispatch';
 // so the cancel is ATOMIC with the persist and covers EVERY entry point
 // (renderer toggle, header mute button, MCP set_tts_enabled). See saveSettings.
 import { shouldCancelNativeTtsOnSettingsChange } from '../shared/side-effect-decision';
-import { addSilencedUserToBothFilters } from '../shared/message-filters';
+import { addHiddenUser, addSilencedUserToBothFilters } from '../shared/message-filters';
 import {
   DEFAULT_SETTINGS,
   IPC,
@@ -1716,6 +1716,16 @@ app.on('ready', async () => {
   }
   ipcMain.handle(IPC.SETTINGS_GET, (): Settings => loadSettings());
   ipcMain.handle(IPC.SETTINGS_SET, (_evt, settings: Settings) => saveSettings(settings));
+  ipcMain.handle(IPC.SETTINGS_HIDE_USER, (_evt, rawUsername: unknown): Settings => {
+    if (typeof rawUsername !== 'string' || rawUsername.trim().length === 0) {
+      throw new Error('Missing chat username');
+    }
+    const username = rawUsername.trim();
+    const current = loadSettings(); // Merge in main so a stale renderer cannot overwrite another saved preference.
+    const saved = saveSettings({ ...current, hiddenUsers: addHiddenUser(current.hiddenUsers, username) });
+    nativeTts.cancelUsername(username); // The saved filter blocks new speech, but this author's current and queued speech must stop too.
+    return saved;
+  });
   /**
    * Atomic per-row Silence-user action. The old renderer path constructed and
    * fire-and-forgot a whole Settings snapshot, gave no success/error feedback,

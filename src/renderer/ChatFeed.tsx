@@ -38,6 +38,8 @@ interface Props {
    * adding anchored, regex-escaped entries to both username-ignore lists.
    */
   onSilenceUser?: (username: string) => void;
+  /** Hide all rows and side effects for this author; separate from Silence user. */
+  onHideUser?: (username: string) => void;
   /** Current username rules, used for live feedback on existing rows. */
   silencedTtsUsernamePatterns?: readonly RegExp[];
   silencedNotificationUsernamePatterns?: readonly RegExp[];
@@ -75,6 +77,7 @@ export function ChatFeed({
   authenticated,
   connection,
   onSilenceUser,
+  onHideUser,
   silencedTtsUsernamePatterns = [],
   silencedNotificationUsernamePatterns = [],
   onRetrySend,
@@ -120,6 +123,7 @@ export function ChatFeed({
           <MessageRow
             message={m}
             onSilenceUser={onSilenceUser}
+            onHideUser={onHideUser}
             silencedTtsUsernamePatterns={silencedTtsUsernamePatterns}
             silencedNotificationUsernamePatterns={silencedNotificationUsernamePatterns}
             onRetrySend={onRetrySend}
@@ -206,6 +210,7 @@ function EmptyFeedBody({
 export function MessageRow({
   message: m,
   onSilenceUser,
+  onHideUser,
   silencedTtsUsernamePatterns = [],
   silencedNotificationUsernamePatterns = [],
   onRetrySend,
@@ -215,6 +220,7 @@ export function MessageRow({
   // affordance can leave this off; production always passes it via
   // ChatFeed → App.tsx → handleSilenceUser.
   onSilenceUser?: (username: string) => void;
+  onHideUser?: Props['onHideUser'];
   silencedTtsUsernamePatterns?: readonly RegExp[];
   silencedNotificationUsernamePatterns?: readonly RegExp[];
   // v0.1.90 (voice 4512) — optional manual-retry relay (same rationale).
@@ -307,6 +313,7 @@ export function MessageRow({
     m.username.trim().length > 0 &&
     typeof onSilenceUser === 'function' &&
     !isFullySilenced;
+  const canHide = !m.self && typeof m.username === 'string' && m.username.trim().length > 0 && !!onHideUser; // Silenced authors can still be hidden completely.
   return (
     <div
       className={
@@ -395,6 +402,20 @@ export function MessageRow({
               }}
             >
               🔇 Silence user
+            </button>
+          )}
+          {canHide && (
+            <button
+              className="hide-user-btn"
+              type="button"
+              title={`Hide ${m.username} — their messages disappear from RC++ and stop triggering TTS and notifications`}
+              aria-label={`Hide ${m.username}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onHideUser?.(m.username);
+              }}
+            >
+              Hide user
             </button>
           )}
         </div>

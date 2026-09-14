@@ -531,8 +531,8 @@ export function SettingsDrawer({
 
           {/*
             v0.1.72 (voice 4352, 2026-05-28) — Hidden Users section.
-            Previously populated by the per-row hover "Hide user" affordance
-            in ChatFeed; each saved entry can still be Unhidden here.
+            Populated by the separate per-row hover "Hide user" affordance
+            in ChatFeed; each saved entry can be Unhidden here.
 
             Hidden users are filtered from the visible feed entirely AND
             their messages don't wake TTS / notifications either. This is
@@ -540,15 +540,15 @@ export function SettingsDrawer({
             side effect — the message still renders with a "regex-ignored"
             badge). "Hide" means "as if they never spoke".
 
-            Keep the saved list recoverable, but do not direct users to the
-            removed Hide action; Silence user intentionally keeps rows visible.
+            Keep the saved list recoverable; Silence user remains a separate
+            action that intentionally keeps rows visible.
           */}
           <section className="section">
             <h3>Hidden Users</h3>
             <p className="section-hint">
-              Users hidden earlier stay listed here. Their messages disappear
-              from the feed and never trigger TTS or notifications.
-              Case-insensitive exact-match. Unhide to bring a user back.
+              Hidden usernames are matched exactly, ignoring case, across all
+              platforms in RC++. Their messages disappear from the feed and never
+              trigger TTS or notifications. Unhide to bring a user back.
             </p>
             {(settings.hiddenUsers ?? []).length === 0 ? (
               <p className="hidden-users-empty">No hidden users yet.</p>

@@ -46,6 +46,7 @@ import type { ViewerStatsSnapshot } from '../shared/viewer-stats-core';
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
 import {
+  addHiddenUser,
   addSilencedUserToBothFilters,
   applyMessageFilters,
   compileHiddenUsersSet,
@@ -918,6 +919,17 @@ export function App(): React.ReactElement {
       });
   };
 
+  const handleHideUser = (username: string): void => {
+    if (username.trim().length === 0) return;
+    setSilenceError(null);
+    setSettings((current) => ({ ...current, hiddenUsers: addHiddenUser(current.hiddenUsers, username) }));
+    void rcpp.hideUser(username).then(setSettings).catch((err: unknown) => {
+      const detail = err instanceof Error ? err.message : String(err);
+      setSilenceError(`Failed to hide ${username}: ${detail}`);
+      void rcpp.getSettings().then(setSettings).catch(() => setSettings(settings)); // A failed save must restore visible rows, even if the settings reload also fails.
+    });
+  };
+
   // v0.1.77 (Ethan voice 4438, 2026-05-30) — header ONE-CLICK MUTE toggle.
   //
   // Flips `settings.tts.muted` and persists it through the normal
@@ -1337,6 +1349,7 @@ export function App(): React.ReactElement {
         // TTS username-ignore list (silence, not hide). ChatFeed is a pure
         // render layer here; it just surfaces the button + relays the click.
         onSilenceUser={handleSilenceUser}
+        onHideUser={handleHideUser}
         // Live compiled patterns make existing rows update immediately: the
         // hover button becomes a persistent "Silenced" status and the old row
         // receives its combined ignore badge without waiting for a new message.

@@ -250,6 +250,9 @@ const api = {
   getSettings: (): Promise<Settings> => ipcRenderer.invoke(IPC.SETTINGS_GET),
   setSettings: (s: Settings): Promise<Settings> =>
     ipcRenderer.invoke(IPC.SETTINGS_SET, s),
+  /** Hide one chat author without overwriting other saved settings. */
+  hideUser: (username: string): Promise<Settings> =>
+    ipcRenderer.invoke(IPC.SETTINGS_HIDE_USER, username),
   /**
    * Atomically silence one chat author in main. The result includes the saved
    * Settings so the renderer can reconcile its optimistic row feedback, plus

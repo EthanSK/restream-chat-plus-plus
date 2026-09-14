@@ -356,7 +356,7 @@ export interface Settings {
    * `username` exactly matches any string in this list are filtered out
    * of the visible feed entirely (NOT just regex-ignored for side
    * effects — they don't render at all). Populated by the hover →
-   * "Hide user" button on each chat row, removed via the Unhide button
+   * "Hide user" button on each chat row, separate from Silence user, removed via the Unhide button
    * in the Settings drawer's Hidden Users section.
    *
    * Exact-match (case-INSENSITIVE) rather than regex because the hide
@@ -662,6 +662,8 @@ export const IPC = {
   FOCUS_CHAT_INPUT: 'chat:focus-input',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
+  /** Hide one username using current persisted Settings and stop its queued speech. */
+  SETTINGS_HIDE_USER: 'settings:hide-user',
   /**
    * Renderer → main atomic "Silence user" action. Unlike SETTINGS_SET,
    * this sends only the username: main reloads the latest persisted Settings,

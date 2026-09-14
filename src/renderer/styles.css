@@ -1513,7 +1513,8 @@ body {
  * mounts and a screen reader can find it via Tab — only the visual
  * presentation is gated on hover.
  */
-.silence-user-btn {
+.silence-user-btn,
+.hide-user-btn {
   display: inline-block;
   margin-left: 8px;
   padding: 1px 6px;
@@ -1524,8 +1525,19 @@ body {
   border: 1px solid var(--text-3);
   border-radius: 4px;
   cursor: pointer;
-  visibility: hidden; /* Hidden until the row is hovered (or button focused). */
   user-select: none;
+}
+.silence-user-btn {
+  visibility: hidden; /* Hidden until the row is hovered (or button focused). */
+}
+.hide-user-btn {
+  opacity: 0; /* Keep the new action keyboard-focusable; visibility:hidden prevents Tab from reaching it. */
+  pointer-events: none;
+}
+.message-row:hover .hide-user-btn,
+.hide-user-btn:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
 }
 .message-row:hover .silence-user-btn,
 .silence-user-btn:focus,
@@ -1533,7 +1545,8 @@ body {
   /* Reveal on row-hover OR keyboard-focus so tab-nav can reach it. */
   visibility: visible;
 }
-.silence-user-btn:hover {
+.silence-user-btn:hover,
+.hide-user-btn:hover {
   color: var(--text-1, #fff);
   border-color: var(--text-1, #fff);
   background: rgba(255, 255, 255, 0.06);
