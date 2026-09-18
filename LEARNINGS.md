@@ -24,6 +24,13 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-09-18T12:20:00Z
+**Trigger:** Ethan requested a quick notification mute beside the header speech mute.
+**Symptom:** Native notifications could only be switched off through Settings.
+**Fix:** v0.1.117 reuses notifications.enabled for the header bell rather than adding a second mute preference. The existing main-process dispatcher already gates notifications independently of speech. Keep the two controls in one inline-flex group so a narrow header cannot wrap them apart.
+**Guard:** notification-mute-button.test.tsx executes the actual JSX and handler, verifies both states and Settings synchronization, and exercises the real dispatcher with fake speech/notification sinks. Typecheck and all 792 tests passed; lint has no errors. Manual isolated actual-App checks at 460 px verified placement, click/keyboard activation, persistence and Settings synchronization. Installed runtime acceptance is a separate check.
+
+---
 **Date:** 2026-09-14T14:49:00Z
 **Trigger:** Ethan asked for complete bot blocking from message hover.
 **Symptom:** Silence user suppressed speech/notifications but intentionally kept bot messages visible; the existing hiddenUsers filter had no hover entry point.

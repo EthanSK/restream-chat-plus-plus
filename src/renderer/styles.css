@@ -771,6 +771,10 @@ body {
  * emoji rendered at full opacity (the base `.btn.icon` dims color via --text-2,
  * which would wash out the emoji). When muted, a subtle danger-tinted
  * background reinforces the "speech is off" state at a glance. */
+.mute-controls {
+  display: inline-flex; /* Keep speech and notification mute together when the narrow header wraps. */
+  gap: 8px;
+}
 .mute-btn {
   font-size: 14px;
   line-height: 1;

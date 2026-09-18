@@ -947,6 +947,13 @@ export function App(): React.ReactElement {
     });
   };
 
+  const toggleNotifications = (): void => { // Reuse Settings' enabled switch so header mute cannot drift from the main-process notification gate.
+    void updateSettings({
+      ...settings,
+      notifications: { ...settings.notifications, enabled: !settings.notifications.enabled },
+    });
+  };
+
   const updateSettings = async (next: Settings) => {
     setSettings(next);
     // v0.1.84 — the "cancel in-flight/queued native TTS on a mute-on / disable-
@@ -1284,15 +1291,26 @@ export function App(): React.ReactElement {
          * this button stay in sync automatically because both read/write the
          * same `settings.tts` object (see SettingsDrawer's Muted row).
          */}
-        <button
-          className={`btn icon ghost mute-btn${settings.tts.muted ? ' muted' : ''}`}
-          title={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
-          aria-label={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
-          aria-pressed={settings.tts.muted}
-          onClick={toggleMuted}
-        >
-          {settings.tts.muted ? '🔇' : '🔊'}
-        </button>
+        <span className="mute-controls">
+          <button
+            className={`btn icon ghost mute-btn${settings.tts.muted ? ' muted' : ''}`}
+            title={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
+            aria-label={settings.tts.muted ? 'Unmute speech' : 'Mute speech'}
+            aria-pressed={settings.tts.muted}
+            onClick={toggleMuted}
+          >
+            {settings.tts.muted ? '🔇' : '🔊'}
+          </button>
+          <button
+            className={`btn icon ghost mute-btn${settings.notifications.enabled ? '' : ' muted'}`}
+            title={settings.notifications.enabled ? 'Mute notifications' : 'Unmute notifications'}
+            aria-label={settings.notifications.enabled ? 'Mute notifications' : 'Unmute notifications'}
+            aria-pressed={!settings.notifications.enabled}
+            onClick={toggleNotifications}
+          >
+            {settings.notifications.enabled ? '🔔' : '🔕'}
+          </button>
+        </span>
         <button
           className="btn ghost"
           title="Reveal raw-frames.jsonl in Finder for debugging"
