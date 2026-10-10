@@ -126,16 +126,17 @@ export function clampSayVolume(volume: number | undefined): number {
  * 2 dp to keep the embedded command tidy in logs.
  *
  * NOTE: `say` treats any `[[...]]` in the text as a command, so a chat message
- * containing literal `[[volm 9]]` could change its own volume. That's a cosmetic
- * abuse (viewer makes their own line louder/quieter), NOT a security issue —
- * `say` runs `[[...]]` as TUNE commands, never shell. We accept it rather than
- * escaping (which would risk mangling legitimate `[[` text). The guard if abuse
- * ever appears is to strip `[[...]]` from `text` here.
+ * containing literal `[[volm 9]]` could change its own volume. Previously this
+ * was accepted as cosmetic abuse because TUNE commands never execute a shell.
+ * However `[[slnc ...]]` also inserts silence and holds up later queued chat.
+ * Separate adjacent opening brackets instead of deleting the viewer's text;
+ * only our own volume command may be interpreted by the speech engine.
  */
 export function buildSayText(text: string, volume: number | undefined): string {
   const v = clampSayVolume(volume);
   const vStr = (Math.round(v * 100) / 100).toString();
-  return `[[volm ${vStr}]] ${text}`;
+  const spokenText = text.replace(/\[(?=\[)/g, '[ '); // Break every command opener, including overlapping [[[ runs that a plain [[ replacement misses.
+  return `[[volm ${vStr}]] ${spokenText}`;
 }
 
 /**

@@ -297,6 +297,22 @@ describe('NativeTtsEngine — macOS say argv', () => {
 // SECURITY — untrusted chat text MUST never reach a shell / PowerShell parser.
 // =============================================================================
 describe('SECURITY: untrusted text handling', () => {
+  it.each(['[[slnc 99999]] hi', '[[[volm 1]]] x', 'a[[b', '[[dlim {{ }}]]', '[[[[rate 1]]'])('does not interpret viewer speech commands: %s', (text) => {
+    const spoken = buildSayText(text, .31);
+    expect(spoken.startsWith('[[volm 0.31]] ')).toBe(true);
+    expect(spoken.slice('[[volm 0.31]] '.length)).not.toContain('[[');
+    expect(spoken.replaceAll(' ', '')).toBe(`[[volm0.31]]${text.replaceAll(' ', '')}`);
+  });
+
+  it('passes only the app volume command to the actual macOS adapter', () => {
+    const { spawner, spawns } = makeFakeSpawner();
+    const engine = new NativeTtsEngine({ settings: baseSettings, spawner, adapter: macAdapter });
+    engine.enqueue('[[slnc 99999]] hi', { volume: .31 });
+    const spoken = lastArg(spawns[0]);
+    expect(spoken.match(/\[\[/g)).toHaveLength(1);
+    expect(spoken).toBe('[[volm 0.31]] [ [slnc 99999]] hi');
+  });
+
   it('macOS: a shell-metachar-laden message is a plain ARGV slot, shell never used', () => {
     const { spawner, last } = makeFakeSpawner();
     const engine = new NativeTtsEngine({

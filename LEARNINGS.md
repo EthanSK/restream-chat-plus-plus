@@ -24,6 +24,13 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-10-10T17:02:00Z
+**Trigger:** Ethan heard both controlled speech samples and requested an Opus/Codex check for speech and notification bugs while retaining system-default audio routing.
+**Root cause:** Native macOS speech interpreted viewer-supplied `[[...]]` as TUNE commands, including silence that could block later queued chat. Separately, a rejected settings save left optimistic mute/notification icons and the separately pushed native-preview configuration showing unsaved values.
+**Fix:** v0.1.118 separates every adjacent opening bracket in viewer text, preserving its characters while allowing only the app's volume command. App.tsx now uses the existing hide/silence-user saved-settings readback pattern after failed writes, with a delayed-readback identity check so a newer edit is not undone. The main-process successful save already owns preview configuration; remove the duplicate pre-save push instead of adding another state channel. System-default audio devices, system volume, and normal notification delivery are unchanged.
+**Guard:** Six speech-command regressions and four actual-renderer save regressions fail before their fixes and pass afterward. All 802 tests and typecheck pass; lint has zero errors and 186 pre-existing warnings. A separate actual-App browser instance with fake IPC manually verified failed speech/notification saves restore the controls, successful mute saves work, keyboard unmute works, and Settings matches the header. These fixes do not establish the cause of the earlier missed speech: all six original messages completed native speech successfully, and no command injection or failed setting save was observed in that incident. Ethan confirmed both native test samples were audible, with the saved 0.31-volume sample quieter; leave output routing at the system default.
+
+---
 **Date:** 2026-10-10T16:38:00Z
 **Trigger:** Viewer messages appeared while Ethan reported no speech or notifications despite enabled header controls.
 **Symptom:** All six target messages passed both side-effect gates; native speech ended normally, but the user did not hear it.

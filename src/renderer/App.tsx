@@ -968,21 +968,18 @@ export function App(): React.ReactElement {
     // So there is deliberately NO cancel() call in the renderer any more — the
     // single source of truth is the main-process saveSettings.
     //
-    // v0.1.81 — no renderer engine to swap. Push the voice/rate/volume slice to
-    // the MAIN native engine so the Settings voice-PREVIEW (which the engine
-    // speaks using its own current rate/volume) reflects live slider changes
-    // immediately. Chat playback reads settings per-message in main, so this
-    // push is only load-bearing for the preview's rate/volume. Fire-and-forget.
+    // v0.1.81 — no renderer engine to swap. The renderer previously pushed the
+    // voice/rate/volume slice separately for Settings voice-PREVIEW. saveSettings
+    // in MAIN already updates that slice synchronously after a successful save,
+    // so it now owns preview settings too; a rejected disk write must not leave
+    // the native preview using values the app never saved.
     try {
-      rcpp.ttsNative?.updateSettings?.({
-        voiceURI: next.tts.voiceURI,
-        rate: next.tts.rate,
-        volume: next.tts.volume,
-      });
+      await rcpp.setSettings(next);
     } catch (err) {
-      console.error('[App] ttsNative.updateSettings failed', err);
+      console.error('[App] settings save failed', err);
+      const saved = await rcpp.getSettings().catch(() => settings); // A failed disk/IPC write can leave optimistic mute icons false; retain the prior snapshot if readback is also unavailable.
+      setSettings((current) => current === next ? saved : current); // A slow failed-save readback must not undo a newer slider edit or settings push.
     }
-    await rcpp.setSettings(next);
   };
 
   const onSignInToSend = async () => {
