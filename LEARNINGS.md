@@ -24,6 +24,13 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-10-10T16:38:00Z
+**Trigger:** Viewer messages appeared while Ethan reported no speech or notifications despite enabled header controls.
+**Symptom:** All six target messages passed both side-effect gates; native speech ended normally, but the user did not hear it.
+**Verified diagnosis:** macOS `systemsoundserverd` logged notification playback with `volume 0.000000 (user vol 0.000000, client vol scalar 1.000000, CM vol 1.000000)` at the actual message times. NotificationCenter separately logged displayed banners and five-second expiration, with no Focus interruption suppression. This proves silent alert sounds and temporary banner handling, not that the user saw the pixels. Speech was unmuted and directed to BuiltInSpeakerDevice; its physical audibility remained unconfirmed. Do not classify an exit-zero speech child as audible success or infer its failure from unrelated CoreAudio shutdown warnings.
+**Guard:** Correlate raw-message timestamps/IDs with `tts-events.jsonl`, then inspect narrowly scoped macOS unified logs for NotificationCenter presentation, systemsoundserverd's resolved playback volume, and the individual `say` process's output device. Current volume alone does not establish historical volume. An OBS recording cannot validate speech if the screen-audio source/track was muted. Render controlled speech to a file for signal checks using the actual app rate (`NATIVE_BASE_WPM` 180 times the saved multiplier), then use a user-confirmed listening check to distinguish quiet speech from the wrong output. Preserve settings, streams, and recording state during diagnosis; these checks do not imply a code fix.
+
+---
 **Date:** 2026-09-18T12:20:00Z
 **Trigger:** Ethan requested a quick notification mute beside the header speech mute.
 **Symptom:** Native notifications could only be switched off through Settings.
