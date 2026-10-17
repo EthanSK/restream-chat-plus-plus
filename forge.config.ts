@@ -49,6 +49,8 @@ const osxNotarize = hasMacSigningSecrets
 const iconPath = path.resolve(__dirname, 'build/icon');
 
 const config: ForgeConfig = {
+  // Generated app bundles must not become duplicate Spotlight app results.
+  outDir: path.resolve(__dirname, 'out.noindex'),
   packagerConfig: {
     asar: true,
     name: 'Restream Chat Plus Plus',

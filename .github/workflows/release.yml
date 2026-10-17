@@ -166,8 +166,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "--- out/make ---"
-          find out/make -type f 2>/dev/null | sort || true
+          echo "--- out.noindex/make ---"
+          find out.noindex/make -type f 2>/dev/null | sort || true
 
       - name: Stage release artefacts
         shell: bash
@@ -179,7 +179,7 @@ jobs:
           set -euo pipefail
           # macOS runners ship bash 3.2 which has no `globstar`; use `find`
           # for cross-shell recursive matching.
-          mkdir -p release-staging
+          mkdir -p release-staging.noindex
 
           stage_files() {
             local pattern="$1"
@@ -188,12 +188,12 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               if [ -n "$rename_to" ]; then
-                cp "$f" "release-staging/$rename_to"
+                cp "$f" "release-staging.noindex/$rename_to"
               else
-                cp "$f" "release-staging/"
+                cp "$f" "release-staging.noindex/"
               fi
               count=$((count + 1))
-            done < <(find "out/make" -type f -name "$pattern" 2>/dev/null || true)
+            done < <(find "out.noindex/make" -type f -name "$pattern" 2>/dev/null || true)
             echo "[stage] pattern=$pattern count=$count"
           }
 
@@ -215,15 +215,15 @@ jobs:
               ;;
           esac
 
-          echo "--- release-staging ---"
-          ls -lah release-staging || true
+          echo "--- release-staging.noindex ---"
+          ls -lah release-staging.noindex || true
 
       - name: Generate SHA-256 checksums
         if: matrix.platform != 'win32'
         shell: bash
         run: |
           set -euo pipefail
-          cd release-staging
+          cd release-staging.noindex
           shopt -s nullglob
           for f in *.zip *.deb *.rpm; do
             [ -f "$f" ] || continue
@@ -234,7 +234,7 @@ jobs:
         if: matrix.platform == 'win32'
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path release-staging -Include *.exe,*.nupkg -Recurse
+          $files = Get-ChildItem -Path release-staging.noindex -Include *.exe,*.nupkg -Recurse
           foreach ($file in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower()
             "$hash  $($file.Name)" | Out-File -FilePath "$($file.FullName).sha256" -Encoding ascii
@@ -244,7 +244,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.slug }}
-          path: release-staging/*
+          path: release-staging.noindex/*
           if-no-files-found: error
 
   publish:

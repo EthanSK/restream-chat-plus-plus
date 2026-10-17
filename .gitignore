@@ -91,5 +91,7 @@ typings/
 
 # Electron-Forge
 out/
+out.noindex/
+release-staging.noindex/
 BUG_SWEEP_*.md
 /.outstanding-items/

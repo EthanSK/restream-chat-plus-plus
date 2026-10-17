@@ -77,6 +77,8 @@ npm run typecheck  # tsc --noEmit
 npm run make       # build for current host (skips signing without secrets)
 ```
 
+Packaged apps and installers are generated in `out.noindex/` (Forge makers use `out.noindex/make/`) so development bundles do not appear as duplicate Spotlight apps. The checked-in `build/` directory contains icons and signing entitlements, not generated app bundles.
+
 For a signed CI build matching the released artefacts, push to `main` (build-only) or push a `v*` tag (build + publish to Releases + bump landing-page `version.json`). The release workflow lives at `.github/workflows/release.yml`.
 
 ### Project layout
