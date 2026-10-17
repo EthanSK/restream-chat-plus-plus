@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-10-17T21:03:49Z
+**Trigger:** Keep generated build app copies out of Spotlight for existing and future builds.
+**Symptom:** Generated app bundles can appear alongside installed apps in macOS search.
+**Root cause:** Electron Forge had no outDir override, so packaged app copies were emitted to the default out/ and CI consumed out/make.
+**Fix:** Set Forge outDir to out.noindex/, update CI maker/staging consumers and TypeScript/Git exclusions, and preserve checked-in build/ icon/entitlement assets.
+**Commit:** c597f8f5528ff8689f86a438fc2c8a3f609ee4ab
+**Guard:** Actual Forge configuration loader resolves out.noindex with the existing .icns; TypeScript and workflow YAML/bash parsing passed. No Electron packaging, signing, or runtime install.
+---
+
+---
 **Date:** 2026-10-10T17:02:00Z
 **Trigger:** Ethan heard both controlled speech samples and requested an Opus/Codex check for speech and notification bugs while retaining system-default audio routing.
 **Root cause:** Native macOS speech interpreted viewer-supplied `[[...]]` as TUNE commands, including silence that could block later queued chat. Separately, a rejected settings save left optimistic mute/notification icons and the separately pushed native-preview configuration showing unsaved values.
