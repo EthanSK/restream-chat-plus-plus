@@ -7,7 +7,7 @@ A native, cross-platform replacement for the official [Restream Chat](https://re
 
 ## What
 
-A free, open-source desktop client that renders multi-platform chat (Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X) in a single virtualised feed. Restream supplies the combined feed, while optional direct Twitch and Kick connections keep those chats visible even when the channels are not enabled as Restream destinations. TTS, notifications, per-platform filters, automatic reconnect — all native.
+A free, source-available desktop client that renders multi-platform chat (Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X) in a single virtualised feed. Restream supplies the combined feed, while optional direct Twitch and Kick connections keep those chats visible even when the channels are not enabled as Restream destinations. TTS, notifications, per-platform filters, automatic reconnect — all native.
 
 The app ships as a signed, notarized macOS bundle (arm64 + x64), a Squirrel installer for Windows x64, and `.deb` / `.rpm` packages for Linux x64. Auto-update is wired through Electron's public update service backed by GitHub Releases.
 
@@ -121,4 +121,9 @@ Personal-use replacement. Not affiliated with Restream. Not published to any app
 
 ## License
 
-MIT.
+See [the no-sale source license](LICENSE) and [its scope](LICENSING.md).
+
+
+## License
+
+Source-available under [Ethan Source-Available No-Sale Terms 1.0](LICENSE). You can use and modify the covered code, including internally at work, and share it without charge. Selling the software, modified versions, paid access, or bundles requires a separate commercial license. Earlier licenses and third-party rights remain in force. See [scope and release policy](LICENSING.md).
