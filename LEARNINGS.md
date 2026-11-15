@@ -1,5 +1,9 @@
 # Learnings
 
+## Queue-owned delivery status — 15 November 2026
+
+The UI's 30-second optimistic timeout ran from enqueue even while the main queue was still sending or waiting behind an earlier message. Actual queue logs later recorded success; clicking the premature warning re-enqueued the same UUID, and Restream posted it again with a different reply UUID. A shared clientReplyUuid is correlation, not proof of server idempotency. Cancel the renderer fallback once pending/retrying acknowledges queue ownership; keep the existing five attempts and report the queue's actual final result. Associate warnings with client IDs and clear only the matching warning on success. Keep recent confirmed results in a bounded completion cache separate from partial-delivery progress, so late manual retry cannot repost success or evict unfinished recovery evidence. Regression guards mount the real App across 90-second delays, verify the lost-IPC fallback, real terminal failure and warning isolation, and exercise completion dedupe, its 500-entry bound and partial-delivery retention.
+
 ## Release runner compatibility — 15 November 2026
 
 GitHub retired macos-14 on 2 November 2026: the release job is cancelled before checkout with unsupported macos-14-arm64-us-default. Use the supported macos-15 arm64 successor. The moving ubuntu-latest selected Ubuntu 26.04, where the current Electron RPM maker failed in %install because rpmbuild changed into a new build subdirectory and could not find usr/*. Pin the existing Linux packaging job to Ubuntu 24.04 instead of changing application packaging or disabling RPM output. Electron 42 requires Node >=22.12, so use Node 22 for release packaging. Verify actual CI package jobs, not only lint/tests; changing these build hosts does not require reinstalling the unchanged local app. Evidence: release run 43721736510.

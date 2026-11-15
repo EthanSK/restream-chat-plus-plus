@@ -81,6 +81,7 @@ interface SendNotice {
   id: number;
   text: string;
   needsLogin: boolean;
+  clientId?: ChatMessage['id']; // Clear a recovered send's warning without dismissing another message's actual failure.
 }
 
 export function App(): React.ReactElement {
@@ -145,8 +146,8 @@ export function App(): React.ReactElement {
   // v0.1.63 — one timeout per renderer-minted optimistic send. The map lives
   // in a ref because these handles are lifecycle bookkeeping, not render data:
   // changing them should not re-render the chat feed. Every handle is cleared
-  // when the matching WS echo arrives, when the main-process queue reports an
-  // explicit failure, when chat is cleared, and on unmount.
+  // when the matching WS echo arrives, when the main-process queue acknowledges
+  // ownership or reports a result, when chat is cleared, and on unmount.
   const optimisticSendTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
@@ -234,12 +235,12 @@ export function App(): React.ReactElement {
     hiddenUsersSetRef.current = hiddenUsersSet;
   }, [hiddenUsersSet]);
 
-  const showSendNotice = (text: string, needsLogin = false): void => {
+  const showSendNotice = (text: string, needsLogin = false, clientId?: ChatMessage['id']): void => {
     // The id makes repeated identical failures visible as fresh state changes.
     // Without it, two consecutive `no-session-cookies` bails would set the
     // same string twice and React could preserve the previous dismissed banner.
     sendNoticeSeqRef.current += 1;
-    setSendNotice({ id: sendNoticeSeqRef.current, text, needsLogin });
+    setSendNotice({ id: sendNoticeSeqRef.current, text, needsLogin, clientId });
   };
 
   const clearOptimisticSendTimeout = (
@@ -248,6 +249,7 @@ export function App(): React.ReactElement {
       | 'echo'
       | 'sent-status'
       | 'failed-status'
+      | 'queue-acknowledged'
       | 'replace'
       | 'clear-chat'
       | 'sign-out'
@@ -287,9 +289,9 @@ export function App(): React.ReactElement {
       optimisticSendTimeoutsRef.current.delete(clientId);
       // v0.1.63 stuck-send guard. This is deliberately a renderer-side
       // safety net, not the primary send-failure path. The main process
-      // should emit `failed` for every `{ ok:false }` send result, and startup
-      // cookie repair should prevent the v0.1.62 cookie-bail path entirely.
-      // If either contract regresses, this timer turns the placeholder into
+      // acknowledges each enqueue and owns its retries and final result.
+      // Acknowledgement cancels this guard; only a missing IPC reply leaves
+      // it armed. If that contract regresses, this timer turns the placeholder into
       // `pendingSend: "failed"` after 30s so Ethan never stares at an
       // indefinite "sending" state with no explanation.
       //
@@ -300,7 +302,7 @@ export function App(): React.ReactElement {
       // any later `ws-echo-received` row to see whether the send DID
       // actually land just too slowly for the guard to wait.
       setMessages((prev) => applyOptimisticSendTimeout(prev, clientId));
-      logOptimisticSendTimeout(clientId);
+      logOptimisticSendTimeout(clientId, 'queue-not-acknowledged');
       // v0.1.87 (send-warning auto-reconnect request 2026-06-07): a send that
       // never got its WS echo within the 30s guard means the chat WS is most
       // likely stale/replaced — the POST landed (200) but the round-trip echo
@@ -320,7 +322,7 @@ export function App(): React.ReactElement {
         // self-healing nudge must never break the stuck-send guard
       }
       const notice = sendFailureNoticeText(optimisticSendTimeoutStatus(clientId));
-      if (notice) showSendNotice(notice);
+      if (notice) showSendNotice(notice, false, clientId);
     }, OPTIMISTIC_SEND_TIMEOUT_MS);
     optimisticSendTimeoutsRef.current.set(clientId, timeout);
   };
@@ -554,6 +556,10 @@ export function App(): React.ReactElement {
     // suppressed in main so they cannot duplicate that row. `failed` keeps the
     // placeholder visible with a small ⚠ + tooltip carrying the error.
     const offSendStatus = rcpp.onChatSendStatus((status) => {
+      if (status.status === 'pending' || status.status === 'retrying') {
+        clearOptimisticSendTimeout(status.clientId, 'queue-acknowledged'); // The queue owns delivery and its five attempts; a 30-second UI timer must not offer manual retry while that same send is still active.
+        if (status.status === 'pending') return;
+      }
       // v0.1.88 (voice 4504): record HTTP-200 sends so the reconnect-success
       // sweep can tell "Restream accepted this POST (it WILL deliver once we
       // re-subscribe)" from "this send genuinely never landed". The queue emits
@@ -565,6 +571,7 @@ export function App(): React.ReactElement {
       if (status.status === 'sent') {
         clearOptimisticSendTimeout(status.clientId, 'sent-status');
         setMessages((prev) => applySentSendStatus(prev, status));
+        setSendNotice((previous) => previous?.clientId === status.clientId ? null : previous);
         const set = httpOkSendsRef.current;
         set.add(status.clientId);
         if (set.size > HTTP_OK_SENDS_MAX) {
@@ -576,16 +583,15 @@ export function App(): React.ReactElement {
       // v0.1.90 (voice 4512) — intermediate retry status. The bounded
       // exponential-backoff loop in main flips the placeholder to
       // "sending… (retry N/5)" between attempts so Ethan always SEES his
-      // message fighting to deliver. We KEEP the optimistic-send timeout
-      // armed across retries — if the whole loop eventually succeeds the
-      // echo clears it; if it ends in terminal 'failed' that status cancels
-      // it (below). A 'retrying' is NOT a failure and NOT an HTTP-200, so it
-      // touches neither the timeout nor the httpOkSends set.
+      // message fighting to deliver. The queue acknowledgement cancels the
+      // optimistic-send timeout above; the queue's own terminal status owns
+      // the result. A 'retrying' is NOT a failure or an HTTP-200, so it must
+      // not enter the httpOkSends set.
       if (status.status === 'retrying') {
         setMessages((prev) => applyRetryingSendStatus(prev, status));
         if (needsRestreamSendLogin(status)) {
           const notice = sendFailureNoticeText(status);
-          if (notice) showSendNotice(notice, true); // Reconnecting OAuth cannot complete a missing website login; expose repair while bounded retries continue.
+          if (notice) showSendNotice(notice, true, status.clientId); // Reconnecting OAuth cannot complete a missing website login; expose repair while bounded retries continue.
         }
         return;
       }
@@ -603,7 +609,7 @@ export function App(): React.ReactElement {
       httpOkSendsRef.current.delete(status.clientId);
       setMessages((prev) => applyFailedSendStatus(prev, status));
       const notice = sendFailureNoticeText(status);
-      if (notice) showSendNotice(notice, needsRestreamSendLogin(status));
+      if (notice) showSendNotice(notice, needsRestreamSendLogin(status), status.clientId);
     });
     // v0.1.88 (voice 4504): RECONNECT-SUCCESS SWEEP.
     //
@@ -768,8 +774,8 @@ export function App(): React.ReactElement {
     };
     setMessages((prev) => pushOptimisticMessage(prev, optimistic, MAX_MESSAGES));
     // Start the timer only after the placeholder exists locally. If the main
-    // process drops a preflight send without emitting `failed`, this callback
-    // is the UX backstop that flips the message to a red warning after 15s.
+    // process never acknowledges this enqueue, this callback is the UX
+    // backstop that flips it to a warning after 30s. An acknowledged queue owns its result.
     scheduleOptimisticSendTimeout(clientId);
     dispatchEnqueueChatSend(text, clientId);
   };
@@ -779,8 +785,8 @@ export function App(): React.ReactElement {
   // "failed — tap to retry" affordance. Clicking it re-runs the WHOLE loop:
   // we re-enqueue with the SAME clientId (== the placeholder id == the Restream
   // clientReplyUuid) so (a) the existing placeholder is reused in-place rather
-  // than spawning a duplicate row, and (b) Restream dedupes on the uuid if the
-  // original send had somehow reached it. We flip the placeholder straight back
+  // than spawning a duplicate row, and (b) the fan-out reuses retained confirmed
+  // destinations instead of assuming Restream dedupes that UUID. We flip it back
   // to 'sending' and re-arm the optimistic-send timeout so the retry has the
   // same stuck-send safety net as a fresh send.
   const handleRetrySend = (message: ChatMessage): void => {

@@ -48,6 +48,44 @@ describe('intendedTargets', () => {
 });
 
 describe('createChatSendFanout', () => {
+  it('does not repost a completed message when a late manual retry reuses its client ID', async () => {
+    const sendRestream = vi.fn(async () => ({ ok: true }));
+    const sendDirect = vi.fn(async () => ({ ok: true }));
+    const fanout = createChatSendFanout({
+      getRestreamConnections: () => [restream('youtube')],
+      getDirectConnections: () => [direct('twitch'), direct('kick')],
+      sendRestream, sendDirect,
+    });
+    const item = { clientId: 'same-message', text: 'hello' };
+    expect(await fanout.send(item)).toMatchObject({ ok: true });
+    expect(await fanout.send(item)).toMatchObject({ ok: true });
+    expect(sendRestream).toHaveBeenCalledOnce();
+    expect(sendDirect).toHaveBeenCalledTimes(2);
+    expect(await fanout.send({ ...item, clientId: 'new-message' })).toMatchObject({ ok: true });
+    expect(sendRestream).toHaveBeenCalledTimes(2);
+    expect(sendDirect).toHaveBeenCalledTimes(4);
+  });
+
+  it('bounds retained completion evidence to the existing 500-message cache', async () => {
+    const sendRestream = vi.fn(async () => ({ ok: true }));
+    const fanout = createChatSendFanout({ getRestreamConnections: () => [restream('youtube')], getDirectConnections: () => [], sendRestream, sendDirect: async () => ({ ok: true }) });
+    for (let index = 0; index < 501; index++) await fanout.send({ clientId: `message-${index}`, text: 'hello' });
+    await fanout.send({ clientId: 'message-500', text: 'hello' });
+    expect(sendRestream).toHaveBeenCalledTimes(501);
+    await fanout.send({ clientId: 'message-0', text: 'hello' });
+    expect(sendRestream).toHaveBeenCalledTimes(502);
+  });
+
+  it('does not let completed messages evict partial-delivery progress', async () => {
+    const sendRestream = vi.fn(async () => ({ ok: true }));
+    const sendDirect = vi.fn(async (): Promise<DirectChatSendResult> => ({ ok: true })).mockResolvedValueOnce({ ok: false, error: 'temporary failure' });
+    const fanout = createChatSendFanout({ getRestreamConnections: () => [restream('youtube')], getDirectConnections: () => [direct('kick')], sendRestream, sendDirect });
+    const partial = { clientId: 'partial-delivery', text: 'hello' };
+    expect(await fanout.send(partial)).toMatchObject({ ok: false });
+    for (let index = 0; index < 501; index++) await fanout.send({ clientId: `completed-${index}`, text: 'hello' });
+    expect(await fanout.send(partial)).toMatchObject({ ok: true });
+    expect(sendRestream).toHaveBeenCalledTimes(502);
+  });
   it('retains the provider rejection code in the aggregate failure', async () => {
     const fanout = createChatSendFanout({ getRestreamConnections: () => [], getDirectConnections: () => [direct('twitch')],
       sendRestream: async () => ({ ok: true }),

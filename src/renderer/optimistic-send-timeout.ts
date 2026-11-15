@@ -9,6 +9,8 @@ import { SEND_TIMEOUT_TOOLTIP_TEXT } from './send-failure-copy';
  * should make `sendChatText` either POST successfully or emit an explicit
  * `failed` status. This timeout exists because a future silent-bail bug must
  * never leave the renderer showing `pendingSend: "sending"` forever.
+ * The actual App cancels this guard when the queue acknowledges ownership;
+ * queued work and its five automatic attempts must not be mistaken for failure.
  *
  * v0.1.68 (voice 4013): bumped from 15s → 30s. The 15s value was tight
  * enough that genuinely-slow-but-fine sends (REST hydration after a

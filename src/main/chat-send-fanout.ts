@@ -34,9 +34,13 @@ export function createChatSendFanout({
   ) => Promise<DirectChatSendResult>;
 }): ChatSendFanout {
   const sends = new Map<string, FrozenSend>();
+  const completed = new Map<string, ChatSendDestinationResult[]>(); // Late retry clicks must not repost a confirmed send; keep completion evidence separate so it cannot evict partial-delivery progress.
+  const maxRememberedSends = 500;
 
   return {
     async send(item): Promise<SendTextResult> {
+      const previousSuccess = completed.get(item.clientId);
+      if (previousSuccess) return { ok: true, destinations: previousSuccess };
       let frozen = sends.get(item.clientId);
       if (!frozen) {
         const targets = intendedTargets(
@@ -46,7 +50,7 @@ export function createChatSendFanout({
         if (targets.length === 0) {
           return { ok: false, reason: 'no-active-connections' };
         }
-        if (sends.size >= 500) {
+        if (sends.size >= maxRememberedSends) {
           const oldest = sends.keys().next().value;
           if (oldest !== undefined) sends.delete(oldest); // Failed messages retain progress for manual retry; cap that evidence so a long session cannot grow forever.
         }
@@ -87,6 +91,11 @@ export function createChatSendFanout({
       const failed = results.filter((result) => !result.ok);
       if (failed.length === 0) {
         sends.delete(item.clientId);
+        if (completed.size >= maxRememberedSends) {
+          const oldest = completed.keys().next().value;
+          if (oldest !== undefined) completed.delete(oldest);
+        }
+        completed.set(item.clientId, results); // Restream did repost identical client UUIDs on 15 November; confirmed-success dedupe must happen here rather than relying on its server.
         return { ok: true, destinations: results };
       }
       const sent = results.filter((result) => result.ok);
