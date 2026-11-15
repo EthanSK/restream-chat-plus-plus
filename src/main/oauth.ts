@@ -68,6 +68,9 @@ const SAFE_STORAGE_DECRYPT_TIMEOUT_MS = 30_000;
 
 export class OAuthCoordinator {
   private server?: http.Server;
+  private authenticationPromise?: Promise<TokenSet>;
+  private authenticationWindow?: BrowserWindow;
+  private rejectAuthenticationCode?: (error: Error) => void;
   /**
    * Lazy decrypt cache. Set on the first successful decrypt (or after a
    * fresh authenticate / refresh). All subsequent `getToken()` callers hit
@@ -448,7 +451,19 @@ export class OAuthCoordinator {
    * 4. POST to TOKEN_URL with client_id/secret/code to exchange for a token set.
    * 5. Persist token in electron-store and close the BrowserWindow.
    */
-  async authenticate(): Promise<TokenSet> {
+  authenticate(): Promise<TokenSet> {
+    if (this.authenticationPromise) {
+      const window = this.authenticationWindow;
+      if (window && !window.isDestroyed()) window.focus(); // Repeated sign-in clicks must reuse the existing callback listener instead of failing with EADDRINUSE.
+      return this.authenticationPromise;
+    }
+    this.authenticationPromise = this.authenticateInner().finally(() => {
+      this.authenticationPromise = undefined;
+    });
+    return this.authenticationPromise;
+  }
+
+  private async authenticateInner(): Promise<TokenSet> {
     const creds = loadRestreamCreds();
     if (!creds) {
       throw new Error(
@@ -519,6 +534,11 @@ export class OAuthCoordinator {
         session: oauthSession,
       },
     });
+    this.authenticationWindow = win;
+    const rejectCode = this.rejectAuthenticationCode; // A delayed close from this window must never cancel a later login's callback.
+    win.once('closed', () => {
+      rejectCode?.(new Error('Restream sign-in cancelled.')); // Closing a login window must settle its request and release the port before another login starts.
+    });
 
     // Scope guard — capture this window's webContents id at handler install
     // time so the closure can reject requests from any other webContents that
@@ -561,13 +581,16 @@ export class OAuthCoordinator {
       .getUserAgent()
       .replace(/\s?(Electron|restream-chat-plus-plus)\/\S+/g, '');
 
-    win.loadURL(authUrl.toString(), { userAgent: cleanUa });
+    void win.loadURL(authUrl.toString(), { userAgent: cleanUa }).catch((error: unknown) => {
+      appendErrorLog({ subsystem: 'oauth', phase: 'oauth.login-load-failed', errorMessage: errorToString(error) }); // Keep a failed navigation available for Reload or cancellation without an unhandled rejection.
+    });
 
     let code: string;
     try {
       code = await codePromise;
     } finally {
       this.stopListener();
+      this.authenticationWindow = undefined;
       if (!win.isDestroyed()) win.close();
     }
 
@@ -871,6 +894,7 @@ export class OAuthCoordinator {
 
   private listenForCode(): Promise<string> {
     return new Promise((resolve, reject) => {
+      this.rejectAuthenticationCode = reject;
       const server = http.createServer((req, res) => {
         if (!req.url) return;
         const url = new URL(req.url, REDIRECT_URI);
@@ -906,6 +930,7 @@ export class OAuthCoordinator {
   }
 
   private stopListener() {
+    this.rejectAuthenticationCode = undefined;
     try {
       this.server?.close();
     } catch {

@@ -5,6 +5,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { IPC, type AuthStatus } from '../shared/types';
 import type { TokenSet } from '../main/oauth';
+import type { ChatSendQueueOptions } from '../main/chat-send-queue';
 
 /** Execute the real main-process recovery closures with fake account and transport dependencies. */
 function recoveryWiring() {
@@ -122,5 +123,73 @@ describe('main-process auth recovery publication', () => {
     expect(await ctx.viewer()).toBeUndefined();
     expect(ctx.refresh).toHaveBeenCalledOnce();
     expect(ctx.chat.reconnect).not.toHaveBeenCalled();
+  });
+});
+
+/** Run the production send-retry callback without opening account or transport connections. */
+function sendRetryWiring() {
+  const source = readFileSync(new URL('../main/main.ts', import.meta.url), 'utf8');
+  const tree = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
+  let callbackSource: string | undefined;
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'sendQueue' && node.initializer && ts.isCallExpression(node.initializer)) {
+      const options = node.initializer.arguments[0];
+      if (options && ts.isObjectLiteralExpression(options)) {
+        const property = options.properties.find((entry) => ts.isPropertyAssignment(entry) && entry.name.getText(tree) === 'reconnectBetweenRetries');
+        if (property && ts.isPropertyAssignment(property)) callbackSource = property.initializer.getText(tree);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(tree);
+  assert(callbackSource);
+  let retry: NonNullable<ChatSendQueueOptions['reconnectBetweenRetries']> | undefined;
+  const reconnect = vi.fn(async () => ({ ok: true }));
+  runInNewContext(ts.transpile(`capture(${callbackSource});`, { target: ts.ScriptTarget.ES2022 }), {
+    performFullReconnect: reconnect,
+    capture: (callback: NonNullable<ChatSendQueueOptions['reconnectBetweenRetries']>) => { retry = callback; },
+  });
+  assert(retry);
+  return { retry, reconnect };
+}
+
+describe('send-retry connection ownership', () => {
+  it('keeps healthy receiving chat open when only the website sending credential is missing', async () => {
+    const ctx = sendRetryWiring();
+    await ctx.retry('send-retry', {
+      ok: false,
+      reason: 'destination-send-failed',
+      destinations: [
+        { destination: 'restream', ok: false, reason: 'no-session-cookies' },
+        { destination: 'twitch', ok: true },
+      ],
+    });
+    expect(ctx.reconnect).not.toHaveBeenCalled();
+  });
+
+  it('keeps the same isolation for a direct missing-cookie result', async () => {
+    const ctx = sendRetryWiring();
+    await ctx.retry('send-retry', { ok: false, reason: 'no-session-cookies' });
+    expect(ctx.reconnect).not.toHaveBeenCalled();
+  });
+
+  it('still reconnects Restream after an actual Restream transport failure', async () => {
+    const ctx = sendRetryWiring();
+    await ctx.retry('send-retry', {
+      ok: false,
+      reason: 'destination-send-failed',
+      destinations: [{ destination: 'restream', ok: false, reason: 'send-failed', status: 503 }],
+    });
+    expect(ctx.reconnect).toHaveBeenCalledOnce();
+  });
+
+  it('continues to isolate failed direct destinations', async () => {
+    const ctx = sendRetryWiring();
+    await ctx.retry('send-retry', {
+      ok: false,
+      reason: 'destination-send-failed',
+      destinations: [{ destination: 'kick', ok: false, status: 503 }],
+    });
+    expect(ctx.reconnect).not.toHaveBeenCalled();
   });
 });

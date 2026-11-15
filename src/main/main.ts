@@ -2290,9 +2290,10 @@ app.on('ready', async () => {
     // re-POSTing a transiently-failed send. We reuse `performFullReconnect`
     // verbatim — the SAME managed reconnect the manual Reconnect button and
     // the v0.1.86/87 recoveries use: OAuth refresh → chat.reconnect() →
-    // re-subscribe → chat-context re-sniff → cookie re-provision. So by the
+    // re-subscribe → chat-context re-sniff. Sending website cookies are repaired
+    // separately by sendChatText's existing headless provisioner. So by the
     // time the next POST fires, the exact things that caused the transient
-    // failure (lapsed token / drained connections / lost cookies / un-sniffed
+    // failure (lapsed token / drained connections / un-sniffed
     // showId) have been refreshed. We don't gate the retry on its success;
     // `performFullReconnect` already returns `{ ok }` so the loop just logs it.
     reconnectBetweenRetries: async (reason, result) => {
@@ -2300,6 +2301,14 @@ app.on('ready', async () => {
       // retries must not churn the healthy Restream socket; reconnect it only
       // when Restream itself is one of the failed destinations.
       void reason;
+      if (
+        result.reason === 'no-session-cookies' ||
+        result.destinations?.some((destination) =>
+          destination.destination === 'restream' && !destination.ok && destination.reason === 'no-session-cookies',
+        )
+      ) {
+        return { ok: true }; // A missing website credential cannot be repaired by reconnecting receiving OAuth; retries already recheck the sending login.
+      }
       if (
         result.destinations &&
         !result.destinations.some(

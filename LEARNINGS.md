@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-11-15
+**Trigger:** RC++ stopped sending while receiving chat still showed Connected.
+**Symptom:** Restream sends failed with `no-session-cookies` despite persistent refresh cookies. Automatic retries repeatedly disconnected the healthy receiving socket and temporarily produced `no-active-connections`. A separate abandoned or overlapping OAuth sign-in produced `EADDRINUSE` on callback port 8765.
+**Root cause:** Website sending needs `accessXsrfToken`, independently of receiving OAuth. The retry callback treated missing website credentials as a receiving transport failure. OAuth authentication also created a listener for every call and did not settle its code request when the login window closed.
+**Fix:** Keep receiving chat open for missing sending cookies and reuse the existing sending-cookie provisioner and repair action. Preserve the five-attempt limit and frozen successful destinations. Share one OAuth login operation, focus its existing window on repeat requests, and release its listener on close or listener failure. Bind cancellation to that operation so an older window cannot cancel a later login. Log failed OAuth navigation without an unhandled rejection or an extra login deadline.
+**Guard:** Actual main-process retry-closure regressions and fake-window/listener tests failed before the fixes. Focused auth, persistence, fan-out and retry tests passed afterward. Live repair refreshed the website sending credential and three original client IDs each received successful delivery and matching Restream echoes without restarting the process or repeating already-confirmed destinations. Cookie metadata alone is not proof of a working sender; never print cookie values, erase all auth, or restart before retrying partially delivered messages. Provider revocation and future expiry remain external possibilities.
+---
+
+---
 **Date:** 2026-10-17T21:03:49Z
 **Trigger:** Keep generated build app copies out of Spotlight for existing and future builds.
 **Symptom:** Generated app bundles can appear alongside installed apps in macOS search.
