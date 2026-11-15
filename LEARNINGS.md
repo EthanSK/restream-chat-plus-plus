@@ -1,5 +1,10 @@
 # Learnings
 
+## Release runner compatibility — 15 November 2026
+
+GitHub retired macos-14 on 2 November 2026: the release job is cancelled before checkout with unsupported macos-14-arm64-us-default. Use the supported macos-15 arm64 successor. The moving ubuntu-latest selected Ubuntu 26.04, where the current Electron RPM maker failed in %install because rpmbuild changed into a new build subdirectory and could not find usr/*. Pin the existing Linux packaging job to Ubuntu 24.04 instead of changing application packaging or disabling RPM output. Electron 42 requires Node >=22.12, so use Node 22 for release packaging. Verify actual CI package jobs, not only lint/tests; changing these build hosts does not require reinstalling the unchanged local app. Evidence: release run 43721736510.
+
+
 Per-repo institutional memory for fixes. Every entry below is a real bug we hit + how we solved it. Check this file BEFORE attempting a same-looking fix.
 
 Maintained by the `learnings` skill — see `~/.claude/skills/learnings/skill.md`.
