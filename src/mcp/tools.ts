@@ -422,9 +422,8 @@ const getVoices: ToolDefinition = {
 const listRecentMessages: ToolDefinition = {
   name: 'list_recent_messages',
   description:
-    'List the most recent chat messages. Currently requires the running ' +
-    'GUI to introspect (messages are buffered in the renderer; we do not ' +
-    'persist them to disk). Returns a not-introspectable note.',
+    'Chat scrollback is available in the app. The MCP server does not ' +
+    'expose chat messages. Returns a not-introspectable note.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -437,21 +436,10 @@ const listRecentMessages: ToolDefinition = {
     },
     additionalProperties: false,
   },
-  handler: async (_args, _ctx) => {
-    // The recent-message buffer is purely a renderer artefact (we never
-    // persist it). Even with the in-process HTTP MCP transport in
-    // v0.1.36 we don't pipe the renderer buffer through to the main
-    // process yet, so this still returns the hint payload. A future
-    // change can wire `webContents.executeJavaScript()` to read the
-    // ChatFeed state.
-    return {
-      messages: null,
-      hint:
-        'Recent-message buffer lives in the renderer and is not exposed ' +
-        'to the MCP process. A future loopback IPC channel can surface ' +
-        'this when implemented.',
-    };
-  },
+  handler: async () => ({
+    messages: null,
+    hint: 'Use Load older messages at the top of the chat feed in the app.',
+  }),
 };
 
 // ---------------------------------------------------------------------------
@@ -778,7 +766,7 @@ const setAutoUpdateCheck: ToolDefinition = {
 const clearChat: ToolDefinition = {
   name: 'clear_chat',
   description:
-    'Clear the local message buffer (the chat feed in the running GUI). ' +
+    'Clear the local chat feed and saved scrollback. ' +
     'When the in-process HTTP MCP is the host (v0.1.36+), this triggers ' +
     'the same Cmd+K path the menu item uses. Outside the running app, ' +
     'returns a clear hint payload.',

@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatSendStatus } from '../shared/types';
+import { MAX_CHAT_MESSAGES, type ChatMessage, type ChatSendStatus } from '../shared/types';
 import { formatSendFailureTooltip } from './send-failure-copy';
 
 /**
@@ -8,7 +8,7 @@ import { formatSendFailureTooltip } from './send-failure-copy';
  * drive the renderer's chat feed:
  *
  *   1. `pushOptimisticMessage`  — the user just hit Enter; mint the
- *      placeholder and append (capping at MAX_MESSAGES).
+ *      placeholder and append (capping at MAX_CHAT_MESSAGES).
  *   2. `dedupeOptimisticOnEcho` — a WS `reply_created` arrived. If a
  *      placeholder with the matching `id` is in the feed, replace it
  *      with the echo; otherwise just append.
@@ -22,8 +22,6 @@ import { formatSendFailureTooltip } from './send-failure-copy';
  * just describe how new state is computed.
  */
 
-const MAX_MESSAGES_DEFAULT = 1000;
-
 /**
  * Append an optimistic placeholder to `prev`. Caps the buffer at
  * `maxMessages` (defaults to the same 1000 App.tsx uses).
@@ -31,7 +29,7 @@ const MAX_MESSAGES_DEFAULT = 1000;
 export function pushOptimisticMessage(
   prev: ChatMessage[],
   placeholder: ChatMessage,
-  maxMessages = MAX_MESSAGES_DEFAULT,
+  maxMessages = MAX_CHAT_MESSAGES,
 ): ChatMessage[] {
   const next = [...prev, placeholder];
   if (next.length > maxMessages) next.splice(0, next.length - maxMessages);
@@ -51,7 +49,7 @@ export function pushOptimisticMessage(
 export function dedupeOptimisticOnEcho(
   prev: ChatMessage[],
   incoming: ChatMessage,
-  maxMessages = MAX_MESSAGES_DEFAULT,
+  maxMessages = MAX_CHAT_MESSAGES,
 ): ChatMessage[] {
   const dupIdx = prev.findIndex(
     (m) => m.id === incoming.id && m.pendingSend !== undefined,

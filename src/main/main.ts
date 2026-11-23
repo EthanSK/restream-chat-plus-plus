@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import started from 'electron-squirrel-startup';
 import { OAuthCoordinator } from './oauth';
 import { ChatClient } from './ws-client';
+import { ChatHistory } from './chat-history';
 import { createStore } from './store';
 import {
   sendChatText,
@@ -602,7 +603,7 @@ export function openSettingsFromMenu(win: BrowserWindow | null): void {
   }
 }
 
-function buildMenu(onRevealLogs: () => void) {
+function buildMenu(onRevealLogs: () => void, clearChat: () => void) {
   const isMac = process.platform === 'darwin';
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
@@ -699,7 +700,7 @@ function buildMenu(onRevealLogs: () => void) {
         {
           label: 'Clear Chat',
           accelerator: 'CmdOrCtrl+K',
-          click: () => broadcastChatClear(mainWindow),
+          click: clearChat,
         },
       ],
     },
@@ -766,6 +767,36 @@ app.on('ready', async () => {
   const oauth = new OAuthCoordinator(store);
   const chat = new ChatClient();
   const directChat = new DirectChatSources(store);
+  let chatHistory: ChatHistory | undefined;
+  try {
+    chatHistory = new ChatHistory(path.join(app.getPath('userData'), 'chat-history.sqlite'));
+  } catch (error) {
+    console.error('[main] Could not open local chat history', error);
+  }
+  let chatClearGeneration = 0;
+  const clearChat = (): void => {
+    chatClearGeneration += 1;
+    try {
+      chatHistory?.clear();
+    } catch (error) {
+      console.error('[main] Could not clear local chat history', error);
+    }
+    broadcastChatClear(mainWindow);
+  };
+  const saveChatHistory = (message: ChatMessage): number | undefined => {
+    try {
+      return chatHistory?.add(message);
+    } catch (error) {
+      console.error('[main] Could not save local chat history', error);
+      return undefined;
+    }
+  };
+  ipcMain.handle(IPC.CHAT_LOAD_OLDER, (_event, before?: number) => {
+    if (!chatHistory || (before !== undefined && (!Number.isSafeInteger(before) || before < 1))) {
+      throw new Error('Chat history unavailable');
+    }
+    return chatHistory.loadOlder(before);
+  });
   const crossSourceDeduper = new CrossSourceDeduper();
   const ownOutgoingClientIds = new Set<string>();
   // v0.1.94 — LIVE VIEWER COUNT. Second, independent WebSocket client for
@@ -806,7 +837,7 @@ app.on('ready', async () => {
   // future WebAuthn path (security key, cross-device passkey, etc.) and
   // don't depend on platform-authenticator support.
 
-  buildMenu(() => revealLogsInFinder(chat.getRawLogPath()));
+  buildMenu(() => revealLogsInFinder(chat.getRawLogPath()), clearChat);
   await createMainWindow();
 
   /**
@@ -1501,6 +1532,7 @@ app.on('ready', async () => {
     // disappears rather than freezing at the last pre-signout value).
     viewerStats.stop();
     await oauth.logout();
+    clearChat();
     const status: AuthStatus = { authenticated: false };
     mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
     return status;
@@ -2272,7 +2304,23 @@ app.on('ready', async () => {
     },
   });
   const sendQueue: ChatSendQueue = createChatSendQueue({
-    runSend: (item) => sendFanout.send(item),
+    runSend: async (item) => {
+      const clearGeneration = chatClearGeneration;
+      const result = await sendFanout.send(item);
+      if (result.ok && clearGeneration === chatClearGeneration) {
+        // Own echoes are suppressed below. The queue's confirmed result is
+        // what turns the optimistic row into a sent message.
+        saveChatHistory({
+          id: item.clientId,
+          username: 'You',
+          text: item.text,
+          ts: Date.now(),
+          platform: 'unknown',
+          self: true,
+        });
+      }
+      return result;
+    },
     emitStatus: emitSendStatus,
     // Keep the 1 msg/sec spacing the v0.1.42 IPC gate enforced. This
     // protects against Restream's own throttle on rapid spam.
@@ -2454,7 +2502,7 @@ app.on('ready', async () => {
         {
           label: 'Clear Chat',
           accelerator: 'CmdOrCtrl+K',
-          click: () => broadcastChatClear(mainWindow),
+          click: clearChat,
         },
       ]);
       menu.popup({ window: mainWindow });
@@ -2485,7 +2533,8 @@ app.on('ready', async () => {
       return;
     }
     if (!crossSourceDeduper.shouldEmit(message)) return;
-    mainWindow?.webContents.send(IPC.CHAT_MESSAGE, message);
+    const historySequence = saveChatHistory(message);
+    mainWindow?.webContents.send(IPC.CHAT_MESSAGE, { ...message, historySequence });
     ttsDispatcher.handleMessage(message);
   };
   chat.on('message', (message) =>
@@ -2526,6 +2575,7 @@ app.on('ready', async () => {
       loadSettings,
       saveSettings,
       getMainWindow: () => mainWindow,
+      clearChat,
       chat,
       oauth,
       checkForUpdatesNow: () => performUpdateCheck(true),

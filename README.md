@@ -9,6 +9,8 @@ A native, cross-platform replacement for the official [Restream Chat](https://re
 
 A free, open-source desktop client that renders multi-platform chat (Twitch, YouTube, Facebook, Kick, Trovo, Rumble, TikTok, X) in a single virtualised feed. Restream supplies the combined feed, while optional direct Twitch and Kick connections keep those chats visible even when the channels are not enabled as Restream destinations. TTS, notifications, per-platform filters, automatic reconnect — all native.
 
+After a reload or restart, choose **Load older messages** at the top of the chat feed. The app keeps the latest 1,000 messages locally, starting when this version receives chat. **Clear Chat** also deletes the saved history.
+
 The app ships as a signed, notarized macOS bundle (arm64 + x64), a Squirrel installer for Windows x64, and `.deb` / `.rpm` packages for Linux x64. Auto-update is wired through Electron's public update service backed by GitHub Releases.
 
 ## Why

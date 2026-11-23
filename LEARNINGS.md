@@ -1,5 +1,16 @@
 # Learnings
 
+## Chat scrollback after reload — 23 November 2026
+
+The live feed was renderer-only, so a reload emptied it. Restream's event
+history covers only a specific Restream event, and the direct Twitch and Kick
+APIs have no scrollback. Save normalized live rows after cross-source
+deduplication and confirmed local sends in a bounded local archive. Fetch pages
+over a separate IPC channel to avoid replaying TTS and notifications. Page by
+local arrival sequence so a new live message or a provider clock difference
+cannot shift page boundaries. Clear the archive and invalidate any in-flight
+page on the same paths that implement Clear Chat.
+
 ## X replies labeled Unknown — 23 November 2026
 
 Restream sent an incoming reply with `eventTypeId: 38`, X's documented

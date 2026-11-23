@@ -9,6 +9,7 @@ import {
   DirectChatConnection,
   DirectChatProvider,
   DEFAULT_SETTINGS,
+  MAX_CHAT_MESSAGES,
   NativeVoiceWire,
   Platform,
   Settings,
@@ -45,6 +46,7 @@ import type { ViewerStatsSnapshot } from '../shared/viewer-stats-core';
 // used by SettingsDrawer directly).
 import { shouldProceedWithSignOut } from './auth-guards';
 import { clearChatMessages } from './chat-actions';
+import { useChatHistory } from './useChatHistory';
 import {
   addHiddenUser,
   addSilencedUserToBothFilters,
@@ -75,8 +77,6 @@ import {
 } from './optimistic-send-timeout';
 import { needsRestreamSendLogin, sendFailureNoticeText } from './send-failure-copy';
 
-const MAX_MESSAGES = 1000;
-
 interface SendNotice {
   id: number;
   text: string;
@@ -86,6 +86,7 @@ interface SendNotice {
 
 export function App(): React.ReactElement {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const { history, loadOlderMessages, resetHistory } = useChatHistory();
   const [auth, setAuth] = useState<AuthStatus>({ authenticated: false });
   // v0.1.71 cold-start flicker fix (voice 4198, 2026-05-26).
   //
@@ -171,7 +172,7 @@ export function App(): React.ReactElement {
   // Hard cap so the HTTP-200 set can't grow without bound across a marathon
   // stream. Old entries are the oldest-resolved sends; if we ever exceed this
   // we drop the oldest-inserted ids (Set preserves insertion order). 2000 is
-  // ~2x the MAX_MESSAGES feed cap so a fully-failed-then-recovered feed is
+  // ~2x the MAX_CHAT_MESSAGES feed cap so a fully-failed-then-recovered feed is
   // still fully covered.
   const HTTP_OK_SENDS_MAX = 2000;
   const sendNoticeSeqRef = useRef(0);
@@ -539,7 +540,7 @@ export function App(): React.ReactElement {
       let wasLateEchoForFailed = false;
       setMessages((prev) => {
         wasLateEchoForFailed = isLateEchoForFailedSend(prev, flagged);
-        return dedupeOptimisticOnEcho(prev, flagged, MAX_MESSAGES);
+        return dedupeOptimisticOnEcho(prev, flagged);
       });
       if (wasLateEchoForFailed) {
         logLateEchoResolved(flagged.id);
@@ -674,6 +675,7 @@ export function App(): React.ReactElement {
       // fire later and resurrect a confusing send-failed banner.
       clearAllOptimisticSendTimeouts('clear-chat');
       setMessages((prev) => clearChatMessages(prev));
+      resetHistory();
     });
     // Live update-check broadcasts — fires when the GH poller completes a
     // check (hourly + once at startup), on every explicit "Check Now",
@@ -772,7 +774,7 @@ export function App(): React.ReactElement {
       self: true,
       pendingSend: 'sending',
     };
-    setMessages((prev) => pushOptimisticMessage(prev, optimistic, MAX_MESSAGES));
+    setMessages((prev) => pushOptimisticMessage(prev, optimistic));
     // Start the timer only after the placeholder exists locally. If the main
     // process never acknowledges this enqueue, this callback is the UX
     // backstop that flips it to a warning after 30s. An acknowledged queue owns its result.
@@ -846,15 +848,44 @@ export function App(): React.ReactElement {
   // Hide on a row (NOT just for future arrivals). The Set is rebuilt
   // only when settings.hiddenUsers changes (see `hiddenUsersSet` useMemo
   // above), so the per-row check is O(1).
-  const visibleMessages = useMemo(
-    () =>
-      messages.filter(
-        (m) =>
-          settings.filter.platforms[m.platform] !== false &&
-          !isHiddenUser(m.username, hiddenUsersSet),
-      ),
-    [messages, settings.filter.platforms, hiddenUsersSet],
-  );
+  const { visibleMessages, visibleHistoryCount } = useMemo(() => {
+    const isVisible = (message: ChatMessage) =>
+      settings.filter.platforms[message.platform] !== false &&
+      !isHiddenUser(message.username, hiddenUsersSet);
+    const visibleLive = messages.filter(isVisible);
+    if (history.messages.length === 0 || messages.length >= MAX_CHAT_MESSAGES) {
+      return { visibleMessages: visibleLive, visibleHistoryCount: 0 };
+    }
+    const liveIds = new Set(messages.map((message) => message.id));
+    const visibleHistory = history.messages
+      .filter((message) => !liveIds.has(message.id))
+      .slice(-(MAX_CHAT_MESSAGES - messages.length))
+      .filter(isVisible)
+      .map((message) => ({
+        ...message,
+        ...applyMessageFilters(
+          message.text,
+          ttsIgnoreCompiled,
+          notifIgnoreCompiled,
+          message.username,
+          ttsUsernameIgnoreCompiled,
+          notifUsernameIgnoreCompiled,
+        ),
+      }));
+    return {
+      visibleMessages: [...visibleHistory, ...visibleLive],
+      visibleHistoryCount: visibleHistory.length,
+    };
+  }, [
+    messages,
+    history.messages,
+    settings.filter.platforms,
+    hiddenUsersSet,
+    ttsIgnoreCompiled,
+    notifIgnoreCompiled,
+    ttsUsernameIgnoreCompiled,
+    notifUsernameIgnoreCompiled,
+  ]);
 
   // v0.1.91 (task: "silence user" button) — handler for the per-row
   // "Silence user" hover button. RENAMED + REWIRED from the old
@@ -1037,6 +1068,7 @@ export function App(): React.ReactElement {
     applyAuthStatus(s);
     clearAllOptimisticSendTimeouts('sign-out');
     setMessages([]);
+    resetHistory();
   };
 
   const onReconnect = async () => {
@@ -1360,6 +1392,14 @@ export function App(): React.ReactElement {
       />
       <ChatFeed
         messages={visibleMessages}
+        firstItemIndex={MAX_CHAT_MESSAGES + 1 - visibleHistoryCount}
+        historyControls={{
+          status: messages.length >= MAX_CHAT_MESSAGES ? 'exhausted' : history.status,
+          loadOlder: () => {
+            const oldestSavedLiveMessage = messages.find((message) => message.historySequence !== undefined);
+            void loadOlderMessages(oldestSavedLiveMessage?.historySequence);
+          },
+        }}
         authenticated={
           auth.authenticated ||
           directConnections.some((connection) => connection.status === 'connected')

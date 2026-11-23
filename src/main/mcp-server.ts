@@ -47,6 +47,7 @@ export interface McpServerDeps {
   saveSettings: (next: Settings) => Settings;
   /** Main BrowserWindow — used to push settings updates to the renderer. */
   getMainWindow: () => BrowserWindow | null;
+  clearChat: () => void;
   /** WS chat client — exposes connection state + per-platform list. */
   chat: ChatClient;
   /** OAuth coordinator — used by `sign_out` to clear the in-memory token. */
@@ -123,6 +124,7 @@ export async function startInProcessMcpServer(
       }
       // Push refreshed auth status so the renderer flips to the
       // sign-in screen without a restart.
+      deps.clearChat();
       try {
         const win = deps.getMainWindow();
         win?.webContents.send(IPC.AUTH_STATUS, { authenticated: false });
@@ -147,14 +149,7 @@ export async function startInProcessMcpServer(
       // lives there); leave null until a future loopback IPC ships.
       voices: null,
     }),
-    clearChat: () => {
-      try {
-        const win = deps.getMainWindow();
-        win?.webContents.send(IPC.CHAT_CLEAR);
-      } catch (err) {
-        console.error('[mcp] CHAT_CLEAR push failed', err);
-      }
-    },
+    clearChat: deps.clearChat,
     checkForUpdatesNow: () => deps.checkForUpdatesNow(),
     triggerUpdateDownload: () => triggerSquirrelDownload(),
     // v0.1.64 — expose Squirrel's coarse download-state machine + the

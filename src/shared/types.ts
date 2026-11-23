@@ -60,6 +60,8 @@ export interface ChatMessage {
   color?: string;
   /** Identifies the transport so the main process can drop only cross-source duplicates. */
   source?: 'restream' | 'twitch-direct' | 'kick-direct';
+  /** Local receive order, used to page back from the oldest live row. */
+  historySequence?: number;
   raw?: unknown;
   /**
    * True when the message was originated by the local user — produced by
@@ -142,6 +144,13 @@ export interface ChatMessage {
    */
   sendMaxAttempts?: number;
 }
+
+export interface ChatHistoryPage {
+  messages: ChatMessage[];
+  nextBefore?: number;
+}
+
+export const MAX_CHAT_MESSAGES = 1_000;
 
 /**
  * One connected event source as reported by Restream's WS `connection_info`
@@ -530,6 +539,7 @@ export const IPC = {
    */
   CONN_RECONNECT_SUCCEEDED: 'conn:reconnect-succeeded',
   CHAT_MESSAGE: 'chat:message',
+  CHAT_LOAD_OLDER: 'chat:load-older',
   /**
    * Push channel — main → renderer — fires whenever the in-memory map of
    * Restream `connection_info` entries changes (new connect, status flip,
@@ -643,10 +653,8 @@ export const IPC = {
    */
   CHAT_SHOW_CONTEXT_MENU: 'chat:show-context-menu',
   /**
-   * Main → renderer broadcast: clear the chat-message buffer (renderer state
-   * only — this never touches the WebSocket or Restream-side state). Fired
-   * by either the chat context-menu "Clear chat" item or the application
-   * menu's "Clear chat" item (Cmd+K). v0.1.18.
+   * Main → renderer broadcast after the local archive is cleared. The
+   * renderer clears the visible feed too. Provider chat is unaffected.
    */
   CHAT_CLEAR: 'chat:clear',
   /**

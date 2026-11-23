@@ -3,6 +3,7 @@ import { IPC } from './shared/types';
 import type {
   AuthStatus,
   ChatConnection,
+  ChatHistoryPage,
   ChatMessage,
   ChatSendEnqueuePayload,
   ChatSendStatus,
@@ -69,6 +70,8 @@ const api = {
     ipcRenderer.on(IPC.CHAT_MESSAGE, h);
     return () => ipcRenderer.removeListener(IPC.CHAT_MESSAGE, h);
   },
+  loadOlderChatMessages: (before?: number): Promise<ChatHistoryPage> =>
+    ipcRenderer.invoke(IPC.CHAT_LOAD_OLDER, before),
   /**
    * v0.1.88 (voice 4504, 2026-06-08) — subscribe to "a managed reconnect just
    * succeeded" pushes from main (automatic drain/unconfirmed recovery OR the

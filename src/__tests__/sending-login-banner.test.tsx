@@ -2,12 +2,15 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../renderer/App';
-import type { ChatSendEnqueuePayload, ChatSendStatus } from '../shared/types';
+import type { ChatHistoryPage, ChatMessage, ChatSendEnqueuePayload, ChatSendStatus } from '../shared/types';
 import { ChatFeed } from '../renderer/ChatFeed';
 import { ChatInputInline } from '../renderer/ChatInputInline';
 
 const api = vi.hoisted(() => ({
   onStatus: undefined as ((status: ChatSendStatus) => void) | undefined,
+  onChat: undefined as ((message: ChatMessage) => void) | undefined,
+  onClear: undefined as (() => void) | undefined,
+  loadOlderChatMessages: vi.fn<(before?: number) => Promise<ChatHistoryPage>>(),
   signInToSend: vi.fn<() => Promise<boolean>>(),
   authLogout: vi.fn(), authStart: vi.fn(), enqueueChatSend: vi.fn<(payload: ChatSendEnqueuePayload) => void>(),
 }));
@@ -20,9 +23,18 @@ vi.mock('../renderer/api', async () => {
     connectionState: async () => ({ status: 'connected' }),
     getConnections: async () => [], getUpdateStatus: async () => null,
     onAuthStatus: noopSubscription, onConnectionState: noopSubscription,
-    onConnections: noopSubscription, onChatMessage: noopSubscription,
+    onConnections: noopSubscription,
+    onChatMessage: (callback: (message: ChatMessage) => void) => {
+      api.onChat = callback;
+      return noopSubscription();
+    },
     onReconnectSucceeded: noopSubscription, onMenuOpenSettings: noopSubscription,
-    onChatClear: noopSubscription, onSettingsPush: noopSubscription,
+    onChatClear: (callback: () => void) => {
+      api.onClear = callback;
+      return noopSubscription();
+    },
+    loadOlderChatMessages: api.loadOlderChatMessages,
+    onSettingsPush: noopSubscription,
     onUpdateStatus: noopSubscription,
     onChatSendStatus: (callback: (status: ChatSendStatus) => void) => { api.onStatus = callback; return () => undefined; },
     signInToSend: api.signInToSend, authLogout: api.authLogout,
@@ -38,6 +50,57 @@ vi.mock('../renderer/ViewerCount', () => ({ ViewerCount: () => null }));
 
 let renderer: TestRenderer.ReactTestRenderer;
 afterEach(() => { act(() => renderer?.unmount()); vi.useRealTimers(); vi.clearAllMocks(); });
+
+describe('loading older chat messages', () => {
+  const row = (historySequence: number): ChatMessage => ({
+    id: String(historySequence),
+    platform: 'twitch',
+    username: 'viewer',
+    text: `Message ${historySequence}`,
+    ts: historySequence,
+    historySequence,
+  });
+  const feed = () => renderer.root.findByType(ChatFeed).props;
+
+  it('prepends older pages without moving live indices or duplicating a live arrival', async () => {
+    api.loadOlderChatMessages
+      .mockResolvedValueOnce({ messages: [row(2), row(3)], nextBefore: 2 })
+      .mockResolvedValueOnce({ messages: [row(1)] });
+    await act(async () => { renderer = TestRenderer.create(<App />); });
+    const initialIndex = feed().firstItemIndex;
+    act(() => api.onChat?.(row(3)));
+    await act(async () => feed().historyControls.loadOlder());
+    expect(api.loadOlderChatMessages).toHaveBeenNthCalledWith(1, 3);
+    expect(feed().messages.map((message: ChatMessage) => message.id)).toEqual(['2', '3']);
+    expect(feed().firstItemIndex).toBe(initialIndex - 1);
+
+    act(() => api.onChat?.(row(4)));
+    await act(async () => feed().historyControls.loadOlder());
+    expect(api.loadOlderChatMessages).toHaveBeenNthCalledWith(2, 2);
+    expect(feed().messages.map((message: ChatMessage) => message.id)).toEqual(['1', '2', '3', '4']);
+    expect(feed().firstItemIndex).toBe(initialIndex - 2);
+    expect(feed().historyControls.status).toBe('exhausted');
+    expect(api.enqueueChatSend).not.toHaveBeenCalled();
+  });
+
+  it('fetches from an empty feed and ignores a pending reply after Clear Chat', async () => {
+    let completePage!: (page: ChatHistoryPage) => void;
+    api.loadOlderChatMessages.mockReturnValueOnce(
+      new Promise((resolve) => { completePage = resolve; }),
+    );
+    await act(async () => { renderer = TestRenderer.create(<App />); });
+    act(() => {
+      feed().historyControls.loadOlder();
+      feed().historyControls.loadOlder();
+    });
+    expect(api.loadOlderChatMessages).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(feed().historyControls.status).toBe('loading');
+    act(() => api.onClear?.());
+    await act(async () => completePage({ messages: [row(1)] }));
+    expect(feed().messages).toEqual([]);
+    expect(feed().historyControls.status).toBe('ready');
+  });
+});
 
 describe('queue-owned send status', () => {
   it('keeps acknowledged queued sends and automatic retries pending beyond 30 seconds', async () => {

@@ -1,6 +1,7 @@
 import React from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import { rcpp } from './api';
+import type { ChatHistoryStatus } from './useChatHistory';
 import {
   ChatMessage,
   ConnectionState,
@@ -14,6 +15,8 @@ import {
 
 interface Props {
   messages: ChatMessage[];
+  firstItemIndex?: number;
+  historyControls?: HistoryControls;
   authenticated: boolean;
   /**
    * The current WebSocket connection state, used as the SINGLE SOURCE OF
@@ -52,6 +55,34 @@ interface Props {
   onRetrySend?: (message: ChatMessage) => void;
 }
 
+interface HistoryControls {
+  status: ChatHistoryStatus;
+  loadOlder: () => void;
+}
+
+function ChatHistoryHeader({ context }: { context?: HistoryControls }): React.ReactElement | null {
+  if (!context) return null;
+  return (
+    <div className="chat-history-header">
+      {context.status === 'exhausted' ? (
+        <span role="status">No older messages</span>
+      ) : (
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={context.status === 'loading'}
+          onClick={context.loadOlder}
+        >
+          {context.status === 'loading' ? 'Loading…' : 'Load older messages'}
+        </button>
+      )}
+      {context.status === 'error' && <span role="status">Couldn’t load older messages</span>}
+    </div>
+  );
+}
+
+const feedComponents = { Header: ChatHistoryHeader };
+
 /**
  * Right-click handler attached to the feed container — asks the main
  * process to pop a native context menu (Menu.buildFromTemplate + popup).
@@ -74,6 +105,8 @@ function onFeedContextMenu(e: React.MouseEvent<HTMLDivElement>): void {
 
 export function ChatFeed({
   messages,
+  firstItemIndex,
+  historyControls,
   authenticated,
   connection,
   onSilenceUser,
@@ -100,7 +133,8 @@ export function ChatFeed({
   }
   if (messages.length === 0) {
     return (
-      <div className="feed" onContextMenu={onFeedContextMenu}>
+      <div className="feed feed-empty" onContextMenu={onFeedContextMenu}>
+        <ChatHistoryHeader context={historyControls} />
         <div className="empty">
           <EmptyFeedBody connection={connection} />
         </div>
@@ -111,6 +145,10 @@ export function ChatFeed({
     <div className="feed" onContextMenu={onFeedContextMenu}>
       <Virtuoso
         data={messages}
+        // With prepended history, the live rows keep their virtual indices.
+        firstItemIndex={firstItemIndex}
+        components={feedComponents}
+        context={historyControls}
         followOutput="smooth"
         initialTopMostItemIndex={messages.length - 1}
         // v0.1.91 — thread `onSilenceUser` down to each row so the hover-

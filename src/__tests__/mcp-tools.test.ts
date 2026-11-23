@@ -255,7 +255,7 @@ describe('mcp tools: runtime-only stubs return guiNotIntrospectable', () => {
   it('list_recent_messages surfaces a non-introspectable note', async () => {
     const r = (await call('list_recent_messages', {})) as any;
     expect(r.messages).toBeNull();
-    expect(r.hint).toMatch(/renderer/);
+    expect(r.hint).toContain('Load older messages');
   });
 
   it('list_connections surfaces a non-introspectable note', async () => {
