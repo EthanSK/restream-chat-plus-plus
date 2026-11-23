@@ -4,7 +4,9 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   build: {
     rollupOptions: {
-      external: ['electron'],
+      // Keep SQLite resolved by the packaged Electron runtime. The Node 22
+      // build runner does not expose it through builtinModules for Forge.
+      external: ['electron', 'node:sqlite'],
     },
   },
 });

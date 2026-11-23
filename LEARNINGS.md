@@ -11,6 +11,11 @@ local arrival sequence so a new live message or a provider clock difference
 cannot shift page boundaries. Clear the archive and invalidate any in-flight
 page on the same paths that implement Clear Chat.
 
+Forge picks up Node built-ins from the build host. Node 22 omits
+`node:sqlite` from that list, so Vite tried to bundle it for a browser
+even though packaged Electron supports it. Explicitly externalize it in
+the main build and verify with the CI Node version.
+
 ## X replies labeled Unknown — 23 November 2026
 
 Restream sent an incoming reply with `eventTypeId: 38`, X's documented
