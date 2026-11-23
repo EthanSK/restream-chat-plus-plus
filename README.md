@@ -69,6 +69,8 @@ sources without revoking the direct-provider logins.
 
 ## Develop
 
+Use the Node version in `.nvmrc`. With nvm, run `nvm install` from the project folder.
+
 ```bash
 git clone https://github.com/EthanSK/restream-chat-plus-plus.git
 cd restream-chat-plus-plus

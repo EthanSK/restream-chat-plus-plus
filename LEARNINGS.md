@@ -16,6 +16,11 @@ Forge picks up Node built-ins from the build host. Node 22 omits
 even though packaged Electron supports it. Explicitly externalize it in
 the main build and verify with the CI Node version.
 
+The separate lint and test workflow still ran Node 20, which has no
+`node:sqlite`. This broke tests that imported either the chat archive or
+the Electron main module, even after desktop packaging passed. Both GitHub
+workflows now take their Node version from `.nvmrc`.
+
 ## X replies labeled Unknown — 23 November 2026
 
 Restream sent an incoming reply with `eventTypeId: 38`, X's documented
