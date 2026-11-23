@@ -190,7 +190,13 @@ export function normalizeRestreamEventDetailed(
     return { drop: { reason: 'no-payload', eventTypeId } };
   }
 
-  const platform: Platform = mapEventTypeId(eventTypeId) ?? guessPlatform(payload);
+  // Restream sent type 38 for replies on X. Require its X source ID because
+  // the event type is not in Restream's published table. — GPT-6.2 Sol
+  const isXReply =
+    eventTypeId === 38 && mapEventSourceId(r.payload?.eventSourceId) === 'x';
+  const platform: Platform = isXReply
+    ? 'x'
+    : mapEventTypeId(eventTypeId) ?? guessPlatform(payload);
   const username =
     payload.author?.displayName ??
     payload.author?.nickname ?? // Discord-style

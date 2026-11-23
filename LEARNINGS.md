@@ -1,5 +1,13 @@
 # Learnings
 
+## X replies labeled Unknown — 23 November 2026
+
+Restream sent an incoming reply with `eventTypeId: 38`, X's documented
+`eventSourceId: 28`, and a `referencedTweetId`. The live chat parser only
+recognized the documented X text type (24), so it labeled the reply Unknown.
+Recognize type 38 when the source confirms X. The sanitized regression checks
+both the X reply and the same event type without an X source.
+
 ## Queue-owned delivery status — 15 November 2026
 
 The UI's 30-second optimistic timeout ran from enqueue even while the main queue was still sending or waiting behind an earlier message. Actual queue logs later recorded success; clicking the premature warning re-enqueued the same UUID, and Restream posted it again with a different reply UUID. A shared clientReplyUuid is correlation, not proof of server idempotency. Cancel the renderer fallback once pending/retrying acknowledges queue ownership; keep the existing five attempts and report the queue's actual final result. Associate warnings with client IDs and clear only the matching warning on success. Keep recent confirmed results in a bounded completion cache separate from partial-delivery progress, so late manual retry cannot repost success or evict unfinished recovery evidence. Regression guards mount the real App across 90-second delays, verify the lost-IPC fallback, real terminal failure and warning isolation, and exercise completion dedupe, its 500-entry bound and partial-delivery retention.

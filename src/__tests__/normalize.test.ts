@@ -4,7 +4,7 @@ import {
   normalizeRestreamEventDetailed,
 } from '../main/normalize';
 
-// All eventTypeIds tested below are taken from the official Restream docs:
+// Documented eventTypeIds are taken from the official Restream docs:
 // https://developers.restream.io/chat/events
 
 describe('normalizeRestreamEvent', () => {
@@ -94,6 +94,41 @@ describe('normalizeRestreamEvent', () => {
         },
       })?.platform,
     ).toBe('rumble');
+  });
+
+  it('labels an incoming Restream type 38 reply as X when its source is X', () => {
+    // Sanitized from a live Restream Chat frame observed on 2026-11-23.
+    const payload = {
+      connectionIdentifier: '100-twitter-200',
+      eventId: 'event-1',
+      eventSourceId: 28,
+      eventTypeId: 38,
+      eventPayload: {
+        author: {
+          avatar: null,
+          displayName: 'Viewer',
+          id: '300',
+          isIdentityVerified: false,
+          username: 'viewer',
+          verified: false,
+          verifiedType: null,
+        },
+        id: '400',
+        referencedTweetId: '500',
+        text: 'Great stream!',
+      },
+    };
+    expect(normalizeRestreamEvent({ action: 'event', payload })).toMatchObject({
+      platform: 'x',
+      username: 'Viewer',
+      text: 'Great stream!',
+    });
+    expect(
+      normalizeRestreamEvent({
+        action: 'event',
+        payload: { ...payload, eventSourceId: 0 },
+      })?.platform,
+    ).toBe('unknown');
   });
 
   it('returns undefined for non-event actions', () => {
