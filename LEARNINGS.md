@@ -630,3 +630,7 @@ Each entry looks like:
 **Commit:** a59300b
 **Guard:** src/__tests__/transient-refresh-retry.test.ts (12 cases pinning the state machine: 2m base, doubles, 30m cap, success/fatal/coalescing/cancel/throw-handling) + 5 new cases in oauth-refresh-failure.test.ts pinning getLastRefreshFailure() classification across all 4 outcomes. Plus extensive inline comment blocks in src/main/transient-refresh-retry.ts + src/main/oauth.ts referencing this bug.
 ---
+
+## Hosted release credential checks — 24 November 2026
+
+Release packaging must fail when any required Apple signing/notarization input is missing; Forge's optional local development signing configuration must not silently produce unsigned public releases. Require source checks, validate the Developer ID signature and stapled Apple ticket before upload, then verify the downloaded version, checksum and signature. Keep the temporary Keychain and certificate in RUNNER_TEMP and remove them in an always cleanup step. Published tags and assets remain immutable; use a new package/lock version for a fresh round.
