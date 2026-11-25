@@ -1,89 +1,70 @@
 import { describe, expect, it, vi } from 'vitest';
-import React from 'react';
+import React, { useState } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { MessageRow } from '../renderer/ChatFeed';
-import { compileIgnorePatterns } from '../renderer/message-filters';
-import type { ChatMessage } from '../shared/types';
+import { applyMessageFilters, compileIgnorePatterns, hasExactSilenceRule, setSilencedUser } from '../shared/message-filters';
+import { DEFAULT_SETTINGS, type ChatMessage } from '../shared/types';
 
 vi.mock('../renderer/api', () => ({
   rcpp: { showChatContextMenu: vi.fn() },
 }));
 
 const message: ChatMessage = {
-  id: 'twitch-1',
-  platform: 'twitch',
-  username: 'burntballs_',
+  id: 'viewer-1',
+  platform: 'youtube',
+  username: '@viewer',
   text: 'hello',
-  ts: 1_786_195_091_000,
+  ts: 1,
 };
 
-function findByClass(
-  renderer: TestRenderer.ReactTestRenderer,
-  className: string,
-): TestRenderer.ReactTestInstance[] {
-  return renderer.root.findAll((node) => node.props.className === className);
-}
-
-describe('per-row Silence user feedback', () => {
-  it('click relays the exact Twitch username and stops propagation', () => {
-    const onSilenceUser = vi.fn();
+describe('per-row Silence and Unsilence', () => {
+  it('toggles the same row both ways and refreshes the ignored badge', () => {
     const stopPropagation = vi.fn();
-    let renderer!: TestRenderer.ReactTestRenderer;
-    act(() => {
-      renderer = TestRenderer.create(
-        <MessageRow message={message} onSilenceUser={onSilenceUser} />,
-      );
-    });
+    const onSetUserSilenced = vi.fn();
 
-    const button = findByClass(renderer, 'silence-user-btn')[0];
-    expect(button).toBeDefined();
+    function FeedRow(): React.ReactElement {
+      const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+      const tts = settings.filters.tts.ignoreUsernameRegex;
+      const notifications = settings.filters.notifications.ignoreUsernameRegex;
+      return (
+        <MessageRow
+          message={message}
+          silenced={hasExactSilenceRule(tts, message.username) || hasExactSilenceRule(notifications, message.username)}
+          filterFlags={applyMessageFilters(message.text, [], [], message.username, compileIgnorePatterns(tts), compileIgnorePatterns(notifications))}
+          onSetUserSilenced={(username, silenced) => {
+            onSetUserSilenced(username, silenced);
+            setSettings((current) => setSilencedUser(current, username, silenced));
+          }}
+        />
+      );
+    }
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(<FeedRow />); });
+    const button = renderer.root.findByProps({ 'aria-label': 'Silence user @viewer' });
     act(() => button.props.onClick({ stopPropagation }));
-    expect(stopPropagation).toHaveBeenCalledOnce();
-    expect(onSilenceUser).toHaveBeenCalledWith('burntballs_');
+    expect(onSetUserSilenced).toHaveBeenNthCalledWith(1, '@viewer', true);
+    const reverseButton = renderer.root.findByProps({ 'aria-label': 'Unsilence user @viewer' });
+    expect(reverseButton).toBe(button);
+    expect(renderer.root.findByProps({ className: 'regex-ignored-badge' }).children).toEqual(['🔇🔕 regex-ignored']);
+
+    act(() => reverseButton.props.onClick({ stopPropagation }));
+    expect(onSetUserSilenced).toHaveBeenNthCalledWith(2, '@viewer', false);
+    expect(renderer.root.findByProps({ 'aria-label': 'Silence user @viewer' })).toBe(button);
+    expect(renderer.root.findAllByProps({ className: 'regex-ignored-badge' })).toHaveLength(0);
+    expect(stopPropagation).toHaveBeenCalledTimes(2);
   });
 
-  it('existing row changes to Silenced only after both TTS and notifications match', () => {
-    const onSilenceUser = vi.fn();
+  it('uses current filter flags for rows that carried an earlier ignore badge', () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(
-        <MessageRow message={message} onSilenceUser={onSilenceUser} />,
-      );
-    });
-    expect(findByClass(renderer, 'silence-user-btn')).toHaveLength(1);
-    expect(findByClass(renderer, 'silence-user-status')).toHaveLength(0);
-
-    const ttsOnly = compileIgnorePatterns(['^burntballs_$']);
-    act(() => {
-      renderer.update(
         <MessageRow
-          message={message}
-          onSilenceUser={onSilenceUser}
-          silencedTtsUsernamePatterns={ttsOnly}
+          message={{ ...message, ignoredByTts: true, ignoredByNotifications: true }}
+          filterFlags={{ ignoredByNotifications: true }}
         />,
       );
     });
-    expect(findByClass(renderer, 'silence-user-btn')).toHaveLength(1);
-    expect(findByClass(renderer, 'regex-ignored-badge')[0].children).toEqual([
-      '🔇 regex-ignored (TTS)',
-    ]);
-
-    act(() => {
-      renderer.update(
-        <MessageRow
-          message={message}
-          onSilenceUser={onSilenceUser}
-          silencedTtsUsernamePatterns={ttsOnly}
-          silencedNotificationUsernamePatterns={ttsOnly}
-        />,
-      );
-    });
-    expect(findByClass(renderer, 'silence-user-btn')).toHaveLength(0);
-    expect(findByClass(renderer, 'silence-user-status')[0].children).toEqual([
-      '✓ Silenced',
-    ]);
-    expect(findByClass(renderer, 'regex-ignored-badge')[0].children).toEqual([
-      '🔇🔕 regex-ignored',
-    ]);
+    expect(renderer.root.findByProps({ className: 'regex-ignored-badge' }).children).toEqual(['🔕 regex-ignored (notif)']);
   });
 });

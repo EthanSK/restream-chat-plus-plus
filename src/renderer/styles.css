@@ -1548,23 +1548,17 @@ body {
   cursor: pointer;
   user-select: none;
 }
-.silence-user-btn {
-  visibility: hidden; /* Hidden until the row is hovered (or button focused). */
-}
+.silence-user-btn:not(.silenced),
 .hide-user-btn {
-  opacity: 0; /* Keep the new action keyboard-focusable; visibility:hidden prevents Tab from reaching it. */
+  opacity: 0;
   pointer-events: none;
 }
+.message-row:hover .silence-user-btn:not(.silenced),
+.silence-user-btn:not(.silenced):focus-visible,
 .message-row:hover .hide-user-btn,
 .hide-user-btn:focus-visible {
   opacity: 1;
   pointer-events: auto;
-}
-.message-row:hover .silence-user-btn,
-.silence-user-btn:focus,
-.silence-user-btn:focus-visible {
-  /* Reveal on row-hover OR keyboard-focus so tab-nav can reach it. */
-  visibility: visible;
 }
 .silence-user-btn:hover,
 .hide-user-btn:hover {
@@ -1573,20 +1567,11 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
-/* Persistent success state after a per-row Silence-user action. Unlike the
- * hover-only button, this stays visible so a successful click cannot look like
- * a no-op. Existing rows switch to this state as soon as Settings changes. */
-.silence-user-status {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 6px;
-  font-size: 11px;
-  font-weight: 600;
+/* Keep the reverse action visible while the author is silenced. */
+.silence-user-btn.silenced {
   color: var(--ok);
-  border: 1px solid rgba(63, 185, 80, 0.55);
-  border-radius: 4px;
+  border-color: rgba(63, 185, 80, 0.55);
   background: rgba(63, 185, 80, 0.08);
-  user-select: none;
 }
 
 /* Hidden Users section in the Settings drawer — list each currently-hidden

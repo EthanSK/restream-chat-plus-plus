@@ -49,10 +49,10 @@ import { clearChatMessages } from './chat-actions';
 import { useChatHistory } from './useChatHistory';
 import {
   addHiddenUser,
-  addSilencedUserToBothFilters,
   applyMessageFilters,
   compileHiddenUsersSet,
   compileIgnorePatterns,
+  hasExactSilenceRule,
   isHiddenUser,
 } from './message-filters';
 import {
@@ -180,14 +180,7 @@ export function App(): React.ReactElement {
   // process (TtsDispatcher.lastProcessedId) with the rest of the decision
   // logic. The renderer no longer tracks which message it last "spoke".
 
-  // v0.1.26 — compile the user's regex-ignore lists ONCE per Settings change
-  // and stash both in refs so the mount-only `onChatMessage` subscription
-  // can read the freshest lists without being torn down on every tweak.
-  //
-  // v0.1.72 adds TWO more compiled lists per axis: username-regex (the
-  // second matching axis added in voice 4352). Same ref-pattern so the
-  // onChatMessage handler picks up the latest compiled set without
-  // re-subscribing.
+  // Compile filter rules once per settings change for the visible chat rows.
   const ttsIgnoreCompiled = useMemo(
     () => compileIgnorePatterns(settings.filters?.tts?.ignoreRegex ?? []),
     [settings.filters?.tts?.ignoreRegex],
@@ -205,23 +198,6 @@ export function App(): React.ReactElement {
       compileIgnorePatterns(settings.filters?.notifications?.ignoreUsernameRegex ?? []),
     [settings.filters?.notifications?.ignoreUsernameRegex],
   );
-  const ttsIgnoreRef = useRef<RegExp[]>(ttsIgnoreCompiled);
-  const notifIgnoreRef = useRef<RegExp[]>(notifIgnoreCompiled);
-  const ttsUsernameIgnoreRef = useRef<RegExp[]>(ttsUsernameIgnoreCompiled);
-  const notifUsernameIgnoreRef = useRef<RegExp[]>(notifUsernameIgnoreCompiled);
-  useEffect(() => {
-    ttsIgnoreRef.current = ttsIgnoreCompiled;
-  }, [ttsIgnoreCompiled]);
-  useEffect(() => {
-    notifIgnoreRef.current = notifIgnoreCompiled;
-  }, [notifIgnoreCompiled]);
-  useEffect(() => {
-    ttsUsernameIgnoreRef.current = ttsUsernameIgnoreCompiled;
-  }, [ttsUsernameIgnoreCompiled]);
-  useEffect(() => {
-    notifUsernameIgnoreRef.current = notifUsernameIgnoreCompiled;
-  }, [notifUsernameIgnoreCompiled]);
-
   // v0.1.72 — compile the hidden-users list into a lowercase Set once per
   // settings change. Used by both ChatFeed (to hide the row from the
   // visible feed) and the side-effect gate (so hidden users' messages
@@ -231,11 +207,6 @@ export function App(): React.ReactElement {
     () => compileHiddenUsersSet(settings.hiddenUsers ?? []),
     [settings.hiddenUsers],
   );
-  const hiddenUsersSetRef = useRef<Set<string>>(hiddenUsersSet);
-  useEffect(() => {
-    hiddenUsersSetRef.current = hiddenUsersSet;
-  }, [hiddenUsersSet]);
-
   const showSendNotice = (text: string, needsLogin = false, clientId?: ChatMessage['id']): void => {
     // The id makes repeated identical failures visible as fresh state changes.
     // Without it, two consecutive `no-session-cookies` bails would set the
@@ -484,28 +455,6 @@ export function App(): React.ReactElement {
     const offViewerStats =
       rcpp.onViewerStats?.(setViewerStats) ?? (() => undefined);
     const offChat = rcpp.onChatMessage((m) => {
-      // v0.1.26: apply regex-ignore filters BEFORE pushing to state so
-      // the resulting ChatMessage carries `ignoredByTts` /
-      // `ignoredByNotifications`. The forward-to-side-effects useEffect
-      // below reads those flags to skip TTS / notifications, and
-      // ChatFeed renders the "regex-ignored" badge from the same flags.
-      //
-      // v0.1.72 — apply BOTH axes (content + username) per side-effect.
-      // The compiled username regex lists live in *UsernameIgnoreRef and
-      // are passed down so the helper can OR-compose content + username
-      // matches. See `applyMessageFilters` docstring for the contract.
-      const flags = applyMessageFilters(
-        m.text,
-        ttsIgnoreRef.current,
-        notifIgnoreRef.current,
-        m.username,
-        ttsUsernameIgnoreRef.current,
-        notifUsernameIgnoreRef.current,
-      );
-      const flagged: ChatMessage =
-        flags.ignoredByTts || flags.ignoredByNotifications
-          ? { ...m, ...flags }
-          : m;
       // v0.1.43: dedupe against any locally-minted optimistic placeholder
       // (the WS rebroadcasts the streamer's own outgoing reply as a
       // `reply_created` echo, normalised with `id === clientReplyUuid`).
@@ -516,7 +465,7 @@ export function App(): React.ReactElement {
       // state-machine transition. The echo is the server-confirmed success
       // path; leaving the timer armed would let a stale callback later repaint
       // an already-confirmed message as failed.
-      clearOptimisticSendTimeout(flagged.id, 'echo');
+      clearOptimisticSendTimeout(m.id, 'echo');
       // v0.1.88 (voice 4504): LATE-ECHO RESOLUTION.
       //
       // `dedupeOptimisticOnEcho` replaces ANY placeholder with `pendingSend !==
@@ -539,16 +488,16 @@ export function App(): React.ReactElement {
       // it can no longer need a reconnect sweep.
       let wasLateEchoForFailed = false;
       setMessages((prev) => {
-        wasLateEchoForFailed = isLateEchoForFailedSend(prev, flagged);
-        return dedupeOptimisticOnEcho(prev, flagged);
+        wasLateEchoForFailed = isLateEchoForFailedSend(prev, m);
+        return dedupeOptimisticOnEcho(prev, m);
       });
       if (wasLateEchoForFailed) {
-        logLateEchoResolved(flagged.id);
+        logLateEchoResolved(m.id);
       }
       // The id is now resolved (whether on-time or late) — drop it from the
       // HTTP-200 tracking set so that set only ever holds ids that might STILL
       // need a reconnect sweep. Harmless if the id was never in it.
-      httpOkSendsRef.current.delete(flagged.id);
+      httpOkSendsRef.current.delete(m.id);
     });
     // v0.1.43 — listen for queue lifecycle updates and flip the matching
     // optimistic placeholder. `pending` is a no-op (the placeholder is
@@ -834,7 +783,7 @@ export function App(): React.ReactElement {
   // What the renderer does now:
   //   - Renders the feed (onChatMessage, above) — unchanged.
   //   - Computes the `ignoredByTts` / `ignoredByNotifications` BADGE flags for
-  //     the feed via applyMessageFilters in onChatMessage — display-only, NOT a
+  //     visible rows from the current settings — display-only, NOT a
   //     side-effect decision. (The authoritative decision is main's.)
   //   - Shows the native voice list + fires the voice-preview IPC in Settings.
   //
@@ -860,100 +809,41 @@ export function App(): React.ReactElement {
     const visibleHistory = history.messages
       .filter((message) => !liveIds.has(message.id))
       .slice(-(MAX_CHAT_MESSAGES - messages.length))
-      .filter(isVisible)
-      .map((message) => ({
-        ...message,
-        ...applyMessageFilters(
-          message.text,
-          ttsIgnoreCompiled,
-          notifIgnoreCompiled,
-          message.username,
-          ttsUsernameIgnoreCompiled,
-          notifUsernameIgnoreCompiled,
-        ),
-      }));
+      .filter(isVisible);
     return {
       visibleMessages: [...visibleHistory, ...visibleLive],
       visibleHistoryCount: visibleHistory.length,
     };
-  }, [
-    messages,
-    history.messages,
-    settings.filter.platforms,
-    hiddenUsersSet,
-    ttsIgnoreCompiled,
-    notifIgnoreCompiled,
-    ttsUsernameIgnoreCompiled,
-    notifUsernameIgnoreCompiled,
-  ]);
+  }, [messages, history.messages, settings.filter.platforms, hiddenUsersSet]);
 
-  // v0.1.91 (task: "silence user" button) — handler for the per-row
-  // "Silence user" hover button. RENAMED + REWIRED from the old
-  // handleHideUser:
-  //
-  //   - OLD behavior (v0.1.72): appended the username to
-  //     `settings.hiddenUsers`, which DROPPED their rows from the visible
-  //     feed AND suppressed all side effects.
-  //   - NEW behavior: adds anchored, regex-escaped entries for the username to
-  //     BOTH the TTS and notification username-ignore lists, so the user's
-  //     messages STILL RENDER while spoken chat and native notifications stop.
-  //
-  // v0.1.97 fix: persistence is now an ATOMIC username-only IPC. The old path
-  // fire-and-forgot a whole renderer Settings snapshot, exposed no result, and
-  // left already-playing/queued speech untouched. We still predict the exact
-  // next filter locally for instant row feedback; main reloads the current
-  // settings, persists both filters safely, cancels only this user's native
-  // queue entries, and returns the authoritative Settings. Any failure becomes
-  // a visible banner; we reload persisted truth instead of pretending it worked.
-  const handleSilenceUser = (username: string): void => {
-    // Defensive: skip empty / whitespace-only usernames so a malformed
-    // ChatMessage can't poison the ignore list with a bare `^$` pattern.
-    // The shared reducer also guards, but checking at the call site is cheap.
-    if (typeof username !== 'string' || username.trim().length === 0) return;
-    const existingTts = settings.filters?.tts?.ignoreUsernameRegex ?? [];
-    const existingNotifications =
-      settings.filters?.notifications?.ignoreUsernameRegex ?? [];
-    // Anchored ^name$ + regex-escape so names with special chars and
-    // superstring names don't over-match; relies on the `i` flag added at
-    // compile time (compileIgnorePatterns) for case-insensitivity.
-    const update = addSilencedUserToBothFilters(
-      existingTts,
-      existingNotifications,
-      username,
-    );
-    // Already suppressed on both paths: still ask main to clear any matching
-    // speech that entered the native queue before the rules were saved.
-    const optimistic: Settings = {
-      ...settings,
-      filters: {
-        ...settings.filters,
-        tts: {
-          ...settings.filters?.tts,
-          ignoreUsernameRegex: update.ttsPatterns,
-        },
-        notifications: {
-          ...settings.filters?.notifications,
-          ignoreUsernameRegex: update.notificationPatterns,
-        },
-      },
-    };
+  const isUserSilenced = (username: string): boolean =>
+    hasExactSilenceRule(settings.filters.tts.ignoreUsernameRegex, username) ||
+    hasExactSilenceRule(settings.filters.notifications.ignoreUsernameRegex, username);
+
+  const handleSetUserSilenced = async (username: string, silenced: boolean): Promise<void> => {
     setSilenceError(null);
-    setSettings(optimistic);
-    void rcpp
-      .silenceUser(username)
-      .then((result) => {
-        if (result.ok) {
-          setSettings(result.settings);
-          return;
-        }
-        setSilenceError(`Couldn’t silence ${username}: ${result.error}`);
-        void rcpp.getSettings().then(setSettings).catch(() => setSettings(settings));
-      })
-      .catch((err) => {
-        const detail = err instanceof Error ? err.message : String(err);
-        setSilenceError(`Couldn’t silence ${username}: ${detail}`);
-        void rcpp.getSettings().then(setSettings).catch(() => setSettings(settings));
-      });
+    try {
+      const result = await rcpp.setUserSilenced(username, silenced);
+      if (!result.ok) throw new Error(result.error);
+      setSettings((current) => ({
+        ...current,
+        filters: {
+          ...current.filters,
+          tts: {
+            ...current.filters.tts,
+            ignoreUsernameRegex: result.settings.filters.tts.ignoreUsernameRegex,
+          },
+          notifications: {
+            ...current.filters.notifications,
+            ignoreUsernameRegex: result.settings.filters.notifications.ignoreUsernameRegex,
+          },
+        },
+      }));
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const action = silenced ? 'silence' : 'unsilence';
+      setSilenceError(`Couldn’t ${action} ${username}: ${detail}`);
+    }
   };
 
   const handleHideUser = (username: string): void => {
@@ -1405,17 +1295,17 @@ export function App(): React.ReactElement {
           directConnections.some((connection) => connection.status === 'connected')
         }
         connection={conn}
-        // v0.1.91 — per-row hover affordance fires this callback with the
-        // author's username. App.tsx owns the settings + persists the
-        // TTS username-ignore list (silence, not hide). ChatFeed is a pure
-        // render layer here; it just surfaces the button + relays the click.
-        onSilenceUser={handleSilenceUser}
+        onSetUserSilenced={(username, silenced) => void handleSetUserSilenced(username, silenced)}
         onHideUser={handleHideUser}
-        // Live compiled patterns make existing rows update immediately: the
-        // hover button becomes a persistent "Silenced" status and the old row
-        // receives its combined ignore badge without waiting for a new message.
-        silencedTtsUsernamePatterns={ttsUsernameIgnoreCompiled}
-        silencedNotificationUsernamePatterns={notifUsernameIgnoreCompiled}
+        isUserSilenced={isUserSilenced}
+        getMessageFilterFlags={(message) => applyMessageFilters(
+          message.text,
+          ttsIgnoreCompiled,
+          notifIgnoreCompiled,
+          message.username,
+          ttsUsernameIgnoreCompiled,
+          notifUsernameIgnoreCompiled,
+        )}
         // v0.1.90 (voice 4512) — manual "tap to retry" on a ⚠ failed send.
         // ChatFeed relays the click on the ⚠ affordance; App re-runs the loop.
         onRetrySend={handleRetrySend}

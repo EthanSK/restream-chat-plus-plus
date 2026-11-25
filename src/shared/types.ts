@@ -673,12 +673,12 @@ export const IPC = {
   /** Hide one username using current persisted Settings and stop its queued speech. */
   SETTINGS_HIDE_USER: 'settings:hide-user',
   /**
-   * Renderer → main atomic "Silence user" action. Unlike SETTINGS_SET,
-   * this sends only the username: main reloads the latest persisted Settings,
-   * appends exact TTS and notification username rules, saves them together,
-   * and cancels speech already in flight/queued for that same user. Keeping the
+   * Renderer → main atomic Silence/Unsilence user action. Unlike SETTINGS_SET,
+   * this sends the username and desired silence state. Main reloads the latest
+   * Settings, changes both exact username rules, and cancels that user's
+   * queued or active speech when silencing. Keeping the
    * read-modify-write in main prevents a stale renderer Settings snapshot from
-   * overwriting a concurrent edit. The explicit result prevents silent failure.
+   * overwriting a concurrent edit. — GPT-6.2 Sol
    */
   SETTINGS_SILENCE_USER: 'settings:silence-user',
   /**
@@ -822,15 +822,11 @@ export interface TtsNativeEnqueuePayload {
   username?: string;
 }
 
-/** Result returned by the atomic per-row Silence-user IPC. */
+/** Result returned by the atomic per-row Silence/Unsilence action. — GPT-6.2 Sol */
 export type SilenceUserResult =
   | {
       ok: true;
       settings: Settings;
-      addedTts: boolean;
-      addedNotifications: boolean;
-      stoppedCurrent: boolean;
-      clearedQueued: number;
     }
   | { ok: false; error: string };
 

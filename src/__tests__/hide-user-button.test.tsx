@@ -7,7 +7,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { MessageRow } from '../renderer/ChatFeed';
 import { SettingsDrawer } from '../renderer/SettingsDrawer';
-import { addHiddenUser, compileIgnorePatterns } from '../shared/message-filters';
+import { addHiddenUser } from '../shared/message-filters';
 import { DEFAULT_SETTINGS, IPC, type ChatMessage, type Settings } from '../shared/types';
 
 vi.mock('../renderer/api', () => ({ rcpp: { showChatContextMenu: vi.fn() } }));
@@ -34,10 +34,10 @@ function readHandler(file: string, kind: 'main' | 'renderer'): string {
 describe('Hide user hover action', () => {
   it('keeps Hide available beside Silence and for an already-silenced author', () => {
     const onHideUser = vi.fn();
-    const onSilenceUser = vi.fn();
+    const onSetUserSilenced = vi.fn();
     const stopPropagation = vi.fn();
     let renderer!: TestRenderer.ReactTestRenderer;
-    act(() => { renderer = TestRenderer.create(<MessageRow message={message} onHideUser={onHideUser} onSilenceUser={onSilenceUser} />); });
+    act(() => { renderer = TestRenderer.create(<MessageRow message={message} onHideUser={onHideUser} onSetUserSilenced={onSetUserSilenced} />); });
     expect(renderer.root.findAllByProps({ className: 'silence-user-btn' })).toHaveLength(1);
     const button = renderer.root.findByProps({ className: 'hide-user-btn' });
     expect(button.props['aria-label']).toBe('Hide Bot[1]');
@@ -45,10 +45,9 @@ describe('Hide user hover action', () => {
     act(() => { button.props.onClick({ stopPropagation }); });
     expect(onHideUser).toHaveBeenCalledExactlyOnceWith('Bot[1]');
     expect(stopPropagation).toHaveBeenCalledOnce();
-    expect(onSilenceUser).not.toHaveBeenCalled();
-    const patterns = compileIgnorePatterns(['^Bot\\[1\\]$']);
-    act(() => { renderer.update(<MessageRow message={message} onHideUser={onHideUser} onSilenceUser={onSilenceUser} silencedTtsUsernamePatterns={patterns} silencedNotificationUsernamePatterns={patterns} />); });
-    expect(renderer.root.findAllByProps({ className: 'silence-user-status' })).toHaveLength(1);
+    expect(onSetUserSilenced).not.toHaveBeenCalled();
+    act(() => { renderer.update(<MessageRow message={message} onHideUser={onHideUser} onSetUserSilenced={onSetUserSilenced} silenced />); });
+    expect(renderer.root.findAllByProps({ className: 'silence-user-btn silenced' })).toHaveLength(1);
     expect(renderer.root.findAllByProps({ className: 'hide-user-btn' })).toHaveLength(1);
   });
 

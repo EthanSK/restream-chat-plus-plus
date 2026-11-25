@@ -1,3 +1,5 @@
+import type { Settings } from './types';
+
 // Regex-based message filtering, v0.1.26.
 //
 // The Settings drawer exposes two textareas (one for TTS, one for native
@@ -271,61 +273,41 @@ export function addSilencedUser(
   if (typeof username !== 'string') return existingPatterns.slice();
   const trimmed = username.trim();
   if (trimmed.length === 0) return existingPatterns.slice();
-  // Escape the standard JS regex metacharacter set. We anchor with ^...$
-  // (NOT a character class) so we escape the full set including `-` is
-  // unnecessary, but escaping it is harmless; we stick to the canonical
-  // set below. Backslash MUST be escaped first within the class itself —
-  // the `\\` in the class handles that.
-  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const candidate = `^${escaped}$`;
-  const candidateLower = candidate.toLowerCase();
-  for (const existing of existingPatterns) {
-    if (
-      typeof existing === 'string' &&
-      existing.trim().toLowerCase() === candidateLower
-    ) {
-      // Already silencing this exact (case-insensitive) anchored pattern —
-      // return a clone so the caller still detects "no change needed" via a
-      // length / value compare, never a double-add.
-      return existingPatterns.slice();
-    }
-  }
-  return [...existingPatterns, candidate];
+  if (hasExactSilenceRule(existingPatterns, trimmed)) return existingPatterns.slice();
+  return [...existingPatterns, exactUsernamePattern(trimmed)];
 }
 
-/**
- * Add one exact author to BOTH side-effect username filters. A pre-existing
- * broad/manual regex counts as already silenced on that axis, so we do not add
- * redundant anchored entries. Shared by renderer optimism and main's atomic
- * persist path to keep the two lists and their de-dup semantics identical.
- */
-export function addSilencedUserToBothFilters(
-  ttsPatterns: readonly string[],
-  notificationPatterns: readonly string[],
+function exactUsernamePattern(username: string): string {
+  return `^${username.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+}
+
+export function hasExactSilenceRule(
+  patterns: readonly string[],
   username: string,
-): {
-  ttsPatterns: string[];
-  notificationPatterns: string[];
-  addedTts: boolean;
-  addedNotifications: boolean;
-} {
-  const ttsAlreadySilenced = matchesAnyIgnorePattern(
-    username,
-    compileIgnorePatterns(ttsPatterns),
-  );
-  const notificationsAlreadySilenced = matchesAnyIgnorePattern(
-    username,
-    compileIgnorePatterns(notificationPatterns),
-  );
+): boolean {
+  const exact = exactUsernamePattern(username).toLowerCase();
+  return patterns.some((pattern) => typeof pattern === 'string' && pattern.trim().toLowerCase() === exact);
+}
+
+/** Silence/Unsilence owns exact username rules on both alert paths. Broader rules remain independent. Found and fixed by GPT-6.2 Sol. — GPT-6.2 Sol */
+export function setSilencedUser(settings: Settings, username: string, silenced: boolean): Settings {
+  if (!username.trim()) return settings;
+  const exact = exactUsernamePattern(username).toLowerCase();
+  const update = (patterns: string[]): string[] =>
+    silenced
+      ? addSilencedUser(patterns, username)
+      : patterns.filter((pattern) => typeof pattern !== 'string' || pattern.trim().toLowerCase() !== exact);
+  const { tts, notifications } = settings.filters;
   return {
-    ttsPatterns: ttsAlreadySilenced
-      ? ttsPatterns.slice()
-      : addSilencedUser(ttsPatterns, username),
-    notificationPatterns: notificationsAlreadySilenced
-      ? notificationPatterns.slice()
-      : addSilencedUser(notificationPatterns, username),
-    addedTts: !ttsAlreadySilenced,
-    addedNotifications: !notificationsAlreadySilenced,
+    ...settings,
+    filters: {
+      ...settings.filters,
+      tts: { ...tts, ignoreUsernameRegex: update(tts.ignoreUsernameRegex) },
+      notifications: {
+        ...notifications,
+        ignoreUsernameRegex: update(notifications.ignoreUsernameRegex),
+      },
+    },
   };
 }
 

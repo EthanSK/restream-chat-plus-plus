@@ -256,13 +256,8 @@ const api = {
   /** Hide one chat author without overwriting other saved settings. */
   hideUser: (username: string): Promise<Settings> =>
     ipcRenderer.invoke(IPC.SETTINGS_HIDE_USER, username),
-  /**
-   * Atomically silence one chat author in main. The result includes the saved
-   * Settings so the renderer can reconcile its optimistic row feedback, plus
-   * targeted-cancel details for diagnostics.
-   */
-  silenceUser: (username: string): Promise<SilenceUserResult> =>
-    ipcRenderer.invoke(IPC.SETTINGS_SILENCE_USER, username),
+  setUserSilenced: (username: string, silenced: boolean): Promise<SilenceUserResult> =>
+    ipcRenderer.invoke(IPC.SETTINGS_SILENCE_USER, username, silenced),
   /**
    * Subscribe to push-broadcasts of Settings changes coming from the
    * in-process HTTP MCP server (v0.1.36+). The renderer re-applies the

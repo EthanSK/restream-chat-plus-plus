@@ -2,7 +2,8 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../renderer/App';
-import type { ChatHistoryPage, ChatMessage, ChatSendEnqueuePayload, ChatSendStatus } from '../shared/types';
+import { DEFAULT_SETTINGS, type ChatHistoryPage, type ChatMessage, type ChatSendEnqueuePayload, type ChatSendStatus, type SilenceUserResult } from '../shared/types';
+import { setSilencedUser } from '../shared/message-filters';
 import { ChatFeed } from '../renderer/ChatFeed';
 import { ChatInputInline } from '../renderer/ChatInputInline';
 
@@ -11,6 +12,7 @@ const api = vi.hoisted(() => ({
   onChat: undefined as ((message: ChatMessage) => void) | undefined,
   onClear: undefined as (() => void) | undefined,
   loadOlderChatMessages: vi.fn<(before?: number) => Promise<ChatHistoryPage>>(),
+  setUserSilenced: vi.fn<(username: string, silenced: boolean) => Promise<SilenceUserResult>>(),
   signInToSend: vi.fn<() => Promise<boolean>>(),
   authLogout: vi.fn(), authStart: vi.fn(), enqueueChatSend: vi.fn<(payload: ChatSendEnqueuePayload) => void>(),
 }));
@@ -34,6 +36,7 @@ vi.mock('../renderer/api', async () => {
       return noopSubscription();
     },
     loadOlderChatMessages: api.loadOlderChatMessages,
+    setUserSilenced: api.setUserSilenced,
     onSettingsPush: noopSubscription,
     onUpdateStatus: noopSubscription,
     onChatSendStatus: (callback: (status: ChatSendStatus) => void) => { api.onStatus = callback; return () => undefined; },
@@ -50,6 +53,32 @@ vi.mock('../renderer/ViewerCount', () => ({ ViewerCount: () => null }));
 
 let renderer: TestRenderer.ReactTestRenderer;
 afterEach(() => { act(() => renderer?.unmount()); vi.useRealTimers(); vi.clearAllMocks(); });
+
+it('applies a saved silence change to live chat and loaded history without reload', async () => {
+  const row: ChatMessage = { id: 'live', text: 'hello', platform: 'youtube', username: '@viewer', ts: 2 };
+  const older = { ...row, id: 'older', ts: 1 };
+  api.loadOlderChatMessages.mockResolvedValueOnce({ messages: [older] });
+  api.setUserSilenced.mockImplementation(async (username, silenced) => ({
+    ok: true,
+    settings: setSilencedUser(DEFAULT_SETTINGS, username, silenced),
+  }));
+  await act(async () => { renderer = TestRenderer.create(<App />); });
+  const feed = () => renderer.root.findByType(ChatFeed).props;
+  act(() => api.onChat?.(row));
+  await act(async () => feed().historyControls.loadOlder());
+
+  await act(async () => feed().onSetUserSilenced(row.username, true));
+  expect(feed().isUserSilenced(row.username)).toBe(true);
+  expect(feed().messages.map(feed().getMessageFilterFlags)).toEqual([
+    { ignoredByTts: true, ignoredByNotifications: true },
+    { ignoredByTts: true, ignoredByNotifications: true },
+  ]);
+
+  await act(async () => feed().onSetUserSilenced(row.username, false));
+  expect(feed().isUserSilenced(row.username)).toBe(false);
+  expect(feed().messages.map(feed().getMessageFilterFlags)).toEqual([{}, {}]);
+  expect(api.setUserSilenced.mock.calls).toEqual([['@viewer', true], ['@viewer', false]]);
+});
 
 describe('loading older chat messages', () => {
   const row = (historySequence: number): ChatMessage => ({

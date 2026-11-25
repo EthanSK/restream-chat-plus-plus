@@ -8,10 +8,7 @@ import {
   PLATFORM_COLORS,
   PLATFORM_LABELS,
 } from '../shared/types';
-import {
-  matchesAnyIgnorePattern,
-  regexIgnoredBadgeLabel,
-} from './message-filters';
+import { regexIgnoredBadgeLabel } from './message-filters';
 
 interface Props {
   messages: ChatMessage[];
@@ -28,24 +25,10 @@ interface Props {
    * the UI in lockstep.
    */
   connection: ConnectionState;
-  /**
-   * v0.1.91 (task: "silence user" button) — invoked by the per-row hover
-   * "Silence user" button. App.tsx owns the persist round-trip; ChatFeed
-   * just surfaces the affordance + relays the click. Optional so older
-   * test-mount sites don't have to thread it through (tests that don't
-   * exercise silence can omit it).
-   *
-   * RENAMED from `onHideUser` (v0.1.72): the action used to fully HIDE the
-   * user (drop their rows from the feed). It now SILENCES them — their
-   * messages still render while both TTS and native notifications stop — by
-   * adding anchored, regex-escaped entries to both username-ignore lists.
-   */
-  onSilenceUser?: (username: string) => void;
-  /** Hide all rows and side effects for this author; separate from Silence user. */
+  onSetUserSilenced?: (username: string, silenced: boolean) => void;
   onHideUser?: (username: string) => void;
-  /** Current username rules, used for live feedback on existing rows. */
-  silencedTtsUsernamePatterns?: readonly RegExp[];
-  silencedNotificationUsernamePatterns?: readonly RegExp[];
+  isUserSilenced?: (username: string) => boolean;
+  getMessageFilterFlags?: (message: ChatMessage) => MessageFilterFlags;
   /**
    * v0.1.90 (voice 4512) — invoked when the user clicks the ⚠ on a
    * terminally-failed (retries-exhausted) self send. App.tsx re-runs the
@@ -54,6 +37,8 @@ interface Props {
    */
   onRetrySend?: (message: ChatMessage) => void;
 }
+
+type MessageFilterFlags = Pick<ChatMessage, 'ignoredByTts' | 'ignoredByNotifications'>;
 
 interface HistoryControls {
   status: ChatHistoryStatus;
@@ -109,10 +94,10 @@ export function ChatFeed({
   historyControls,
   authenticated,
   connection,
-  onSilenceUser,
+  onSetUserSilenced,
   onHideUser,
-  silencedTtsUsernamePatterns = [],
-  silencedNotificationUsernamePatterns = [],
+  isUserSilenced,
+  getMessageFilterFlags,
   onRetrySend,
 }: Props): React.ReactElement {
   if (!authenticated) {
@@ -151,19 +136,13 @@ export function ChatFeed({
         context={historyControls}
         followOutput="smooth"
         initialTopMostItemIndex={messages.length - 1}
-        // v0.1.91 — thread `onSilenceUser` down to each row so the hover-
-        // affordance button can fire without ChatFeed reaching back into
-        // its own props inside the itemContent closure. Each MessageRow
-        // independently decides whether to render the button (no-op when
-        // the callback is undefined, e.g. test mounts that don't exercise
-        // silence).
         itemContent={(_, m) => (
           <MessageRow
             message={m}
-            onSilenceUser={onSilenceUser}
+            onSetUserSilenced={onSetUserSilenced}
             onHideUser={onHideUser}
-            silencedTtsUsernamePatterns={silencedTtsUsernamePatterns}
-            silencedNotificationUsernamePatterns={silencedNotificationUsernamePatterns}
+            silenced={isUserSilenced?.(m.username)}
+            filterFlags={getMessageFilterFlags?.(m)}
             onRetrySend={onRetrySend}
           />
         )}
@@ -247,20 +226,17 @@ function EmptyFeedBody({
 
 export function MessageRow({
   message: m,
-  onSilenceUser,
+  onSetUserSilenced,
   onHideUser,
-  silencedTtsUsernamePatterns = [],
-  silencedNotificationUsernamePatterns = [],
+  silenced = false,
+  filterFlags,
   onRetrySend,
 }: {
   message: ChatMessage;
-  // v0.1.91 — optional so test mounts that don't exercise the silence
-  // affordance can leave this off; production always passes it via
-  // ChatFeed → App.tsx → handleSilenceUser.
-  onSilenceUser?: (username: string) => void;
+  onSetUserSilenced?: Props['onSetUserSilenced'];
   onHideUser?: Props['onHideUser'];
-  silencedTtsUsernamePatterns?: readonly RegExp[];
-  silencedNotificationUsernamePatterns?: readonly RegExp[];
+  silenced?: boolean;
+  filterFlags?: MessageFilterFlags;
   // v0.1.90 (voice 4512) — optional manual-retry relay (same rationale).
   onRetrySend?: (message: ChatMessage) => void;
 }): React.ReactElement {
@@ -295,26 +271,8 @@ export function MessageRow({
   const platformLabel = isSelfCommon
     ? 'via Restream'
     : PLATFORM_LABELS[m.platform];
-  // v0.1.97: derive silence from the CURRENT settings, not only the immutable
-  // flags attached when this message first arrived. That makes the clicked row
-  // update immediately and also reflects manual/MCP filter edits on historical
-  // messages. The old implementation looked unchanged until another message
-  // arrived, which made a successful button click appear dead.
-  const isTtsSilenced =
-    typeof m.username === 'string' &&
-    m.username.length > 0 &&
-    matchesAnyIgnorePattern(m.username, silencedTtsUsernamePatterns);
-  const areNotificationsSilenced =
-    typeof m.username === 'string' &&
-    m.username.length > 0 &&
-    matchesAnyIgnorePattern(m.username, silencedNotificationUsernamePatterns);
-  const isFullySilenced = isTtsSilenced && areNotificationsSilenced;
-  const ignoredLabel = regexIgnoredBadgeLabel({
-    ...m,
-    ignoredByTts: m.ignoredByTts || isTtsSilenced || undefined,
-    ignoredByNotifications:
-      m.ignoredByNotifications || areNotificationsSilenced || undefined,
-  });
+  // Compute badge state from current filters so Unsilence clears existing rows too. Found and fixed by GPT-6.2 Sol.
+  const ignoredLabel = regexIgnoredBadgeLabel(filterFlags ?? m);
   // v0.1.43 — optimistic-send status indicators (only set on
   // locally-minted placeholders; see `ChatMessage.pendingSend` docstring).
   // `sending` → faint "sending…" hint next to the timestamp so the user
@@ -337,21 +295,8 @@ export function MessageRow({
   // Whether the ⚠ is an interactive "tap to retry" button (only on terminal
   // failures, only for our own sends, only when a retry handler is wired).
   const canRetry = isFailed && m.self === true && typeof onRetrySend === 'function';
-  // v0.1.91 — only surface the Silence-user affordance for incoming
-  // messages from a NAMED user. Silencing "You" (self echoes), the
-  // anonymous "via Restream" common-reply rows, or messages with an empty
-  // username would either be nonsensical ("silence myself") or poison the
-  // TTS username ignore list with a meaningless `^$` pattern. The Silence
-  // button is therefore gated on (a) not-self, (b) non-empty trimmed
-  // username, (c) parent passed `onSilenceUser`. The button itself appears
-  // via CSS hover on the row.
-  const canSilence =
-    !m.self &&
-    typeof m.username === 'string' &&
-    m.username.trim().length > 0 &&
-    typeof onSilenceUser === 'function' &&
-    !isFullySilenced;
-  const canHide = !m.self && typeof m.username === 'string' && m.username.trim().length > 0 && !!onHideUser; // Silenced authors can still be hidden completely.
+  const isNamedViewer = !m.self && typeof m.username === 'string' && m.username.trim().length > 0;
+  const silenceAction = silenced ? 'Unsilence user' : 'Silence user';
   return (
     <div
       className={
@@ -397,52 +342,21 @@ export function MessageRow({
               {`sending…${retryLabel}`}
             </span>
           )}
-          {/*
-            v0.1.91 — per-row "Silence user" affordance (was "Hide user" in
-            v0.1.72). Rendered last in the message-header so it sits at the
-            right edge of the row. CSS .silence-user-btn defaults to
-            `visibility: hidden` and the parent .message-row:hover
-            .silence-user-btn flips it to `visible` — hover-reveal UX
-            without an onMouseEnter / onMouseLeave state dance.
-
-            On click: App.tsx asks main to add anchored, regex-escaped entries
-            for `m.username` to BOTH the TTS and notification username-ignore
-            lists. The user's messages KEEP rendering while both side effects
-            stop. App.tsx owns the atomic persist round-trip; ChatFeed is purely
-            the relay surface.
-
-            The 🔇 mute glyph matches the existing ignored badges and the
-            combined success state reads "✓ Silenced".
-
-            stopPropagation guards against the feed's right-click context
-            menu opening — left clicks on the button shouldn't bubble up
-            to a parent handler if a future redesign attaches one.
-          */}
-          {isFullySilenced && !m.self && (
-            <span
-              className="silence-user-status"
-              role="status"
-              aria-label={`User ${m.username} is silenced`}
-              title={`${m.username} is silenced — their messages still show, with TTS and notifications suppressed`}
-            >
-              ✓ Silenced
-            </span>
-          )}
-          {canSilence && (
+          {isNamedViewer && onSetUserSilenced && (
             <button
-              className="silence-user-btn"
+              className={silenced ? 'silence-user-btn silenced' : 'silence-user-btn'}
               type="button"
-              title={`Silence ${m.username} — their messages still show, but TTS and notifications stop`}
-              aria-label={`Silence user ${m.username}`}
+              title={silenced ? undefined : `Silence ${m.username} — their messages still show, but TTS and notifications stop`}
+              aria-label={`${silenceAction} ${m.username}`}
               onClick={(e) => {
                 e.stopPropagation();
-                onSilenceUser?.(m.username);
+                onSetUserSilenced(m.username, !silenced);
               }}
             >
-              🔇 Silence user
+              {silenced ? silenceAction : `🔇 ${silenceAction}`}
             </button>
           )}
-          {canHide && (
+          {isNamedViewer && onHideUser && (
             <button
               className="hide-user-btn"
               type="button"

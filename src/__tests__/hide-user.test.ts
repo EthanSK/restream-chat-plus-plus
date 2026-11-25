@@ -32,12 +32,13 @@ import { describe, expect, it } from 'vitest';
 import {
   addHiddenUser,
   addSilencedUser,
-  addSilencedUserToBothFilters,
   applyMessageFilters,
   compileHiddenUsersSet,
   compileIgnorePatterns,
+  hasExactSilenceRule,
   isHiddenUser,
   removeHiddenUser,
+  setSilencedUser,
 } from '../renderer/message-filters';
 import { DEFAULT_SETTINGS, type ChatMessage, type Settings } from '../shared/types';
 
@@ -435,40 +436,28 @@ describe('addSilencedUser', () => {
   });
 });
 
-describe('addSilencedUserToBothFilters', () => {
-  it('adds the exact username to TTS and notification filters together', () => {
-    expect(addSilencedUserToBothFilters([], [], 'burntballs_')).toEqual({
-      ttsPatterns: ['^burntballs_$'],
-      notificationPatterns: ['^burntballs_$'],
-      addedTts: true,
-      addedNotifications: true,
-    });
+describe('setSilencedUser', () => {
+  it('sets both exact rules and can remove them without removing broader rules', () => {
+    const initial = structuredClone(DEFAULT_SETTINGS);
+    initial.filters.tts.ignoreUsernameRegex = ['bob', '^Other$'];
+    initial.filters.notifications.ignoreUsernameRegex = ['^Other$'];
+    const silenced = setSilencedUser(initial, 'Bob[1]', true);
+    const exact = '^Bob\\[1\\]$';
+    expect(silenced.filters.tts.ignoreUsernameRegex).toEqual(['bob', '^Other$', exact]);
+    expect(silenced.filters.notifications.ignoreUsernameRegex).toEqual(['^Other$', exact]);
+    expect(setSilencedUser(silenced, 'bob[1]', true)).toEqual(silenced);
+    expect(setSilencedUser(silenced, 'bob[1]', false)).toEqual(initial);
   });
 
-  it('fills only the missing axis and respects an existing broad regex', () => {
-    expect(
-      addSilencedUserToBothFilters(['burntballs_'], [], 'burntballs_1'),
-    ).toEqual({
-      ttsPatterns: ['burntballs_'],
-      notificationPatterns: ['^burntballs_1$'],
-      addedTts: false,
-      addedNotifications: true,
-    });
-  });
-
-  it('is a no-op on both axes when both already suppress the user', () => {
-    expect(
-      addSilencedUserToBothFilters(
-        ['^Alice$'],
-        ['alice'],
-        'ALICE',
-      ),
-    ).toEqual({
-      ttsPatterns: ['^Alice$'],
-      notificationPatterns: ['alice'],
-      addedTts: false,
-      addedNotifications: false,
-    });
+  it('recognizes and removes a legacy exact rule from one list only', () => {
+    const initial = structuredClone(DEFAULT_SETTINGS);
+    initial.filters.tts.ignoreUsernameRegex = ['  ^@Viewer$ ', '^@Viewer2$'];
+    initial.filters.notifications.ignoreUsernameRegex = ['^Other$'];
+    expect(hasExactSilenceRule(initial.filters.tts.ignoreUsernameRegex, '@viewer')).toBe(true);
+    const unsilenced = setSilencedUser(initial, '@viewer', false);
+    expect(unsilenced.filters.tts.ignoreUsernameRegex).toEqual(['^@Viewer2$']);
+    expect(unsilenced.filters.notifications).toEqual(initial.filters.notifications);
+    expect(unsilenced.hiddenUsers).toEqual(initial.hiddenUsers);
   });
 });
 

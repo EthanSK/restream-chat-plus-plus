@@ -1,5 +1,14 @@
 # Learnings
 
+## Reversing Silence user — 25 November 2026
+
+The chat row replaced Silence user with a static status, and stored badge flags
+could remain after the rules were removed. Keep the reverse action on the same
+button and derive visible badges from current settings for live chat and scrollback.
+Treat legacy exact username rules in either filter list as reversible. Change
+both lists together in main, leave broader filters intact, and cancel queued
+speech only when silencing.
+
 ## Chat scrollback after reload — 23 November 2026
 
 The live feed was renderer-only, so a reload emptied it. Restream's event
