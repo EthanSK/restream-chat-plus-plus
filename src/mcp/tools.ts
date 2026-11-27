@@ -766,7 +766,7 @@ const setAutoUpdateCheck: ToolDefinition = {
 const clearChat: ToolDefinition = {
   name: 'clear_chat',
   description:
-    'Clear the local chat feed and saved scrollback. ' +
+    'Clear the chat feed. Saved chat remains available through Load older messages. ' +
     'When the in-process HTTP MCP is the host (v0.1.36+), this triggers ' +
     'the same Cmd+K path the menu item uses. Outside the running app, ' +
     'returns a clear hint payload.',

@@ -48,6 +48,7 @@ export interface McpServerDeps {
   /** Main BrowserWindow — used to push settings updates to the renderer. */
   getMainWindow: () => BrowserWindow | null;
   clearChat: () => void;
+  clearChatOnSignOut: () => void;
   /** WS chat client — exposes connection state + per-platform list. */
   chat: ChatClient;
   /** OAuth coordinator — used by `sign_out` to clear the in-memory token. */
@@ -124,7 +125,7 @@ export async function startInProcessMcpServer(
       }
       // Push refreshed auth status so the renderer flips to the
       // sign-in screen without a restart.
-      deps.clearChat();
+      deps.clearChatOnSignOut();
       try {
         const win = deps.getMainWindow();
         win?.webContents.send(IPC.AUTH_STATUS, { authenticated: false });

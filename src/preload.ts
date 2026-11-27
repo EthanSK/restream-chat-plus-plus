@@ -209,19 +209,16 @@ const api = {
   },
   /**
    * Ask the main process to pop a native context menu anchored at the
-   * current cursor position. The only item today is "Clear chat" — on
-   * click, main sends `CHAT_CLEAR` back to the renderer which empties its
-   * message buffer. Native popup is preferred over a CSS overlay so the
-   * context menu matches macOS dark-blur conventions + system keyboard nav.
-   * v0.1.18.
+   * current cursor position. It contains the same actions as the Chat menu.
+   * The native popup supplies system keyboard navigation. — GPT-6.2 Sol
    */
   showChatContextMenu: (): Promise<void> =>
     ipcRenderer.invoke(IPC.CHAT_SHOW_CONTEXT_MENU),
   /**
    * Subscribe to "clear chat" broadcasts from main — fired by either the
    * chat context-menu "Clear chat" item or the application menu's
-   * "Clear chat" (Cmd+K). Renderer handler empties its in-memory buffer;
-   * Restream-side state is untouched. v0.1.18.
+   * "Clear chat" (Cmd+K). The renderer clears its in-memory buffer and can
+   * load saved messages again. — GPT-6.2 Sol
    */
   onChatClear: (cb: () => void): Unsub => {
     const h = () => cb();

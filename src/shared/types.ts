@@ -644,17 +644,13 @@ export const IPC = {
   CHAT_SEND_UNCONFIRMED: 'chat:send-unconfirmed',
   /**
    * Renderer → main. Asks the main process to pop a native context menu
-   * (Menu.buildFromTemplate + popup) anchored at the cursor. Currently the
-   * only item is "Clear chat"; when clicked, main sends back `CHAT_CLEAR`
-   * which the renderer consumes by emptying its in-memory message buffer.
-   * Native popup is used (rather than a custom CSS menu) so context-menu UX
-   * matches macOS conventions — dark blur, full-system keyboard nav, etc.
-   * v0.1.18.
+   * (Menu.buildFromTemplate + popup) anchored at the cursor. It uses the same
+   * chat actions as the application menu. — GPT-6.2 Sol
    */
   CHAT_SHOW_CONTEXT_MENU: 'chat:show-context-menu',
   /**
-   * Main → renderer broadcast after the local archive is cleared. The
-   * renderer clears the visible feed too. Provider chat is unaffected.
+   * Main → renderer broadcast to clear the visible feed. Only explicit history
+   * deletion or sign-out also clears the local archive. — GPT-6.2 Sol
    */
   CHAT_CLEAR: 'chat:clear',
   /**

@@ -128,6 +128,11 @@ describe('loading older chat messages', () => {
     await act(async () => completePage({ messages: [row(1)] }));
     expect(feed().messages).toEqual([]);
     expect(feed().historyControls.status).toBe('ready');
+
+    api.loadOlderChatMessages.mockResolvedValueOnce({ messages: [row(1)] });
+    await act(async () => feed().historyControls.loadOlder());
+    expect(api.loadOlderChatMessages).toHaveBeenNthCalledWith(2, undefined);
+    expect(feed().messages).toEqual([row(1)]);
   });
 });
 

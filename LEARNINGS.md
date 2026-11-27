@@ -1,5 +1,13 @@
 # Learnings
 
+## Clear Chat keeps saved messages — 27 November 2026
+
+The local history database still had its arrival counter but had lost its earlier
+rows. Clear Chat called the same deletion path as sign-out, leaving Load older
+messages with nothing to restore. Both Chat menus and the MCP clear action now
+clear the visible feed and its paging state. Only explicit history deletion and
+sign-out erase the saved history and block in-flight sends from refilling it.
+
 ## Reversing Silence user — 25 November 2026
 
 The chat row replaced Silence user with a static status, and stored badge flags

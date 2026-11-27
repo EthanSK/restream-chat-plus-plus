@@ -603,7 +603,7 @@ export function openSettingsFromMenu(win: BrowserWindow | null): void {
   }
 }
 
-function buildMenu(onRevealLogs: () => void, clearChat: () => void) {
+function buildMenu(onRevealLogs: () => void, chatMenuItems: Electron.MenuItemConstructorOptions[]) {
   const isMac = process.platform === 'darwin';
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
@@ -696,13 +696,7 @@ function buildMenu(onRevealLogs: () => void, clearChat: () => void) {
     },
     {
       label: 'Chat',
-      submenu: [
-        {
-          label: 'Clear Chat',
-          accelerator: 'CmdOrCtrl+K',
-          click: clearChat,
-        },
-      ],
+      submenu: chatMenuItems,
     },
     {
       label: 'View',
@@ -773,16 +767,51 @@ app.on('ready', async () => {
   } catch (error) {
     console.error('[main] Could not open local chat history', error);
   }
-  let chatClearGeneration = 0;
-  const clearChat = (): void => {
-    chatClearGeneration += 1;
+  let chatHistoryDeletionGeneration = 0;
+  // Clear Chat keeps the cache so Load older messages can bring the rows back.
+  // Found and fixed by GPT-6.2 Sol.
+  const clearChat = (): void => broadcastChatClear(mainWindow);
+  const deleteChatHistory = (): boolean => {
+    chatHistoryDeletionGeneration += 1;
     try {
       chatHistory?.clear();
+      return true;
     } catch (error) {
-      console.error('[main] Could not clear local chat history', error);
+      console.error('[main] Could not delete saved chat history', error);
+      return false;
     }
-    broadcastChatClear(mainWindow);
   };
+  const clearChatOnSignOut = (): void => {
+    deleteChatHistory();
+    clearChat();
+  };
+  const confirmDeleteChatHistory = async (): Promise<void> => {
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      buttons: ['Cancel', 'Delete'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Delete saved chat history?',
+      detail: 'This permanently removes the chat saved on this device.',
+    };
+    try {
+      const result = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showMessageBox(mainWindow, options)
+        : await dialog.showMessageBox(options);
+      if (result.response !== 1) return;
+      if (deleteChatHistory()) {
+        clearChat();
+      } else {
+        dialog.showErrorBox('Couldn’t delete saved chat history', 'Try again.');
+      }
+    } catch (error) {
+      console.error('[main] Delete saved chat history failed', error);
+    }
+  };
+  const chatMenuItems: Electron.MenuItemConstructorOptions[] = [
+    { label: 'Clear Chat', accelerator: 'CmdOrCtrl+K', click: clearChat },
+    { label: 'Delete Saved Chat History…', click: () => void confirmDeleteChatHistory() },
+  ];
   const saveChatHistory = (message: ChatMessage): number | undefined => {
     try {
       return chatHistory?.add(message);
@@ -837,7 +866,7 @@ app.on('ready', async () => {
   // future WebAuthn path (security key, cross-device passkey, etc.) and
   // don't depend on platform-authenticator support.
 
-  buildMenu(() => revealLogsInFinder(chat.getRawLogPath()), clearChat);
+  buildMenu(() => revealLogsInFinder(chat.getRawLogPath()), chatMenuItems);
   await createMainWindow();
 
   /**
@@ -1532,7 +1561,7 @@ app.on('ready', async () => {
     // disappears rather than freezing at the last pre-signout value).
     viewerStats.stop();
     await oauth.logout();
-    clearChat();
+    clearChatOnSignOut();
     const status: AuthStatus = { authenticated: false };
     mainWindow?.webContents.send(IPC.AUTH_STATUS, status);
     return status;
@@ -2261,9 +2290,9 @@ app.on('ready', async () => {
   });
   const sendQueue: ChatSendQueue = createChatSendQueue({
     runSend: async (item) => {
-      const clearGeneration = chatClearGeneration;
+      const deletionGeneration = chatHistoryDeletionGeneration;
       const result = await sendFanout.send(item);
-      if (result.ok && clearGeneration === chatClearGeneration) {
+      if (result.ok && deletionGeneration === chatHistoryDeletionGeneration) {
         // Own echoes are suppressed below. The queue's confirmed result is
         // what turns the optimistic row into a sent message.
         saveChatHistory({
@@ -2454,13 +2483,7 @@ app.on('ready', async () => {
       // })` throw; the surrounding try/catch swallows it, but bailing early
       // is cleaner and matches the openSettingsFromMenu guard.
       if (!mainWindow || mainWindow.isDestroyed()) return;
-      const menu = Menu.buildFromTemplate([
-        {
-          label: 'Clear Chat',
-          accelerator: 'CmdOrCtrl+K',
-          click: clearChat,
-        },
-      ]);
+      const menu = Menu.buildFromTemplate(chatMenuItems);
       menu.popup({ window: mainWindow });
     } catch (err) {
       console.error('[main] chat:show-context-menu failed', err);
@@ -2532,6 +2555,7 @@ app.on('ready', async () => {
       saveSettings,
       getMainWindow: () => mainWindow,
       clearChat,
+      clearChatOnSignOut,
       chat,
       oauth,
       checkForUpdatesNow: () => performUpdateCheck(true),
